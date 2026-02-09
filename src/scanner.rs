@@ -229,19 +229,22 @@ pub fn verify_match(metadata: &SessionMetadata, repo_root: &Path, commit: &str) 
     crate::git::commit_exists_at(repo_root, commit).unwrap_or_default()
 }
 
-/// Extract all potential 40-character hex commit hashes from a file.
+/// Extract all potential commit hashes (7-40 hex characters) from a file.
 ///
-/// Scans every line of the file for substrings that look like full Git commit
-/// hashes: exactly 40 consecutive lowercase or uppercase hex characters.
+/// Scans every line of the file for substrings that look like Git commit
+/// hashes: 7 to 40 consecutive lowercase or uppercase hex characters.
 /// A hex substring is only considered a match if it is not preceded or
-/// followed by another hex character (i.e., it must be exactly 40 chars,
-/// not embedded in a longer hex string).
+/// followed by another hex character (i.e., it must be a bounded run of
+/// hex digits, not embedded in a longer hex string).
 ///
 /// Returns a deduplicated `Vec<String>` of extracted hashes (lowercased).
 /// Returns an empty Vec on any I/O error.
 ///
 /// This is used by the `hydrate` command, which needs to find ALL commit
 /// hashes in a session log (not just check for a specific hash).
+/// Short hashes (7 chars) are included because Claude Code logs typically
+/// contain short hashes from `git commit` output (e.g., `[main bb6ccaa]`).
+/// False positives are filtered downstream by `commit_exists_at`.
 pub fn extract_commit_hashes(file: &Path) -> Vec<String> {
     let file_handle = match File::open(file) {
         Ok(f) => f,
@@ -264,11 +267,11 @@ pub fn extract_commit_hashes(file: &Path) -> Vec<String> {
     hashes
 }
 
-/// Extract 40-char hex strings from a single line.
+/// Extract 7-40 char hex strings from a single line.
 ///
 /// Walks through the line looking for runs of hex digits. When a run of
-/// exactly 40 is found (bounded by non-hex chars or string boundaries),
-/// it is added to the results.
+/// 7 to 40 characters is found (bounded by non-hex chars or string
+/// boundaries), it is added to the results.
 fn extract_hashes_from_line(
     line: &str,
     hashes: &mut Vec<String>,
@@ -285,7 +288,7 @@ fn extract_hashes_from_line(
                 i += 1;
             }
             let run_len = i - start;
-            if run_len == 40 {
+            if run_len >= 7 && run_len <= 40 {
                 let hash = line[start..i].to_ascii_lowercase();
                 if seen.insert(hash.clone()) {
                     hashes.push(hash);
@@ -985,10 +988,22 @@ also not json {{{{
     }
 
     #[test]
-    fn test_extract_commit_hashes_ignores_short_hex() {
+    fn test_extract_commit_hashes_finds_short_hash() {
         let dir = TempDir::new().unwrap();
-        // 7-char hex string -- should NOT be extracted (only 40-char)
-        let content = r#"{"content":"short hash abcdef0"}"#;
+        // 7-char hex string -- should be extracted (minimum length)
+        let content = r#"{"content":"[main abcdef0] fix bug"}"#;
+        let file = write_temp_file(dir.path(), "session.jsonl", content);
+
+        let hashes = extract_commit_hashes(&file);
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(hashes[0], "abcdef0");
+    }
+
+    #[test]
+    fn test_extract_commit_hashes_ignores_too_short_hex() {
+        let dir = TempDir::new().unwrap();
+        // 6-char hex string -- should NOT be extracted (below minimum)
+        let content = r#"{"content":"short hex abcdef"}"#;
         let file = write_temp_file(dir.path(), "session.jsonl", content);
 
         let hashes = extract_commit_hashes(&file);
@@ -1047,8 +1062,9 @@ also not json {{{{
         let file = write_temp_file(dir.path(), "session.jsonl", &content);
 
         let hashes = extract_commit_hashes(&file);
-        assert_eq!(hashes.len(), 1);
-        assert_eq!(hashes[0], hash);
+        // Should find both the short hash "655dd38" and the full hash
+        assert!(hashes.contains(&"655dd38".to_string()));
+        assert!(hashes.contains(&hash.to_string()));
     }
 
     // -----------------------------------------------------------------------

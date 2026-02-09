@@ -1009,19 +1009,36 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn run_hook_post_commit_returns_ok() {
+        // Isolate HOME so we don't scan real session logs
+        let fake_home = TempDir::new().unwrap();
+        let original_home = std::env::var("HOME").unwrap_or_default();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
         // The catch-all wrapper ensures this always returns Ok even
         // when called outside a git repo (the inner logic will fail
         // but the error is caught and logged to stderr).
-        assert!(run_hook_post_commit().is_ok());
+        let result = run_hook_post_commit();
+
+        unsafe { std::env::set_var("HOME", &original_home) };
+        assert!(result.is_ok());
     }
 
     #[test]
+    #[serial]
     fn run_hydrate_returns_ok() {
-        // run_hydrate now does real work: parses --since, scans log dirs.
-        // With a valid duration string and no session logs on disk, it should
-        // succeed and print a "Done. 0 attached, 0 skipped, 0 errors." summary.
-        assert!(run_hydrate("7d", false).is_ok());
+        // Isolate HOME so we don't scan real session logs
+        let fake_home = TempDir::new().unwrap();
+        let original_home = std::env::var("HOME").unwrap_or_default();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+        // With a fake HOME and no session logs, hydrate should
+        // succeed quickly with "Done. 0 attached, 0 skipped, 0 errors."
+        let result = run_hydrate("7d", false);
+
+        unsafe { std::env::set_var("HOME", &original_home) };
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -1307,6 +1324,11 @@ mod tests {
         let repo_path = dir.path();
         let original_cwd = safe_cwd();
 
+        // Isolate HOME so we don't scan real session logs
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
         let head_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
 
         // Manually attach a note first
@@ -1341,6 +1363,12 @@ mod tests {
         );
         assert_eq!(note_output, "existing note");
 
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
         std::env::set_current_dir(original_cwd).unwrap();
     }
 
@@ -1406,14 +1434,19 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_hook_post_commit_never_fails_outside_git_repo() {
+        // Isolate HOME so we don't scan real session logs
+        let fake_home = TempDir::new().unwrap();
+        let original_home = std::env::var("HOME").unwrap_or_default();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
         // When called outside a git repo, the hook should still return Ok
         // because the catch-all wrapper catches errors.
-        // Note: we don't chdir -- just call it in whatever CWD we have.
-        // If the current dir IS a git repo, inner logic may succeed; that's fine.
-        // The important thing is that it NEVER returns Err.
         let result = run_hook_post_commit();
         assert!(result.is_ok());
+
+        unsafe { std::env::set_var("HOME", &original_home) };
     }
 
     // -----------------------------------------------------------------------
@@ -2271,12 +2304,26 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_hydrate_no_logs_returns_ok() {
-        // Hydrate with no log directories should succeed gracefully
-        // (we don't need to redirect HOME here -- if HOME exists but
-        // has no .claude or .codex dirs, hydrate still succeeds)
+        // Hydrate with no log directories should succeed quickly and
+        // deterministically when HOME is isolated.
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
+
         let result = run_hydrate("7d", false);
         assert!(result.is_ok());
+
+        // Restore
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
     }
 
     #[test]
