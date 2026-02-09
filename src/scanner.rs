@@ -10,11 +10,9 @@
 //! into memory) and doing substring matching for the full hash and
 //! the short hash (first 7 characters).
 
-use anyhow::{Context, Result};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -83,7 +81,15 @@ pub fn find_session_for_commit(
     commit_hash: &str,
     candidate_files: &[PathBuf],
 ) -> Option<SessionMatch> {
-    let short_hash = &commit_hash[..7.min(commit_hash.len())];
+    // Reject invalid commit hashes: must be 7-40 hex characters.
+    // An empty or short string would cause `line.contains("")` to return true
+    // for every line, producing universal false positives. Non-hex strings
+    // can never be valid commit hashes.
+    if crate::git::validate_commit_hash(commit_hash).is_err() {
+        return None;
+    }
+
+    let short_hash = &commit_hash[..7];
 
     for file_path in candidate_files {
         let file = match File::open(file_path) {
@@ -124,8 +130,8 @@ pub fn find_session_for_commit(
 ///
 /// This is best-effort: not every line will be valid JSON, and not
 /// every JSON line will contain the fields we need. The function
-/// accumulates fields across all lines, with later values overwriting
-/// earlier ones.
+/// accumulates fields across all lines, with first-value-wins semantics
+/// (once a field is found, later occurrences are ignored).
 pub fn parse_session_metadata(file: &Path) -> SessionMetadata {
     let mut metadata = SessionMetadata::default();
 
@@ -191,6 +197,11 @@ pub fn parse_session_metadata(file: &Path) -> SessionMetadata {
 /// Returns `false` if any check fails or if the cwd is not available
 /// in the metadata.
 pub fn verify_match(metadata: &SessionMetadata, repo_root: &Path, commit: &str) -> bool {
+    // Validate commit hash before passing to git commands.
+    if crate::git::validate_commit_hash(commit).is_err() {
+        return false;
+    }
+
     let cwd = match &metadata.cwd {
         Some(c) => c,
         None => return false,
@@ -199,7 +210,7 @@ pub fn verify_match(metadata: &SessionMetadata, repo_root: &Path, commit: &str) 
     let cwd_path = Path::new(cwd);
 
     // Check 1: cwd resolves to the same git repo root
-    match git_repo_root_at(cwd_path) {
+    match crate::git::repo_root_at(cwd_path) {
         Ok(cwd_repo_root) => {
             // Canonicalize both paths for comparison to handle symlinks
             let canonical_repo = match repo_root.canonicalize() {
@@ -218,7 +229,7 @@ pub fn verify_match(metadata: &SessionMetadata, repo_root: &Path, commit: &str) 
     }
 
     // Check 2: commit exists in the repo
-    git_commit_exists_at(repo_root, commit).unwrap_or_default()
+    crate::git::commit_exists_at(repo_root, commit).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -240,39 +251,6 @@ fn infer_agent_type(path: &Path) -> AgentType {
     }
 }
 
-/// Get the git repo root for a given working directory.
-///
-/// Runs `git -C <dir> rev-parse --show-toplevel`.
-fn git_repo_root_at(dir: &Path) -> Result<PathBuf> {
-    let dir_str = dir.to_string_lossy();
-    let output = Command::new("git")
-        .args(["-C", &dir_str, "rev-parse", "--show-toplevel"])
-        .output()
-        .context("failed to execute git rev-parse --show-toplevel")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("git rev-parse --show-toplevel failed: {}", stderr.trim());
-    }
-
-    let stdout = String::from_utf8(output.stdout).context("git output was not valid UTF-8")?;
-    Ok(PathBuf::from(stdout.trim()))
-}
-
-/// Check whether a commit exists in a repository.
-///
-/// Runs `git -C <repo> cat-file -t <commit>` and checks for success.
-fn git_commit_exists_at(repo: &Path, commit: &str) -> Result<bool> {
-    let repo_str = repo.to_string_lossy();
-    let status = Command::new("git")
-        .args(["-C", &repo_str, "cat-file", "-t", "--", commit])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .context("failed to execute git cat-file")?;
-    Ok(status.success())
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -281,6 +259,7 @@ fn git_commit_exists_at(repo: &Path, commit: &str) -> Result<bool> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::process::Command;
     use tempfile::TempDir;
 
     // -----------------------------------------------------------------------
@@ -566,6 +545,38 @@ mod tests {
 
         // "abcdef" is only 6 chars, our short hash is "abcdef0" (7 chars).
         // The line does not contain "abcdef0", so no match.
+        assert!(result.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // find_session_for_commit — short/empty hash rejected
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_find_session_empty_hash_returns_none() {
+        let dir = TempDir::new().unwrap();
+        // A file where every line would match an empty string
+        let file = write_temp_file(
+            dir.path(),
+            "session.jsonl",
+            "{\"type\":\"message\",\"content\":\"hello\"}\n",
+        );
+
+        let result = find_session_for_commit("", &[file]);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_find_session_short_hash_returns_none() {
+        let dir = TempDir::new().unwrap();
+        let file = write_temp_file(
+            dir.path(),
+            "session.jsonl",
+            "{\"content\":\"abcdef something\"}\n",
+        );
+
+        // 6-char hash is too short, should be rejected
+        let result = find_session_for_commit("abcdef", &[file]);
         assert!(result.is_none());
     }
 

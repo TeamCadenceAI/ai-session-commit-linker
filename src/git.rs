@@ -4,7 +4,7 @@
 //! The notes ref used throughout is `refs/notes/ai-sessions`.
 
 use anyhow::{Context, Result, bail};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// The dedicated git notes ref for AI session data.
@@ -14,7 +14,7 @@ const NOTES_REF: &str = "refs/notes/ai-sessions";
 ///
 /// This prevents flag injection (e.g., passing `--help` as a commit) and
 /// ensures we only pass well-formed refs to git.
-fn validate_commit_hash(commit: &str) -> Result<()> {
+pub(crate) fn validate_commit_hash(commit: &str) -> Result<()> {
     let is_valid =
         commit.len() >= 7 && commit.len() <= 40 && commit.bytes().all(|b| b.is_ascii_hexdigit());
     if !is_valid {
@@ -72,6 +72,42 @@ fn git_succeeds(args: &[&str]) -> Result<bool> {
 pub fn repo_root() -> Result<PathBuf> {
     let path = git_output(&["rev-parse", "--show-toplevel"])?;
     Ok(PathBuf::from(path))
+}
+
+/// Return the repository root for a given working directory.
+///
+/// Runs `git -C <dir> rev-parse --show-toplevel`. This handles the case
+/// where `dir` is a subdirectory of the repo.
+pub(crate) fn repo_root_at(dir: &Path) -> Result<PathBuf> {
+    let dir_str = dir.to_string_lossy();
+    let output = Command::new("git")
+        .args(["-C", &dir_str, "rev-parse", "--show-toplevel"])
+        .output()
+        .context("failed to execute git rev-parse --show-toplevel")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git rev-parse --show-toplevel failed: {}", stderr.trim());
+    }
+
+    let stdout = String::from_utf8(output.stdout).context("git output was not valid UTF-8")?;
+    Ok(PathBuf::from(stdout.trim()))
+}
+
+/// Check whether a commit exists in a given repository.
+///
+/// Runs `git -C <repo> cat-file -t -- <commit>` and checks for success.
+/// The `--` separator prevents the commit argument from being interpreted
+/// as a flag.
+pub(crate) fn commit_exists_at(repo: &Path, commit: &str) -> Result<bool> {
+    let repo_str = repo.to_string_lossy();
+    let status = Command::new("git")
+        .args(["-C", &repo_str, "cat-file", "-t", "--", commit])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .context("failed to execute git cat-file")?;
+    Ok(status.success())
 }
 
 /// Return the full 40-character SHA of HEAD.

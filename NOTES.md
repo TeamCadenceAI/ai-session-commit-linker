@@ -216,7 +216,7 @@ A code review was conducted after Phase 3 (16 findings). The following issues we
 - Uses `git -C <dir> rev-parse --show-toplevel` to resolve the repo root from the session's cwd. This handles the case where the cwd is a subdirectory of the repo.
 - Uses `git -C <repo> cat-file -t <commit>` to verify commit existence. This is a lightweight check that doesn't require checking out the commit.
 - Both paths are canonicalized before comparison to handle symlinks (e.g., on macOS where `/var` is a symlink to `/private/var`).
-- The git helper functions (`git_repo_root_at`, `git_commit_exists_at`) are private to the scanner module. They are similar to the helpers in `git.rs` but accept a directory parameter instead of using the process cwd. This keeps the scanner self-contained without modifying the git module's API.
+- The git helper functions (`repo_root_at`, `commit_exists_at`) are defined in `git.rs` as `pub(crate)` functions that accept a directory parameter. The scanner module calls these directly. This was refactored during the Phase 4 review triage (originally they were private duplicates in scanner.rs).
 
 ### Test Strategy
 - 35 new tests added (total: 119).
@@ -231,3 +231,30 @@ A code review was conducted after Phase 3 (16 findings). The following issues we
 
 ### Dead Code Warnings
 - As with Phases 2 and 3, all new `pub` items generate "never used" warnings because they are not called from production code yet. These will resolve when Phase 6 wires up the hook handler.
+
+---
+
+## Phase 4 Review Triage
+
+A code review was conducted after Phase 4 (21 findings across 8 sections). The review confirmed 121 tests passing, clippy clean (only expected dead-code warnings), and formatting clean.
+
+### Fixed
+
+1. **Doc comment on `parse_session_metadata` said "later values overwriting" but code uses first-value-wins (Review 2.1, Low).** Fixed the doc comment to say "first-value-wins semantics (once a field is found, later occurrences are ignored)." The code was correct; only the comment was wrong.
+
+2. **Empty/short commit hash causes universal match in `find_session_for_commit` (Review 4.2, Medium).** Added input validation via `crate::git::validate_commit_hash` at the top of `find_session_for_commit`. If the hash fails validation (not 7-40 hex characters), returns `None` immediately. This prevents `line.contains("")` from returning `true` for every line. Added 2 new tests: `test_find_session_empty_hash_returns_none` and `test_find_session_short_hash_returns_none`.
+
+3. **No input validation on commit hash in scanner entry points (Review 3.1, Medium).** Made `validate_commit_hash` in `git.rs` `pub(crate)` and called it from both `find_session_for_commit` and `verify_match`. This reuses the existing validation logic (7-40 hex characters) rather than duplicating it.
+
+4. **Duplicated git helpers between scanner.rs and git.rs (Review 3.4, Medium).** Moved `git_repo_root_at` and `git_commit_exists_at` from `scanner.rs` to `git.rs` as `pub(crate)` functions named `repo_root_at` and `commit_exists_at`. The scanner module now calls `crate::git::repo_root_at` and `crate::git::commit_exists_at`. Removed unused imports (`anyhow`, `std::process::Command`) from scanner.rs production code; added `std::process::Command` to the test module where it is still needed.
+
+### Deferred
+
+- **Short hash false positive risk on hex-heavy log lines (Review 1.1):** Known limitation, mitigated by the verify step. The 7-character hex space (268M values) makes random collisions unlikely, and the verify step rejects most false positives.
+- **Two-pass file I/O for match + metadata (Review 5.4):** Premature optimization; OS page cache makes the second pass fast.
+- **Line limit for metadata parsing (Review 5.3):** Not critical for v1; metadata fields appear near the top of session logs in practice.
+- **Move `AgentType` to shared location (Review 6.5):** Will address when Phase 5/6 need it.
+- **No logging/tracing in scanner (Review 7.3):** Phase 6 hook handler should add logging around scanner calls.
+
+### Test Count
+- Total: 121 tests (was 119 before triage). Added 2 new tests for commit hash validation edge cases.
