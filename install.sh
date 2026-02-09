@@ -2,7 +2,7 @@
 set -eu
 
 REPO="TeamCadenceAI/ai-barometer"
-INSTALL_DIR="/usr/local/bin"
+INSTALL_DIR="${HOME}/.local/bin"
 
 main() {
     # Must be macOS
@@ -57,13 +57,9 @@ main() {
     echo "Extracting..."
     tar xzf "${tmpdir}/${tarball}" -C "$tmpdir"
 
+    mkdir -p "$INSTALL_DIR"
     echo "Installing to ${INSTALL_DIR}/ai-barometer..."
-    if [ -w "$INSTALL_DIR" ]; then
-        cp "${tmpdir}/ai-barometer" "${INSTALL_DIR}/ai-barometer"
-    else
-        echo "(requires sudo)"
-        sudo cp "${tmpdir}/ai-barometer" "${INSTALL_DIR}/ai-barometer"
-    fi
+    cp "${tmpdir}/ai-barometer" "${INSTALL_DIR}/ai-barometer"
     chmod +x "${INSTALL_DIR}/ai-barometer"
 
     echo "Running initial setup..."
@@ -73,7 +69,17 @@ main() {
 
     echo ""
     echo "ai-barometer installed successfully!"
-    echo "Run 'ai-barometer --help' to get started."
+
+    # Check if install dir is on PATH
+    case ":${PATH}:" in
+        *":${INSTALL_DIR}:"*) ;;
+        *)
+            echo ""
+            echo "WARNING: ${INSTALL_DIR} is not on your PATH."
+            echo "Add it by running:"
+            echo "  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc"
+            ;;
+    esac
 }
 
 main
