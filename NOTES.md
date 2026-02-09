@@ -681,3 +681,28 @@ A code review was conducted after Phase 9 (19 findings: 0 critical, 2 medium, 7 
   - **`test_install_idempotent`:** Running install twice succeeds and leaves the shim in the correct state.
   - **`test_install_detects_existing_non_barometer_hook`:** A pre-existing non-barometer hook is overwritten by install.
   - **`test_install_detects_existing_barometer_hook`:** A pre-existing barometer hook is updated by install.
+
+---
+
+## Phase 10 Review Triage
+
+A code review was conducted after Phase 10 (18 findings: 0 critical, 2 medium, 8 low, 5 informational, 8 positive). The review confirmed 231 tests passing, clippy clean (2 expected dead-code warnings), and formatting clean.
+
+### Fixed
+
+1. **Back up overwritten third-party hooks (Review #3.1, Medium).** Before overwriting a non-barometer `post-commit` hook, the installer now copies it to `post-commit.pre-ai-barometer` and prints the backup path. If the backup copy fails (e.g., permissions), a warning is printed but installation continues. Updated `test_install_detects_existing_non_barometer_hook` to verify the backup file exists and contains the original hook content.
+
+2. **Test verifying hydration runs during install (Review #8.2, Medium).** Added `test_install_runs_hydration` integration test. It creates a temp repo with a commit, sets up a fake Claude session log containing the commit hash, runs `run_install_inner`, and verifies that a note was attached to the commit -- proving that hydration executed as part of install.
+
+### Deferred
+
+- **PATH verification (Review #2.2, Low):** Out of scope for the installer. The binary is clearly on PATH since `ai-barometer install` was just invoked.
+- **Substring match for hook detection (Review #3.2, Low):** Good enough in practice. The only realistic match is the actual shim content.
+- **Config ordering (Review #3.3, Low):** `core.hooksPath` is set before shim is written. If config succeeds but shim fails, hooks are broken until re-run. Accepted trade-off for best-effort design.
+- **Org value validation (Review #4.3, Info):** Low priority. Malformed org values simply never match (fail-safe).
+- **Failure scenario tests (Review #8.3-8.5, Low):** Nice to have but hard to simulate without filesystem mocking. The best-effort design ensures graceful degradation.
+- **`git config` legacy positional form (Review #7.2, Low):** Already noted in Phase 2. Widely supported, not urgent.
+- **No `--org` unset mechanism (Review #4.2, Low):** Users can manually `git config --global --unset ai.barometer.org`. Acceptable.
+
+### Test Count
+- Total: 232 tests (was 231 before triage). Added 1 new test (`test_install_runs_hydration`).

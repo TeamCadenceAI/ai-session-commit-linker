@@ -137,10 +137,24 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
                     eprintln!("[ai-barometer] post-commit hook already installed, updating");
                     true
                 } else {
-                    eprintln!(
-                        "[ai-barometer] warning: {} exists but was not created by ai-barometer; overwriting",
-                        shim_path.display()
-                    );
+                    // Back up the existing hook before overwriting
+                    let backup_path = hooks_dir.join("post-commit.pre-ai-barometer");
+                    match std::fs::copy(&shim_path, &backup_path) {
+                        Ok(_) => {
+                            eprintln!(
+                                "[ai-barometer] warning: {} exists but was not created by ai-barometer; backed up to {}",
+                                shim_path.display(),
+                                backup_path.display()
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[ai-barometer] warning: {} exists but was not created by ai-barometer; failed to back up: {}",
+                                shim_path.display(),
+                                e
+                            );
+                        }
+                    }
                     true
                 }
             }
@@ -1903,6 +1917,18 @@ mod tests {
         let content = std::fs::read_to_string(&shim_path).unwrap();
         assert_eq!(content, "#!/bin/sh\nexec ai-barometer hook post-commit\n");
 
+        // The original hook should have been backed up
+        let backup_path = hooks_dir.join("post-commit.pre-ai-barometer");
+        assert!(
+            backup_path.exists(),
+            "backup of original hook should exist at post-commit.pre-ai-barometer"
+        );
+        let backup_content = std::fs::read_to_string(&backup_path).unwrap();
+        assert_eq!(
+            backup_content, "#!/bin/sh\necho 'custom hook'\n",
+            "backup should contain the original hook content"
+        );
+
         // Restore
         unsafe {
             match original_home {
@@ -1961,6 +1987,96 @@ mod tests {
                 None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
             }
         }
+    }
+
+    #[test]
+    #[serial]
+    fn test_install_runs_hydration() {
+        // Verify that running install also runs hydration and attaches notes
+        // to commits that have matching session logs.
+
+        let dir = init_temp_repo();
+        let repo_path = dir.path();
+        let original_cwd = safe_cwd();
+
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        let original_global = std::env::var("GIT_CONFIG_GLOBAL").ok();
+
+        let global_config = fake_home.path().join("fake-global-gitconfig");
+        std::fs::write(&global_config, "").unwrap();
+
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+            std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
+        }
+
+        let git_repo_root = run_git(repo_path, &["rev-parse", "--show-toplevel"]);
+        let head_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
+
+        // Create a fake Claude session log containing the commit hash
+        let git_repo_root_path = std::path::Path::new(&git_repo_root);
+        let encoded = agents::encode_repo_path(git_repo_root_path);
+        let claude_project_dir = fake_home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join(&encoded);
+        std::fs::create_dir_all(&claude_project_dir).unwrap();
+
+        let session_content = format!(
+            r#"{{"session_id":"install-hydrate-test","cwd":"{cwd}"}}
+{{"type":"tool_result","content":"commit {hash}"}}
+{{"type":"assistant","message":"Done"}}
+"#,
+            cwd = git_repo_root,
+            hash = head_hash,
+        );
+        let session_file = claude_project_dir.join("session.jsonl");
+        std::fs::write(&session_file, &session_content).unwrap();
+
+        // Set the mtime to "now" so it falls within the 7-day hydration window
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let ft = filetime::FileTime::from_unix_time(now, 0);
+        filetime::set_file_mtime(&session_file, ft).unwrap();
+
+        // Run install (which should run hydration as its final step)
+        std::env::set_current_dir(repo_path).expect("failed to chdir");
+        let result = run_install_inner(None, Some(fake_home.path()));
+        assert!(result.is_ok());
+
+        // Verify a note was attached to the commit by hydration
+        let note_output = run_git(
+            repo_path,
+            &[
+                "notes",
+                "--ref",
+                "refs/notes/ai-sessions",
+                "show",
+                &head_hash,
+            ],
+        );
+        assert!(
+            note_output.contains("agent: claude-code"),
+            "hydration during install should have attached a note"
+        );
+        assert!(note_output.contains("session_id: install-hydrate-test"));
+
+        // Restore
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+            match original_global {
+                Some(g) => std::env::set_var("GIT_CONFIG_GLOBAL", g),
+                None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
     }
 
     #[test]
