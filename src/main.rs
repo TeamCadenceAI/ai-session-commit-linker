@@ -1,5 +1,6 @@
 mod agents;
 mod git;
+mod note;
 mod scanner;
 
 use anyhow::Result;

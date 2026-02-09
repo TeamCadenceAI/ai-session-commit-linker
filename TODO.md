@@ -54,9 +54,9 @@ Shared helpers that multiple subcommands depend on.
 
 ## Phase 5: Note Formatting
 
-- [ ] `note::format(agent: &str, session_id: &str, repo: &str, commit: &str, session_log: &str) -> String` — produce the full note with YAML-style header + verbatim JSONL payload
-- [ ] `note::payload_sha256(content: &str) -> String` — SHA-256 of the session log payload
-- [ ] Unit tests: verify note format matches spec, verify SHA-256 is correct
+- [x] `note::format(agent: &str, session_id: &str, repo: &str, commit: &str, session_log: &str) -> String` — produce the full note with YAML-style header + verbatim JSONL payload
+- [x] `note::payload_sha256(content: &str) -> String` — SHA-256 of the session log payload
+- [x] Unit tests: verify note format matches spec, verify SHA-256 is correct
 
 ---
 

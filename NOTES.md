@@ -258,3 +258,33 @@ A code review was conducted after Phase 4 (21 findings across 8 sections). The r
 
 ### Test Count
 - Total: 121 tests (was 119 before triage). Added 2 new tests for commit hash validation edge cases.
+
+---
+
+## Phase 5 Decisions
+
+### Module Layout
+- The note formatting module is in `src/note.rs`, wired into the crate via `mod note;` in `main.rs`.
+- Contains two public functions (`format`, `payload_sha256`) and no public types.
+
+### Note Format
+- The note format follows the PLAN.md specification exactly: YAML-style header delimited by `---` on their own lines, with the verbatim session log appended after the closing delimiter.
+- Header fields appear in a fixed order: `agent`, `session_id`, `repo`, `commit`, `confidence`, `payload_sha256`. This order matches the spec and ensures consistent, predictable output.
+- The `confidence` field is hardcoded to `exact_hash_match` for now. The PLAN.md notes `commit_in_session: <optional>` as a potential header field, but it is not included in this phase since the format function's parameters do not yet carry that information. It can be added in a future phase if needed.
+
+### SHA-256 Implementation
+- Uses the `sha2` crate (already declared as a dependency in Phase 1's Cargo.toml) via `sha2::Sha256`.
+- The hash is computed over the raw bytes of the session log payload (`content.as_bytes()`), producing a lowercase hex string (64 characters).
+- The `payload_sha256` function is a separate public function (not just an internal helper) because it may be useful for verification in future phases (e.g., validating note integrity).
+
+### Payload Handling
+- The session log is appended verbatim after the closing `---\n` delimiter. No transformation, escaping, or truncation is applied. This ensures the payload in the note is bit-for-bit identical to the original session log file content that was passed in.
+- Empty payloads are handled correctly: the note still has a valid header with the SHA-256 of the empty string, and the note ends with the closing `---\n`.
+
+### Test Strategy
+- 12 new tests added (total: 133).
+- SHA-256 tests use well-known hash values (SHA-256 of "hello" and SHA-256 of empty string) to verify correctness against independent references.
+- Format tests verify: exact structure via `splitn` parsing, header field order, empty payload, multiline payload, verbatim payload preservation, round-trip extraction (split note back into header + payload and verify SHA matches), and agent type variation (codex vs claude-code).
+
+### Dead Code Warnings
+- As with Phases 2-4, all new `pub` items generate "never used" warnings because they are not called from production code yet. These will resolve when Phase 6 wires up the hook handler.
