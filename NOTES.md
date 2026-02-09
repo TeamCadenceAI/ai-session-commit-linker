@@ -314,3 +314,58 @@ A code review was conducted after Phase 5 (12 findings). The review confirmed 13
 
 ### Test Count
 - Total: 137 tests (was 133 before triage). Added 4 new tests (1 for `---` delimiter edge case, 3 for commit hash validation).
+
+---
+
+## Phase 6 Decisions
+
+### Hook Handler Architecture
+- The `run_hook_post_commit()` function uses a two-layer catch-all:
+  1. **Panic guard:** `std::panic::catch_unwind` wraps the inner handler. Any panic is caught and logged to stderr.
+  2. **Error guard:** The inner function `hook_post_commit_inner()` returns `anyhow::Result<()>`. Any error is caught by the outer function and logged to stderr.
+- In both cases, the function returns `Ok(())` — the hook **never** fails the commit.
+- All output uses the `[ai-barometer]` prefix on stderr.
+
+### Inner Handler Flow
+The `hook_post_commit_inner()` function follows the algorithm specified in PLAN.md:
+1. Get `repo_root`, `head_hash`, `head_timestamp` from the git module.
+2. **Deduplication check:** If a note already exists for HEAD (`git::note_exists`), exit early. This prevents duplicate work, rebase loops, and hydration collisions.
+3. Collect candidate log directories from both `agents::claude::log_dirs` and `agents::codex::log_dirs`.
+4. Filter candidate files by the ±600 second (10 minute) time window using `agents::candidate_files`.
+5. Run `scanner::find_session_for_commit` to find a session match.
+6. If matched: parse metadata, verify match against repo root, read the full session log, format the note, and attach it via `git::add_note`.
+7. If not matched (or verification fails): write a pending record via `pending::write_pending`.
+8. After resolving the current commit: run `retry_pending_for_repo` to attempt resolution of all pending commits for this repo.
+
+### Pending Module (Stub)
+- Created `src/pending.rs` with the minimal functions needed by the hook handler: `write_pending`, `list_for_repo`, `remove`, `pending_dir`.
+- The stub writes real JSON files to `~/.ai-barometer/pending/<commit-hash>.json`, so the pending system works end-to-end even before Phase 7 fleshes out the full retry logic.
+- `PendingRecord` struct holds: commit, repo, commit_time, attempts, last_attempt.
+
+### Retry Logic (Stub)
+- `retry_pending_for_repo` iterates over all pending records for the repo, attempts resolution for each, and removes records on success.
+- This is a best-effort operation — errors during retry are silently ignored.
+- Phase 7 will implement the full retry system with proper increment/backoff.
+
+### Push Logic
+- Push is stubbed out. Phase 8 will implement the consent check, org filter, and actual push.
+
+### macOS Path Symlink Handling
+- On macOS, `TempDir::new()` returns paths under `/var/folders/...` but the actual filesystem path is `/private/var/folders/...`. `git rev-parse --show-toplevel` returns the `/private` variant. This caused mismatches in integration tests between the path used to create the session log directory (via `encode_repo_path(dir.path())`) and the path the hook computes (via `encode_repo_path(repo_root())`).
+- The fix in tests: use `git rev-parse --show-toplevel` to get the canonical repo root, then use that for both creating the fake session log directory and for the session metadata's `cwd` field.
+
+### CWD Safety in Serial Tests
+- Serial tests that call `set_current_dir` can leave the process CWD in a deleted temp directory if an assertion panics before CWD is restored. Subsequent serial tests then fail on `current_dir()`.
+- Added a `safe_cwd()` helper that falls back to `std::env::temp_dir()` if the current directory is invalid. All serial tests use `safe_cwd()` instead of `current_dir().expect(...)`.
+
+### Dead Code Warnings
+- Most dead code warnings from Phases 2-5 are now resolved since `run_hook_post_commit` calls into `git`, `agents`, `scanner`, and `note` modules.
+- Remaining dead code warnings: `push_notes`, `has_upstream`, `remote_org`, `parse_org_from_url`, `config_get`, `config_set` (all Phase 8 concerns), `matched_line` on `SessionMatch` (may be used in future phases), and some `PendingRecord` fields.
+
+### Test Count
+- Total: 142 tests (was 137 before Phase 6). Added 5 new tests:
+  - `test_hook_post_commit_attaches_note_to_commit`: full integration test with a temp repo and fake Claude session log.
+  - `test_hook_post_commit_deduplication_skips_if_note_exists`: verifies existing notes are not overwritten.
+  - `test_hook_post_commit_no_match_writes_pending`: verifies pending records are written when no session match is found.
+  - `test_hook_post_commit_never_fails_outside_git_repo`: verifies the catch-all wrapper.
+  - `test_pending_record_struct`: basic struct construction test for `PendingRecord`.

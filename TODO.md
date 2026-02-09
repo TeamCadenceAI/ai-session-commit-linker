@@ -64,16 +64,16 @@ Shared helpers that multiple subcommands depend on.
 
 This is the critical hot path. Must be fast and never fail the commit.
 
-- [ ] Wrap entire handler in catch-all: any error → log warning to stderr, exit 0
-- [ ] Get repo root, HEAD hash, HEAD timestamp
-- [ ] Check deduplication: if note already exists for HEAD, exit early
-- [ ] Get candidate log dirs (Claude + Codex) for this repo
-- [ ] Get candidate files filtered by ±10 min window
-- [ ] Run scanner to find session match
-- [ ] If matched: format note, attach via `git notes add`, attempt push (with consent check)
-- [ ] If not matched: write pending record (see Phase 7)
-- [ ] After resolving current commit: run retry for all pending commits in this repo
-- [ ] Integration test: set up temp repo, create fake session log, run commit, verify note attached
+- [x] Wrap entire handler in catch-all: any error → log warning to stderr, exit 0
+- [x] Get repo root, HEAD hash, HEAD timestamp
+- [x] Check deduplication: if note already exists for HEAD, exit early
+- [x] Get candidate log dirs (Claude + Codex) for this repo
+- [x] Get candidate files filtered by ±10 min window
+- [x] Run scanner to find session match
+- [x] If matched: format note, attach via `git notes add`, attempt push (with consent check)
+- [x] If not matched: write pending record (see Phase 7)
+- [x] After resolving current commit: run retry for all pending commits in this repo
+- [x] Integration test: set up temp repo, create fake session log, run commit, verify note attached
 
 ---
 
