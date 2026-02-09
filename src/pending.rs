@@ -4,10 +4,11 @@
 //! hook time. Full implementation in Phase 7; this module provides
 //! the minimal stubs needed by the post-commit hook handler.
 
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// A record for a commit that could not be resolved at hook time.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingRecord {
     /// Full commit hash.
     pub commit: String,

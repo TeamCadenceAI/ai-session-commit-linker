@@ -128,8 +128,25 @@ fn hook_post_commit_inner() -> Result<()> {
         let metadata = scanner::parse_session_metadata(&matched.file_path);
 
         if scanner::verify_match(&metadata, &repo_root, &head_hash) {
-            // Read the full session log
-            let session_log = std::fs::read_to_string(&matched.file_path).unwrap_or_default();
+            // Read the full session log. If the read fails (permissions,
+            // file deleted between match and read, etc.), fall through to
+            // the pending path so it can be retried later.
+            let session_log = match std::fs::read_to_string(&matched.file_path) {
+                Ok(content) => content,
+                Err(e) => {
+                    eprintln!("[ai-barometer] warning: failed to read session log: {}", e);
+                    if let Err(e) =
+                        pending::write_pending(&head_hash, &repo_root_str, head_timestamp)
+                    {
+                        eprintln!(
+                            "[ai-barometer] warning: failed to write pending record: {}",
+                            e
+                        );
+                    }
+                    // Skip note attachment; retry will pick this up later
+                    return Ok(());
+                }
+            };
 
             let session_id = metadata.session_id.as_deref().unwrap_or("unknown");
 
@@ -216,7 +233,10 @@ fn retry_pending_for_repo(repo_str: &str, repo_root: &std::path::Path) {
             let metadata = scanner::parse_session_metadata(&matched.file_path);
 
             if scanner::verify_match(&metadata, repo_root, &record.commit) {
-                let session_log = std::fs::read_to_string(&matched.file_path).unwrap_or_default();
+                let session_log = match std::fs::read_to_string(&matched.file_path) {
+                    Ok(content) => content,
+                    Err(_) => continue, // File unreadable; skip, will retry later
+                };
 
                 let session_id = metadata.session_id.as_deref().unwrap_or("unknown");
 
@@ -472,6 +492,17 @@ mod tests {
         let repo_path = dir.path();
         let original_cwd = safe_cwd();
 
+        // Use a separate temp dir as a fake HOME to avoid polluting the
+        // real ~/.claude directory. The agents module reads $HOME to find
+        // session logs, so redirecting it is sufficient.
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        // SAFETY: This test is #[serial], so no other threads are reading
+        // env vars concurrently.
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
+
         // Get the actual repo root as git sees it (may differ from dir.path()
         // due to symlinks, e.g. /var -> /private/var on macOS)
         let git_repo_root = run_git(repo_path, &["rev-parse", "--show-toplevel"]);
@@ -482,12 +513,14 @@ mod tests {
         let head_ts_str = run_git(repo_path, &["show", "-s", "--format=%ct", "HEAD"]);
         let head_ts: i64 = head_ts_str.parse().unwrap();
 
-        // Create a fake Claude session log directory matching this repo.
-        // Use the git-reported repo root for encoding to match what the hook
-        // will compute internally.
+        // Create a fake Claude session log directory matching this repo
+        // inside the fake HOME, so it is fully self-contained in temp dirs.
         let encoded = agents::encode_repo_path(git_repo_root_path);
-        let home = agents::home_dir().expect("no HOME");
-        let claude_project_dir = home.join(".claude").join("projects").join(&encoded);
+        let claude_project_dir = fake_home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join(&encoded);
         std::fs::create_dir_all(&claude_project_dir).unwrap();
 
         // Create a fake JSONL session log with the commit hash and metadata.
@@ -530,8 +563,15 @@ mod tests {
         assert!(note_output.contains(&head_hash));
         assert!(note_output.contains("confidence: exact_hash_match"));
 
-        // Clean up: remove the fake Claude dir, restore cwd
-        let _ = std::fs::remove_dir_all(&claude_project_dir);
+        // Restore HOME and cwd
+        // SAFETY: This test is #[serial], so no other threads are reading
+        // env vars concurrently.
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
         std::env::set_current_dir(original_cwd).unwrap();
     }
 
@@ -586,6 +626,16 @@ mod tests {
         let repo_path = dir.path();
         let original_cwd = safe_cwd();
 
+        // Use a fake HOME so pending records are written to a temp dir
+        // instead of the real ~/.ai-barometer/pending/.
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        // SAFETY: This test is #[serial], so no other threads are reading
+        // env vars concurrently.
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
+
         let head_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
 
         // Don't create any session logs — the hook should not find a match
@@ -610,17 +660,23 @@ mod tests {
             .unwrap();
         assert!(!status.success());
 
-        // A pending record should have been written
-        let pending_path = agents::home_dir()
-            .unwrap()
+        // A pending record should have been written inside the fake home
+        let pending_path = fake_home
+            .path()
             .join(".ai-barometer")
             .join("pending")
             .join(format!("{}.json", head_hash));
         assert!(pending_path.exists(), "pending record should exist");
 
-        // Clean up: remove the pending record
-        let _ = std::fs::remove_file(&pending_path);
-
+        // Restore HOME and cwd. The fake_home TempDir drop handles cleanup.
+        // SAFETY: This test is #[serial], so no other threads are reading
+        // env vars concurrently.
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
         std::env::set_current_dir(original_cwd).unwrap();
     }
 

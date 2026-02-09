@@ -369,3 +369,29 @@ The `hook_post_commit_inner()` function follows the algorithm specified in PLAN.
   - `test_hook_post_commit_no_match_writes_pending`: verifies pending records are written when no session match is found.
   - `test_hook_post_commit_never_fails_outside_git_repo`: verifies the catch-all wrapper.
   - `test_pending_record_struct`: basic struct construction test for `PendingRecord`.
+
+---
+
+## Phase 6 Review Triage
+
+A code review was conducted after Phase 6 (16 findings: 0 critical, 3 medium, 6 low, 7 informational). The review confirmed 142 tests passing, clippy clean (expected dead-code warnings only), and formatting clean. No commit-blocking bugs were found.
+
+### Fixed
+
+1. **`unwrap_or_default()` on `read_to_string` silently produces empty note (Review 3.3, Medium).** Changed both occurrences of `std::fs::read_to_string(&matched.file_path).unwrap_or_default()` in `src/main.rs` (main path and retry path). The main path now uses a `match` that logs a warning, writes a pending record, and returns early on read failure -- so the file can be retried later instead of attaching a note with an empty payload. The retry path uses `match` with `continue` on failure, so it skips to the next pending record.
+
+2. **Integration tests pollute real `~/.claude` and `~/.ai-barometer` (Review 4.5, Low).** The `test_hook_post_commit_attaches_note_to_commit` and `test_hook_post_commit_no_match_writes_pending` tests now create a separate `TempDir` as a fake HOME, redirect `$HOME` to it via `unsafe { std::env::set_var("HOME", ...) }` (safe because tests are `#[serial]`), and restore `$HOME` afterward. All fake `.claude/projects/` directories and `.ai-barometer/pending/` files are now fully contained in temp directories that auto-clean on drop.
+
+3. **`PendingRecord` lacks serde derives (Review 5.2, Low).** Added `#[derive(Serialize, Deserialize)]` to `PendingRecord` in `src/pending.rs`, with `use serde::{Deserialize, Serialize};`. This enables direct `serde_json::from_str::<PendingRecord>()` deserialization in Phase 7 instead of manual `serde_json::Value` field extraction.
+
+### Deferred
+
+- **`read_to_string` loads full session log into memory (Review 3.2, Medium):** Phase 12 hardening concern. Future mitigation: use `git notes add -F <file>` with a temp file to avoid both memory pressure and `arg_max` limits.
+- **Retry uses same 600-second window for pending commits (Review 2.2, Low):** Phase 7 will implement proper retry logic with widened windows or full directory scans.
+- **Retry does not increment attempt counter (Review 2.3, Info):** Phase 7 responsibility.
+- **Redundant hash validation (Review 3.4, Low):** Defense-in-depth, intentional. No action needed.
+- **Missing test for verify_match failure -> pending path (Review 4.2, Low):** Nice to have but not blocking.
+- **Missing test for retry resolving a pending commit (Review 4.3, Low):** Phase 7 responsibility.
+
+### Test Count
+- Total: 142 tests (unchanged). No new tests added; existing tests were improved for isolation.
