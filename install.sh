@@ -1,0 +1,79 @@
+#!/bin/sh
+set -eu
+
+REPO="TeamCadenceAI/ai-barometer"
+INSTALL_DIR="/usr/local/bin"
+
+main() {
+    # Must be macOS
+    if [ "$(uname -s)" != "Darwin" ]; then
+        echo "Error: ai-barometer only supports macOS." >&2
+        exit 1
+    fi
+
+    # Detect architecture
+    arch=$(uname -m)
+    case "$arch" in
+        arm64)  target="aarch64-apple-darwin" ;;
+        x86_64) target="x86_64-apple-darwin" ;;
+        *)
+            echo "Error: unsupported architecture: $arch" >&2
+            exit 1
+            ;;
+    esac
+
+    echo "Detected macOS $arch ($target)"
+
+    # Get latest release tag
+    echo "Fetching latest release..."
+    release_url="https://api.github.com/repos/${REPO}/releases/latest"
+    release_json=$(curl -sSf "$release_url") || {
+        echo "Error: could not fetch latest release from GitHub." >&2
+        echo "Check that ${REPO} has at least one published release." >&2
+        exit 1
+    }
+
+    tag=$(echo "$release_json" | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"//;s/".*//')
+    if [ -z "$tag" ]; then
+        echo "Error: could not determine latest release tag." >&2
+        exit 1
+    fi
+    echo "Latest release: $tag"
+
+    # Download tarball
+    tarball="ai-barometer-${target}.tar.gz"
+    download_url="https://github.com/${REPO}/releases/download/${tag}/${tarball}"
+    tmpdir=$(mktemp -d)
+    trap 'rm -rf "$tmpdir"' EXIT
+
+    echo "Downloading ${tarball}..."
+    curl -sSfL -o "${tmpdir}/${tarball}" "$download_url" || {
+        echo "Error: download failed." >&2
+        echo "URL: $download_url" >&2
+        exit 1
+    }
+
+    # Extract and install
+    echo "Extracting..."
+    tar xzf "${tmpdir}/${tarball}" -C "$tmpdir"
+
+    echo "Installing to ${INSTALL_DIR}/ai-barometer..."
+    if [ -w "$INSTALL_DIR" ]; then
+        cp "${tmpdir}/ai-barometer" "${INSTALL_DIR}/ai-barometer"
+    else
+        echo "(requires sudo)"
+        sudo cp "${tmpdir}/ai-barometer" "${INSTALL_DIR}/ai-barometer"
+    fi
+    chmod +x "${INSTALL_DIR}/ai-barometer"
+
+    echo "Running initial setup..."
+    "${INSTALL_DIR}/ai-barometer" install || {
+        echo "Warning: 'ai-barometer install' failed. You can run it manually later." >&2
+    }
+
+    echo ""
+    echo "ai-barometer installed successfully!"
+    echo "Run 'ai-barometer --help' to get started."
+}
+
+main
