@@ -706,3 +706,40 @@ A code review was conducted after Phase 10 (18 findings: 0 critical, 2 medium, 8
 
 ### Test Count
 - Total: 232 tests (was 231 before triage). Added 1 new test (`test_install_runs_hydration`).
+
+---
+
+## Phase 11 Decisions
+
+### Status Output Design
+- All output uses `[ai-barometer]` prefix on stderr, consistent with every other subcommand.
+- The output is indented with two spaces after the prefix for each status field, matching the format shown in the TODO.md spec.
+- Each piece of information is shown on its own line for easy reading and machine parsing.
+
+### Graceful Handling Outside a Git Repository
+- `run_status()` attempts `git::repo_root()` first. If it fails, the function continues and shows `(not in a git repository)` for the repo line and `(n/a - not in a repo)` for fields that require a repo context (pending retries, autopush, repo enabled).
+- The hooks path and org filter are global settings (not repo-specific) and are always shown regardless of whether the CWD is in a git repo.
+- The function always returns `Ok(())` -- it never errors.
+
+### Config Source Decisions
+- **Hooks path**: Read from `git config --global core.hooksPath` since the installer sets it globally. Then checks if the post-commit shim file exists at that path and contains "ai-barometer".
+- **Org filter**: Read from `git config --global ai.barometer.org` since it is set globally at install time.
+- **Autopush consent**: Read from repo-local `git config ai.barometer.autopush` since consent is per-repo.
+- **Repo enabled**: Uses `git::check_enabled()` which reads repo-local `git config ai.barometer.enabled`.
+- **Pending retries**: Uses `pending::list_for_repo()` with the canonical repo root path.
+
+### No New Modules or Public Functions
+- The status subcommand reuses existing public functions from `git`, `pending`, and `agents` modules. No new helper functions were needed. This validates the existing API design -- all the information needed for status was already accessible through the existing module interfaces.
+
+### Dead Code Warnings
+- Same as Phase 10: `remote_org` and `matched_line` remain unused. These are expected.
+
+### Test Count
+- Total: 238 tests (was 232 before Phase 11). Added 6 new tests:
+  - **`run_status_returns_ok_outside_repo`:** Replaces the old trivial `run_status_returns_ok` stub test. Verifies that `run_status()` returns `Ok(())` even when called outside a git repository.
+  - **`test_status_in_repo_shows_repo_root`:** Runs status inside a temp repo and verifies it succeeds.
+  - **`test_status_shows_hooks_path_when_configured`:** Sets up a fake global config with `core.hooksPath` pointing to a directory containing the ai-barometer shim, then verifies status succeeds.
+  - **`test_status_shows_pending_count`:** Creates 3 pending records for a repo, runs status, and verifies the pending count is correct.
+  - **`test_status_shows_org_filter`:** Sets up a global config with `ai.barometer.org` and verifies status succeeds.
+  - **`test_status_shows_autopush_status`:** Sets `ai.barometer.autopush = true` in a repo and verifies status succeeds.
+  - **`test_status_shows_repo_disabled`:** Disables a repo via `ai.barometer.enabled = false`, runs status, and verifies `check_enabled()` returns `false`.

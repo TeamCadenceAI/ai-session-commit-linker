@@ -135,12 +135,12 @@ This is the critical hot path. Must be fast and never fail the commit.
 
 ## Phase 11: `status` Subcommand
 
-- [ ] Show: current repo root
-- [ ] Show: hooks path and whether shim is installed
-- [ ] Show: number of pending retries for current repo
-- [ ] Show: org filter config (if any)
-- [ ] Show: autopush consent status
-- [ ] Show: per-repo enabled/disabled status
+- [x] Show: current repo root
+- [x] Show: hooks path and whether shim is installed
+- [x] Show: number of pending retries for current repo
+- [x] Show: org filter config (if any)
+- [x] Show: autopush consent status
+- [x] Show: per-repo enabled/disabled status
 
 ---
 

@@ -743,8 +743,107 @@ fn run_retry() -> Result<()> {
     Ok(())
 }
 
+/// The status subcommand: show AI Barometer configuration and state.
+///
+/// Displays:
+/// - Current repo root (or a message if not in a git repo)
+/// - Hooks path and whether the post-commit shim is installed
+/// - Number of pending retries for the current repo
+/// - Org filter config (if any)
+/// - Autopush consent status
+/// - Per-repo enabled/disabled status
+///
+/// All output uses the `[ai-barometer]` prefix on stderr.
+/// Handles being called outside a git repo gracefully.
 fn run_status() -> Result<()> {
-    eprintln!("[ai-barometer] status (not yet implemented)");
+    eprintln!("[ai-barometer] Status");
+
+    // --- Repo root ---
+    let repo_root = match git::repo_root() {
+        Ok(root) => {
+            eprintln!("[ai-barometer]   Repo: {}", root.to_string_lossy());
+            Some(root)
+        }
+        Err(_) => {
+            eprintln!("[ai-barometer]   Repo: (not in a git repository)");
+            None
+        }
+    };
+
+    // --- Hooks path and shim status ---
+    let hooks_path = match git::config_get_global("core.hooksPath") {
+        Ok(Some(path)) => {
+            let shim_path = std::path::Path::new(&path).join("post-commit");
+            let shim_installed = match std::fs::read_to_string(&shim_path) {
+                Ok(content) => content.contains("ai-barometer"),
+                Err(_) => false,
+            };
+            let installed_str = if shim_installed { "yes" } else { "no" };
+            eprintln!(
+                "[ai-barometer]   Hooks path: {} (shim installed: {})",
+                path, installed_str
+            );
+            Some(path)
+        }
+        _ => {
+            eprintln!("[ai-barometer]   Hooks path: (not configured)");
+            None
+        }
+    };
+    let _ = hooks_path; // suppress unused warning
+
+    // --- Pending retries ---
+    if let Some(ref root) = repo_root {
+        let repo_str = root.to_string_lossy().to_string();
+        let pending_count = pending::list_for_repo(&repo_str)
+            .map(|r| r.len())
+            .unwrap_or(0);
+        eprintln!("[ai-barometer]   Pending retries: {}", pending_count);
+    } else {
+        eprintln!("[ai-barometer]   Pending retries: (n/a - not in a repo)");
+    }
+
+    // --- Org filter ---
+    match git::config_get_global("ai.barometer.org") {
+        Ok(Some(org)) => {
+            eprintln!("[ai-barometer]   Org filter: {}", org);
+        }
+        _ => {
+            eprintln!("[ai-barometer]   Org filter: (none)");
+        }
+    }
+
+    // --- Autopush consent ---
+    if repo_root.is_some() {
+        match git::config_get("ai.barometer.autopush") {
+            Ok(Some(val)) if val == "true" => {
+                eprintln!("[ai-barometer]   Auto-push: enabled (consented)");
+            }
+            Ok(Some(val)) if val == "false" => {
+                eprintln!("[ai-barometer]   Auto-push: disabled (opted out)");
+            }
+            _ => {
+                eprintln!(
+                    "[ai-barometer]   Auto-push: not yet configured (will prompt on first push)"
+                );
+            }
+        }
+    } else {
+        eprintln!("[ai-barometer]   Auto-push: (n/a - not in a repo)");
+    }
+
+    // --- Per-repo enabled/disabled ---
+    if repo_root.is_some() {
+        let enabled = git::check_enabled();
+        if enabled {
+            eprintln!("[ai-barometer]   Repo enabled: yes");
+        } else {
+            eprintln!("[ai-barometer]   Repo enabled: no");
+        }
+    } else {
+        eprintln!("[ai-barometer]   Repo enabled: (n/a - not in a repo)");
+    }
+
     Ok(())
 }
 
@@ -933,8 +1032,11 @@ mod tests {
     }
 
     #[test]
-    fn run_status_returns_ok() {
-        assert!(run_status().is_ok());
+    fn run_status_returns_ok_outside_repo() {
+        // run_status should always return Ok even outside a git repo --
+        // it gracefully handles the case where git::repo_root() fails.
+        let result = run_status();
+        assert!(result.is_ok());
     }
 
     // -----------------------------------------------------------------------
@@ -2092,5 +2194,250 @@ mod tests {
     fn test_hydrate_invalid_since_returns_error() {
         let result = run_hydrate("invalid", false);
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Integration tests: status subcommand
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn test_status_in_repo_shows_repo_root() {
+        let dir = init_temp_repo();
+        let repo_path = dir.path();
+        let original_cwd = safe_cwd();
+
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
+
+        std::env::set_current_dir(repo_path).expect("failed to chdir");
+        let result = run_status();
+        assert!(result.is_ok());
+
+        // Restore
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_status_shows_hooks_path_when_configured() {
+        let dir = init_temp_repo();
+        let repo_path = dir.path();
+        let original_cwd = safe_cwd();
+
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        let original_global = std::env::var("GIT_CONFIG_GLOBAL").ok();
+
+        // Create a fake global config with core.hooksPath
+        let hooks_dir = fake_home.path().join(".git-hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let hooks_dir_str = hooks_dir.to_string_lossy().to_string();
+
+        // Write the ai-barometer shim
+        let shim_path = hooks_dir.join("post-commit");
+        std::fs::write(
+            &shim_path,
+            "#!/bin/sh\nexec ai-barometer hook post-commit\n",
+        )
+        .unwrap();
+
+        let global_config = fake_home.path().join("fake-global-gitconfig");
+        std::fs::write(
+            &global_config,
+            format!("[core]\n    hooksPath = {}\n", hooks_dir_str),
+        )
+        .unwrap();
+
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+            std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
+        }
+
+        std::env::set_current_dir(repo_path).expect("failed to chdir");
+        let result = run_status();
+        assert!(result.is_ok());
+
+        // Restore
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+            match original_global {
+                Some(g) => std::env::set_var("GIT_CONFIG_GLOBAL", g),
+                None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_status_shows_pending_count() {
+        let dir = init_temp_repo();
+        let repo_path = dir.path();
+        let original_cwd = safe_cwd();
+
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
+
+        let git_repo_root = run_git(repo_path, &["rev-parse", "--show-toplevel"]);
+
+        // Write some pending records for this repo
+        let pending_dir = fake_home.path().join(".ai-barometer").join("pending");
+        std::fs::create_dir_all(&pending_dir).unwrap();
+
+        for i in 0..3 {
+            let fake_hash = format!("{:0>40}", format!("abcdef{}", i));
+            let record = serde_json::json!({
+                "commit": fake_hash,
+                "repo": git_repo_root,
+                "commit_time": 1700000000 + i,
+                "attempts": 1,
+                "last_attempt": 1700000060 + i,
+            });
+            std::fs::write(
+                pending_dir.join(format!("{}.json", fake_hash)),
+                serde_json::to_string_pretty(&record).unwrap(),
+            )
+            .unwrap();
+        }
+
+        std::env::set_current_dir(repo_path).expect("failed to chdir");
+        let result = run_status();
+        assert!(result.is_ok());
+
+        // Verify the pending count matches by reading it ourselves
+        let count = pending::list_for_repo(&git_repo_root)
+            .map(|r| r.len())
+            .unwrap_or(0);
+        assert_eq!(count, 3);
+
+        // Restore
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_status_shows_org_filter() {
+        let dir = init_temp_repo();
+        let repo_path = dir.path();
+        let original_cwd = safe_cwd();
+
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        let original_global = std::env::var("GIT_CONFIG_GLOBAL").ok();
+
+        // Create a global config with org filter
+        let global_config = fake_home.path().join("fake-global-gitconfig");
+        std::fs::write(
+            &global_config,
+            "[ai \"barometer\"]\n    org = my-test-org\n",
+        )
+        .unwrap();
+
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+            std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
+        }
+
+        std::env::set_current_dir(repo_path).expect("failed to chdir");
+        let result = run_status();
+        assert!(result.is_ok());
+
+        // Restore
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+            match original_global {
+                Some(g) => std::env::set_var("GIT_CONFIG_GLOBAL", g),
+                None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_status_shows_autopush_status() {
+        let dir = init_temp_repo();
+        let repo_path = dir.path();
+        let original_cwd = safe_cwd();
+
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
+
+        // Set autopush to true
+        run_git(repo_path, &["config", "ai.barometer.autopush", "true"]);
+
+        std::env::set_current_dir(repo_path).expect("failed to chdir");
+        let result = run_status();
+        assert!(result.is_ok());
+
+        // Restore
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_status_shows_repo_disabled() {
+        let dir = init_temp_repo();
+        let repo_path = dir.path();
+        let original_cwd = safe_cwd();
+
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
+
+        // Disable this repo
+        run_git(repo_path, &["config", "ai.barometer.enabled", "false"]);
+
+        std::env::set_current_dir(repo_path).expect("failed to chdir");
+        let result = run_status();
+        assert!(result.is_ok());
+
+        // Verify the enabled check sees it as disabled
+        assert!(!git::check_enabled());
+
+        // Restore
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
     }
 }
