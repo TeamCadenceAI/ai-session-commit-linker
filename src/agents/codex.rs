@@ -31,10 +31,7 @@ pub fn all_log_dirs() -> Vec<PathBuf> {
 /// Returns an empty `Vec` if:
 /// - The home directory cannot be resolved
 /// - `~/.codex/sessions/` does not exist
-///
-/// The `_repo_path` parameter is accepted for API symmetry with
-/// `claude::log_dirs` but is not used for filtering.
-pub fn log_dirs(_repo_path: &Path) -> Vec<PathBuf> {
+pub fn log_dirs() -> Vec<PathBuf> {
     let home = match home_dir() {
         Some(h) => h,
         None => return Vec::new(),

@@ -39,8 +39,6 @@ impl std::fmt::Display for AgentType {
 pub struct SessionMatch {
     /// Path to the session log file that contained the commit hash.
     pub file_path: PathBuf,
-    /// The line from the file that contained the match.
-    pub matched_line: String,
     /// The agent type, inferred from the file path.
     pub agent_type: AgentType,
 }
@@ -110,7 +108,6 @@ pub fn find_session_for_commit(
                 let agent_type = infer_agent_type(file_path);
                 return Some(SessionMatch {
                     file_path: file_path.clone(),
-                    matched_line: line,
                     agent_type,
                 });
             }
@@ -399,7 +396,6 @@ mod tests {
         assert!(result.is_some());
         let m = result.unwrap();
         assert_eq!(m.file_path, file);
-        assert!(m.matched_line.contains(commit_hash));
     }
 
     // -----------------------------------------------------------------------
@@ -420,7 +416,7 @@ mod tests {
 
         assert!(result.is_some());
         let m = result.unwrap();
-        assert!(m.matched_line.contains(short_hash));
+        assert_eq!(m.agent_type, AgentType::Claude);
     }
 
     // -----------------------------------------------------------------------
@@ -590,8 +586,6 @@ mod tests {
         let result = find_session_for_commit(commit_hash, &[file]);
 
         assert!(result.is_some());
-        let m = result.unwrap();
-        assert!(m.matched_line.contains(&commit_hash[..7]));
     }
 
     // -----------------------------------------------------------------------

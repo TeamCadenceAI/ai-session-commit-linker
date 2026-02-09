@@ -844,8 +844,6 @@ A code review was conducted after Phase 12 (REVIEW.md). The review confirmed 251
 
 ### Deferred
 
-- **`matched_line` dead code (Review: Dead Code #2):** Kept with existing clippy warning. The field may be useful for debugging or future features.
-- **`_repo_root` parameter on `push::should_push` (Review: Refactoring #2):** Harmless, low priority.
 - **Named constants for time window values (Review: Refactoring #3):** Nice to have but not blocking. The values are used in only one place each.
 - **`read_to_string` + `git notes add -m` pipeline (Review: Spec Problem #1):** Known limitation, documented in code. Future work to switch to `git notes add -F <file>`.
 - **No maximum pending directory size (Review: Spec Problem #2):** Unlikely in practice. `MAX_RETRY_ATTEMPTS` caps individual record lifetime.
@@ -853,3 +851,23 @@ A code review was conducted after Phase 12 (REVIEW.md). The review confirmed 251
 
 ### Test Count
 - Total: 249 tests (was 251 before triage). Removed 2 tests for deleted `remote_org()` function.
+
+---
+
+## Final Triage
+
+Final cleanup pass before shipping. Addressed all remaining dead code and clippy warnings.
+
+### Fixed
+
+1. **Removed `matched_line` field from `SessionMatch` in scanner.rs.** The field was populated during scanning but never read in production code (only in 3 test assertions). Removing it eliminates the last clippy dead-code warning. The 3 test assertions were either removed (where redundant) or replaced with agent_type assertions. This achieves zero clippy warnings.
+
+2. **Removed unused `_repo_path` parameter from `codex::log_dirs()`.** Codex sessions are not scoped to a repo path, so this parameter was accepted only for API symmetry with `claude::log_dirs` but never used. Removed it and updated the 2 call sites in main.rs. The doc comment noting the unused parameter was also removed.
+
+3. **Removed unused `_repo_root` parameter from `push::should_push()`.** The doc comment claimed it was "used for logging context only" but it was not used at all. Removed the parameter, its doc comment line, the `use std::path::Path` import from push.rs production code, and updated all call sites (2 in main.rs, 5 in push.rs tests).
+
+### Verification
+
+- 249 tests passing (unchanged count)
+- Zero clippy warnings (was 1)
+- Formatting clean

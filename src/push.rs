@@ -18,8 +18,6 @@
 //! Push failures are always non-fatal: logged to stderr, never block the
 //! commit, never retry automatically in the hook.
 
-use std::path::Path;
-
 use crate::git;
 
 // ---------------------------------------------------------------------------
@@ -33,9 +31,7 @@ use crate::git;
 ///
 /// Returns `true` if all conditions are met and notes should be pushed.
 /// Returns `false` if any condition prevents pushing.
-///
-/// The `repo_root` parameter is used for logging context only.
-pub fn should_push(_repo_root: &Path) -> bool {
+pub fn should_push() -> bool {
     // Check 1: Does the repo have a remote?
     match git::has_upstream() {
         Ok(true) => {}
@@ -153,7 +149,7 @@ pub fn check_or_request_consent() -> bool {
 mod tests {
     use super::*;
     use serial_test::serial;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
     use tempfile::TempDir;
 
@@ -379,7 +375,7 @@ mod tests {
         std::env::set_current_dir(dir.path()).expect("failed to chdir");
 
         // No remote -- should_push should return false
-        assert!(!should_push(dir.path()));
+        assert!(!should_push());
 
         std::env::set_current_dir(original_cwd).unwrap();
     }
@@ -406,7 +402,7 @@ mod tests {
         run_git(dir.path(), &["config", "ai.barometer.autopush", "true"]);
 
         // should_push should return true (remote exists, no org filter, consent given)
-        assert!(should_push(dir.path()));
+        assert!(should_push());
 
         std::env::set_current_dir(original_cwd).unwrap();
     }
@@ -432,7 +428,7 @@ mod tests {
         // Explicitly deny consent
         run_git(dir.path(), &["config", "ai.barometer.autopush", "false"]);
 
-        assert!(!should_push(dir.path()));
+        assert!(!should_push());
 
         std::env::set_current_dir(original_cwd).unwrap();
     }
@@ -598,7 +594,7 @@ mod tests {
         }
 
         // should_push should return false because "actual-org" != "required-org"
-        assert!(!should_push(dir.path()));
+        assert!(!should_push());
 
         // Restore GIT_CONFIG_GLOBAL
         unsafe {
@@ -636,7 +632,7 @@ mod tests {
         }
 
         // should_push should return true because "my-org" matches
-        assert!(should_push(dir.path()));
+        assert!(should_push());
 
         // Restore
         unsafe {

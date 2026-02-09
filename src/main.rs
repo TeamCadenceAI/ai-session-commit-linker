@@ -285,7 +285,7 @@ fn hook_post_commit_inner() -> Result<()> {
     // Step 3: Collect candidate log directories from agents
     let mut candidate_dirs = Vec::new();
     candidate_dirs.extend(agents::claude::log_dirs(&repo_root));
-    candidate_dirs.extend(agents::codex::log_dirs(&repo_root));
+    candidate_dirs.extend(agents::codex::log_dirs());
 
     // Step 4: Filter candidate files by ±10 min (600 sec) window
     let candidate_files = agents::candidate_files(&candidate_dirs, head_timestamp, 600);
@@ -345,7 +345,7 @@ fn hook_post_commit_inner() -> Result<()> {
             );
 
             // Push notes if conditions are met (consent, org filter, remote exists)
-            if push::should_push(&repo_root) {
+            if push::should_push() {
                 push::attempt_push();
             }
         } else {
@@ -429,7 +429,7 @@ fn retry_pending_for_repo(repo_str: &str, repo_root: &std::path::Path) {
         // continued working after the commit.
         let mut candidate_dirs = Vec::new();
         candidate_dirs.extend(agents::claude::log_dirs(repo_root));
-        candidate_dirs.extend(agents::codex::log_dirs(repo_root));
+        candidate_dirs.extend(agents::codex::log_dirs());
 
         let candidate_files = agents::candidate_files(&candidate_dirs, record.commit_time, 86_400);
 
@@ -473,7 +473,7 @@ fn retry_pending_for_repo(repo_str: &str, repo_root: &std::path::Path) {
                     let _ = pending::remove(&record.commit);
 
                     // Push if conditions are met
-                    if push::should_push(repo_root) {
+                    if push::should_push() {
                         push::attempt_push();
                     }
                 } else {
