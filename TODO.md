@@ -44,11 +44,11 @@ Shared helpers that multiple subcommands depend on.
 
 ## Phase 4: Session Scanning & Correlation
 
-- [ ] `scanner::find_session_for_commit(commit_hash: &str, candidate_files: &[PathBuf]) -> Option<SessionMatch>` — stream each file line-by-line, substring match for full hash and short hash (first 7 chars), stop on first match
-- [ ] `scanner::SessionMatch` struct — fields: `file_path`, `matched_line`, `agent_type`
-- [ ] `scanner::parse_session_metadata(file: &Path) -> SessionMetadata` — parse minimal JSON fields: `session_id`, `cwd`/`workdir`, `agent_type`
-- [ ] `scanner::verify_match(metadata: &SessionMetadata, repo_root: &Path, commit: &str) -> bool` — confirm cwd resolves to same git repo, commit exists in repo
-- [ ] Unit tests: fake JSONL files with embedded commit hashes, verify match/no-match
+- [x] `scanner::find_session_for_commit(commit_hash: &str, candidate_files: &[PathBuf]) -> Option<SessionMatch>` — stream each file line-by-line, substring match for full hash and short hash (first 7 chars), stop on first match
+- [x] `scanner::SessionMatch` struct — fields: `file_path`, `matched_line`, `agent_type`
+- [x] `scanner::parse_session_metadata(file: &Path) -> SessionMetadata` — parse minimal JSON fields: `session_id`, `cwd`/`workdir`, `agent_type`
+- [x] `scanner::verify_match(metadata: &SessionMetadata, repo_root: &Path, commit: &str) -> bool` — confirm cwd resolves to same git repo, commit exists in repo
+- [x] Unit tests: fake JSONL files with embedded commit hashes, verify match/no-match
 
 ---
 

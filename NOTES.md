@@ -182,3 +182,52 @@ A code review was conducted after Phase 3 (16 findings). The following issues we
 
 ### Test Count
 - Total: 84 tests (was 83 before triage). Added 1 new test, renamed 1 test.
+
+---
+
+## Phase 4 Decisions
+
+### Module Layout
+- The scanner module is in `src/scanner.rs`, wired into the crate via `mod scanner;` in `main.rs`.
+- Contains three main public functions (`find_session_for_commit`, `parse_session_metadata`, `verify_match`) and two public types (`SessionMatch`, `SessionMetadata`).
+
+### Agent Type Inference
+- Agent type is inferred from the file path rather than from log content. If the path contains `.codex`, it is classified as Codex; otherwise it defaults to Claude. This is simple, reliable, and avoids parsing overhead.
+- The `AgentType` enum is defined in the scanner module (not in the agents module) because it is used primarily by scanner types. If other modules need it in the future, it can be moved to a shared location.
+- `AgentType` implements `Display` to produce the note-format strings: `"claude-code"` and `"codex"`.
+
+### Streaming Line-by-Line
+- `find_session_for_commit` uses `BufReader` to stream files line-by-line. This is critical because session logs can be very large (tens of MB) and loading them entirely into memory would be wasteful, especially in the hot post-commit hook path.
+- Lines that fail to read (I/O errors) are silently skipped, matching the defensive pattern used throughout the project.
+
+### Substring Matching Strategy
+- Both the full 40-character hash and the 7-character short hash are checked on every line.
+- The full hash is checked first (more specific, less likely to false-positive), then the short hash.
+- Stop-on-first-match: as soon as any line in any file matches, the function returns. This avoids scanning the rest of potentially large files.
+
+### Metadata Parsing
+- `parse_session_metadata` reads the file line-by-line, attempting to parse each line as JSON via `serde_json::Value`.
+- Looks for multiple field name variants: `session_id`/`sessionId` for the session ID, and `cwd`/`workdir`/`working_directory` for the working directory.
+- Fields are accumulated across lines (first value wins for each field). Once both `session_id` and `cwd` are found, parsing stops early.
+- Invalid JSON lines are silently skipped. This is intentional since JSONL files may contain non-JSON lines or malformed entries.
+
+### Verification
+- `verify_match` performs two checks: (1) the metadata's cwd resolves to the same git repo root as the target repo, and (2) the commit exists in that repo.
+- Uses `git -C <dir> rev-parse --show-toplevel` to resolve the repo root from the session's cwd. This handles the case where the cwd is a subdirectory of the repo.
+- Uses `git -C <repo> cat-file -t <commit>` to verify commit existence. This is a lightweight check that doesn't require checking out the commit.
+- Both paths are canonicalized before comparison to handle symlinks (e.g., on macOS where `/var` is a symlink to `/private/var`).
+- The git helper functions (`git_repo_root_at`, `git_commit_exists_at`) are private to the scanner module. They are similar to the helpers in `git.rs` but accept a directory parameter instead of using the process cwd. This keeps the scanner self-contained without modifying the git module's API.
+
+### Test Strategy
+- 35 new tests added (total: 119).
+- Tests cover:
+  - Full hash matching, short hash matching, no match, stop-on-first-match, match in second file, empty candidates, nonexistent files.
+  - Agent type inference from Claude and Codex paths, and unknown paths.
+  - Metadata parsing: session_id, camelCase sessionId, cwd, workdir, working_directory, fields across multiple lines, invalid JSON lines, empty files, nonexistent files, first-value-wins semantics.
+  - Verification: same repo, different repo, missing cwd, nonexistent cwd, nonexistent commit, cwd in subdirectory.
+  - End-to-end: find + parse + verify workflow.
+- Tests that need real git repos use the same `init_temp_repo` + `run_git` helper pattern established in Phase 2.
+- The "partial hash no false positive" test verifies that a 6-character substring does not match a 7-character short hash, confirming the boundary behavior.
+
+### Dead Code Warnings
+- As with Phases 2 and 3, all new `pub` items generate "never used" warnings because they are not called from production code yet. These will resolve when Phase 6 wires up the hook handler.

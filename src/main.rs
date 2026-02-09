@@ -1,5 +1,6 @@
 mod agents;
 mod git;
+mod scanner;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
