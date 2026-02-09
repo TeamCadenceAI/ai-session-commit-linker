@@ -6,11 +6,11 @@ Ordered by dependency. Complete each phase before starting the next.
 
 ## Phase 1: Project Scaffolding
 
-- [ ] `cargo init` with binary target, set package name to `ai-barometer`
-- [ ] Add dependencies: `clap` (CLI parsing), `serde` + `serde_json` (JSON), `sha2` (SHA-256), `chrono` (timestamps)
-- [ ] Set up CLI skeleton with `clap` derive API — subcommands: `install`, `hook` (with sub `post-commit`), `hydrate`, `retry`, `status`
-- [ ] Add top-level error handling: all subcommands return `Result`, main catches and prints errors without panicking
-- [ ] Add `#[cfg(test)]` test module scaffolding
+- [x] `cargo init` with binary target, set package name to `ai-barometer`
+- [x] Add dependencies: `clap` (CLI parsing), `serde` + `serde_json` (JSON), `sha2` (SHA-256), `chrono` (timestamps)
+- [x] Set up CLI skeleton with `clap` derive API — subcommands: `install`, `hook` (with sub `post-commit`), `hydrate`, `retry`, `status`
+- [x] Add top-level error handling: all subcommands return `Result`, main catches and prints errors without panicking
+- [x] Add `#[cfg(test)]` test module scaffolding
 
 ---
 
