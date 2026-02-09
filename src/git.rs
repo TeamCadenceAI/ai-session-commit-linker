@@ -277,6 +277,42 @@ pub fn has_upstream() -> Result<bool> {
     }
 }
 
+/// Return the URL of the first configured remote for the repo at `repo`.
+///
+/// Returns `None` if no remotes are configured. Returns an error only if
+/// the git commands themselves fail unexpectedly.
+pub(crate) fn first_remote_url_at(repo: &Path) -> Result<Option<String>> {
+    let repo_str = repo.to_string_lossy();
+    let output = Command::new("git")
+        .args(["-C", &repo_str, "remote"])
+        .output()
+        .context("failed to execute git remote")?;
+
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let remotes =
+        String::from_utf8(output.stdout).context("git remote output was not valid UTF-8")?;
+    let first = match remotes.lines().next() {
+        Some(name) if !name.is_empty() => name,
+        _ => return Ok(None),
+    };
+
+    let url_output = Command::new("git")
+        .args(["-C", &repo_str, "remote", "get-url", first])
+        .output()
+        .context("failed to execute git remote get-url")?;
+
+    if !url_output.status.success() {
+        return Ok(None);
+    }
+
+    let url = String::from_utf8(url_output.stdout)
+        .context("git remote get-url output was not valid UTF-8")?;
+    Ok(Some(url.trim().to_string()))
+}
+
 /// Extract owner/org from ALL remote URLs.
 ///
 /// Returns a deduplicated list of org names extracted from all configured

@@ -679,22 +679,34 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
             continue;
         }
 
+        // Skip sessions with no cwd silently — we can't determine the repo
+        let cwd = match &metadata.cwd {
+            Some(c) => c.clone(),
+            None => continue,
+        };
+
+        let cwd_path = std::path::Path::new(&cwd);
+
+        // Skip sessions whose cwd isn't a git repo (silently)
+        let repo_root = match git::repo_root_at(cwd_path) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
         let session_id = metadata
             .session_id
             .as_deref()
             .unwrap_or("unknown")
             .to_string();
 
-        // Determine repo name for display (last path component of cwd)
-        let repo_display = metadata
-            .cwd
-            .as_ref()
-            .and_then(|c| {
-                std::path::Path::new(c)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-            })
-            .unwrap_or_else(|| "unknown".to_string());
+        // Determine repo display: prefer remote URL, fall back to directory name
+        let repo_display = match git::first_remote_url_at(&repo_root) {
+            Ok(Some(url)) => url,
+            _ => repo_root
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+        };
 
         // Show short session_id for display (first 8 chars or full if shorter)
         let session_display = if session_id.len() > 8 {
@@ -714,36 +726,6 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
             skipped += 1;
             continue;
         }
-
-        // Step 5: Resolve repo once for the whole session (cwd is per-session)
-        let cwd = match &metadata.cwd {
-            Some(c) => c.clone(),
-            None => {
-                eprintln!(
-                    "{} | no cwd, skipping {} commits",
-                    header,
-                    commit_hashes.len()
-                );
-                errors += commit_hashes.len();
-                continue;
-            }
-        };
-
-        let cwd_path = std::path::Path::new(&cwd);
-
-        let repo_root = match git::repo_root_at(cwd_path) {
-            Ok(r) => r,
-            Err(_) => {
-                eprintln!(
-                    "{} | repo missing for {}, skipping {} commits",
-                    header,
-                    cwd,
-                    commit_hashes.len()
-                );
-                errors += commit_hashes.len();
-                continue;
-            }
-        };
 
         if !git::check_enabled_at(&repo_root) {
             continue;
