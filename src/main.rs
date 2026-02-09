@@ -1,3 +1,4 @@
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::process;
 
@@ -34,7 +35,7 @@ enum Command {
         since: String,
 
         /// Push notes to remote after hydration.
-        #[arg(long, default_value_t = false)]
+        #[arg(long)]
         push: bool,
     },
 
@@ -55,7 +56,7 @@ enum HookCommand {
 // Subcommand dispatch
 // ---------------------------------------------------------------------------
 
-fn run_install(org: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+fn run_install(org: Option<String>) -> Result<()> {
     eprintln!(
         "[ai-barometer] install: org={:?} (not yet implemented)",
         org
@@ -63,12 +64,12 @@ fn run_install(org: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn run_hook_post_commit() -> Result<(), Box<dyn std::error::Error>> {
+fn run_hook_post_commit() -> Result<()> {
     eprintln!("[ai-barometer] hook post-commit (not yet implemented)");
     Ok(())
 }
 
-fn run_hydrate(since: &str, push: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn run_hydrate(since: &str, push: bool) -> Result<()> {
     eprintln!(
         "[ai-barometer] hydrate: since={}, push={} (not yet implemented)",
         since, push
@@ -76,12 +77,12 @@ fn run_hydrate(since: &str, push: bool) -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
-fn run_retry() -> Result<(), Box<dyn std::error::Error>> {
+fn run_retry() -> Result<()> {
     eprintln!("[ai-barometer] retry (not yet implemented)");
     Ok(())
 }
 
-fn run_status() -> Result<(), Box<dyn std::error::Error>> {
+fn run_status() -> Result<()> {
     eprintln!("[ai-barometer] status (not yet implemented)");
     Ok(())
 }
@@ -202,5 +203,33 @@ mod tests {
     #[test]
     fn run_status_returns_ok() {
         assert!(run_status().is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Negative CLI parsing tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cli_rejects_unknown_subcommand() {
+        let result = Cli::try_parse_from(["ai-barometer", "frobnicate"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cli_rejects_hook_without_sub_subcommand() {
+        let result = Cli::try_parse_from(["ai-barometer", "hook"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cli_rejects_hydrate_since_missing_value() {
+        let result = Cli::try_parse_from(["ai-barometer", "hydrate", "--since"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cli_rejects_no_subcommand() {
+        let result = Cli::try_parse_from(["ai-barometer"]);
+        assert!(result.is_err());
     }
 }
