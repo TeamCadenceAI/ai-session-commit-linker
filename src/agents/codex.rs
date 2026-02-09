@@ -142,6 +142,21 @@ mod tests {
         assert_eq!(result.len(), 3);
     }
 
+    // -----------------------------------------------------------------------
+    // Phase 12 hardening: missing ~/.codex/ directory
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_log_dirs_graceful_when_codex_dir_missing() {
+        // If ~/.codex/ does not exist at all, log_dirs should return
+        // an empty Vec, not error.
+        let home = TempDir::new().unwrap();
+        // Don't create .codex/ at all
+
+        let result = log_dirs_in(home.path());
+        assert!(result.is_empty());
+    }
+
     #[test]
     fn test_log_dirs_empty_sessions_directory() {
         let home = TempDir::new().unwrap();

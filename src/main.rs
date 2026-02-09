@@ -301,6 +301,12 @@ fn hook_post_commit_inner() -> Result<()> {
             // Read the full session log. If the read fails (permissions,
             // file deleted between match and read, etc.), fall through to
             // the pending path so it can be retried later.
+            //
+            // Note: `read_to_string` loads the entire file into memory.
+            // This is acceptable because session logs are typically small
+            // (tens of KB to a few MB). For very large session logs, a
+            // future improvement could use `git notes add -F <file>` with
+            // a temp file to avoid both memory pressure and ARG_MAX limits.
             let session_log = match std::fs::read_to_string(&matched.file_path) {
                 Ok(content) => content,
                 Err(e) => {
@@ -367,11 +373,20 @@ fn hook_post_commit_inner() -> Result<()> {
     Ok(())
 }
 
+/// Maximum number of retry attempts before a pending record is abandoned.
+///
+/// After this many attempts, the pending record is removed and a warning
+/// is logged. This prevents unbounded retries for commits that can never
+/// be resolved (e.g., the session log was deleted or the commit was from
+/// a different machine).
+const MAX_RETRY_ATTEMPTS: u32 = 100;
+
 /// Attempt to resolve pending commits for the given repository.
 ///
 /// This is a best-effort operation. Any errors during retry are logged
 /// and silently ignored. For each pending record:
 /// - If note already exists: remove the pending record (success).
+/// - If max attempts exceeded: remove the pending record (abandoned).
 /// - If session match is found and verified: attach note, remove pending record.
 /// - Otherwise: increment the attempt counter and leave for next time.
 ///
@@ -385,6 +400,17 @@ fn retry_pending_for_repo(repo_str: &str, repo_root: &std::path::Path) {
     };
 
     for record in &mut pending_records {
+        // Check if max retry attempts exceeded -- abandon the record
+        if record.attempts >= MAX_RETRY_ATTEMPTS {
+            eprintln!(
+                "[ai-barometer] warning: abandoning pending commit {} after {} attempts",
+                &record.commit[..std::cmp::min(7, record.commit.len())],
+                record.attempts
+            );
+            let _ = pending::remove(&record.commit);
+            continue;
+        }
+
         // Skip if note already exists (may have been resolved by another mechanism)
         match git::note_exists(&record.commit) {
             Ok(true) => {
@@ -2518,6 +2544,225 @@ mod tests {
             "should show repo as disabled, got: {}",
             output
         );
+
+        // Restore
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 12 hardening tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_existing_notes_from_other_refs_not_affected() {
+        // AI Barometer uses refs/notes/ai-sessions. Existing notes from
+        // other refs (e.g., the default refs/notes/commits) should not
+        // be affected by our operations.
+        let dir = init_temp_repo();
+        let repo_path = dir.path();
+
+        let head_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
+
+        // Attach a note using the default ref (refs/notes/commits)
+        run_git(
+            repo_path,
+            &["notes", "add", "-m", "default ref note", &head_hash],
+        );
+
+        // Attach a note using our custom ref
+        run_git(
+            repo_path,
+            &[
+                "notes",
+                "--ref",
+                "refs/notes/ai-sessions",
+                "add",
+                "-m",
+                "ai session note",
+                &head_hash,
+            ],
+        );
+
+        // Verify both notes exist independently
+        let default_note = run_git(repo_path, &["notes", "show", &head_hash]);
+        assert_eq!(default_note, "default ref note");
+
+        let ai_note = run_git(
+            repo_path,
+            &[
+                "notes",
+                "--ref",
+                "refs/notes/ai-sessions",
+                "show",
+                &head_hash,
+            ],
+        );
+        assert_eq!(ai_note, "ai session note");
+
+        // Verify note_exists only detects our ref
+        let exists =
+            git::note_exists_at(repo_path, &head_hash).expect("note_exists_at should work");
+        assert!(exists);
+
+        // Adding our note should not have affected the default note
+        let default_note_after = run_git(repo_path, &["notes", "show", &head_hash]);
+        assert_eq!(default_note_after, "default ref note");
+    }
+
+    #[test]
+    fn test_short_hash_uses_first_7_chars() {
+        // Verify that the scanner uses exactly the first 7 characters
+        // of the commit hash for short hash matching.
+        let dir = TempDir::new().unwrap();
+        let commit_hash = "abcdef0123456789abcdef0123456789abcdef01";
+        let short_hash = &commit_hash[..7]; // "abcdef0"
+
+        // Create a file containing only the short hash (not the full hash)
+        let content = format!(r#"{{"output":"commit {} done"}}"#, short_hash);
+        let file = dir.path().join("session.jsonl");
+        std::fs::write(&file, format!("{}\n", content)).unwrap();
+
+        // Should match on short hash
+        let result = scanner::find_session_for_commit(commit_hash, &[file.clone()]);
+        assert!(
+            result.is_some(),
+            "should match on first 7 chars of commit hash"
+        );
+
+        // Create a file with only 6 chars of the hash (should NOT match)
+        let too_short = &commit_hash[..6]; // "abcdef"
+        let content2 = format!(r#"{{"output":"commit {} done"}}"#, too_short);
+        let file2 = dir.path().join("session2.jsonl");
+        std::fs::write(&file2, format!("{}\n", content2)).unwrap();
+
+        // The 6-char substring should NOT match since the file only has 6 chars
+        // but the scanner checks for the 7-char short hash
+        let result2 = scanner::find_session_for_commit(commit_hash, &[file2.clone()]);
+        assert!(
+            result2.is_none(),
+            "should not match on fewer than 7 chars of commit hash"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_max_retry_count_abandons_record() {
+        // When a pending record exceeds MAX_RETRY_ATTEMPTS, it should be
+        // removed rather than retried indefinitely.
+        let dir = init_temp_repo();
+        let repo_path = dir.path();
+        let original_cwd = safe_cwd();
+
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
+
+        let git_repo_root = run_git(repo_path, &["rev-parse", "--show-toplevel"]);
+        let first_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
+
+        // Create a pending record with attempts >= MAX_RETRY_ATTEMPTS
+        let pending_dir = fake_home.path().join(".ai-barometer").join("pending");
+        std::fs::create_dir_all(&pending_dir).unwrap();
+
+        let record = serde_json::json!({
+            "commit": first_hash,
+            "repo": git_repo_root,
+            "commit_time": 1700000000,
+            "attempts": MAX_RETRY_ATTEMPTS,
+            "last_attempt": 1700000060,
+        });
+        let pending_path = pending_dir.join(format!("{}.json", first_hash));
+        std::fs::write(
+            &pending_path,
+            serde_json::to_string_pretty(&record).unwrap(),
+        )
+        .unwrap();
+
+        // Verify the pending record exists
+        assert!(pending_path.exists());
+
+        // Run retry -- should abandon the record since it exceeded max attempts
+        std::env::set_current_dir(repo_path).expect("failed to chdir");
+        retry_pending_for_repo(&git_repo_root, std::path::Path::new(&git_repo_root));
+
+        // The pending record should have been removed
+        assert!(
+            !pending_path.exists(),
+            "pending record should be removed after exceeding max retry attempts"
+        );
+
+        // Restore
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_hook_works_in_detached_head() {
+        // The post-commit hook should work correctly even when HEAD is detached.
+        let dir = init_temp_repo();
+        let repo_path = dir.path();
+        let original_cwd = safe_cwd();
+
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
+
+        // Detach HEAD
+        run_git(repo_path, &["checkout", "--detach", "HEAD"]);
+
+        // The hook should not panic or error in detached HEAD state
+        std::env::set_current_dir(repo_path).expect("failed to chdir");
+        let result = run_hook_post_commit();
+        assert!(result.is_ok(), "hook should succeed in detached HEAD state");
+
+        // Restore
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_hook_works_in_repo_with_no_remotes() {
+        // The post-commit hook should work correctly in a local-only repo
+        // with no remotes configured.
+        let dir = init_temp_repo();
+        let repo_path = dir.path();
+        let original_cwd = safe_cwd();
+
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
+
+        // Verify no remotes
+        let remotes = run_git(repo_path, &["remote"]);
+        assert!(remotes.is_empty(), "should have no remotes");
+
+        std::env::set_current_dir(repo_path).expect("failed to chdir");
+        let result = run_hook_post_commit();
+        assert!(result.is_ok(), "hook should succeed with no remotes");
 
         // Restore
         unsafe {

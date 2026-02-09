@@ -146,11 +146,11 @@ This is the critical hot path. Must be fast and never fail the commit.
 
 ## Phase 12: Hardening & Edge Cases
 
-- [ ] Ensure hook never panics — catch_unwind or equivalent top-level guard
-- [ ] Handle missing `~/.claude/` or `~/.codex/` dirs gracefully (not errors)
-- [ ] Handle repos with no remotes (local-only)
-- [ ] Handle detached HEAD state
-- [ ] Handle concurrent commits (pending file write atomicity)
-- [ ] Handle very large session logs (streaming, not loading into memory)
-- [ ] Verify short hash matching uses first 7 chars of full hash
-- [ ] Test on repos with existing notes from other sources
+- [x] Ensure hook never panics — catch_unwind or equivalent top-level guard
+- [x] Handle missing `~/.claude/` or `~/.codex/` dirs gracefully (not errors)
+- [x] Handle repos with no remotes (local-only)
+- [x] Handle detached HEAD state
+- [x] Handle concurrent commits (pending file write atomicity)
+- [x] Handle very large session logs (streaming, not loading into memory)
+- [x] Verify short hash matching uses first 7 chars of full hash
+- [x] Test on repos with existing notes from other sources

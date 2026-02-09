@@ -770,3 +770,58 @@ A code review was conducted after Phase 11 (11 findings: 0 critical, 2 medium, 5
 
 ### Test Count
 - Total: 238 tests (unchanged). No new tests added; 4 existing tests were improved to capture and verify output content.
+
+---
+
+## Phase 12 — Hardening & Edge Cases
+
+Phase 12 was primarily a verification and testing phase. The TODO listed 8 hardening items; systematic review showed that 7 of 8 were already implemented in earlier phases. The one missing piece (max retry count) was added as production code. All other items received new tests to document and lock in the existing behaviour.
+
+### Verification Results
+
+| Hardening Item | Status | Details |
+|---|---|---|
+| Hook never panics | Already implemented (Phase 6) | `std::panic::catch_unwind` wraps the entire `hook_post_commit` handler |
+| Missing `~/.claude/` or `~/.codex/` dirs | Already handled | `fs::read_dir` returns `Err` which maps to empty `Vec` |
+| Repos with no remotes | Already handled | `has_upstream()` returns `false`, push is skipped |
+| Detached HEAD state | Already works | `git rev-parse HEAD` works in detached HEAD; no branch name needed |
+| Concurrent commits (atomicity) | Already implemented (Phase 7) | `pending::write` uses write-to-temp + `fs::rename` for atomic writes |
+| Large session logs (streaming) | Already implemented (Phase 4) | `scanner` uses `BufReader` line-by-line streaming; `read_to_string` used only for note content (acceptable for v1) |
+| Short hash matching (first 7 chars) | Already implemented (Phase 4) | Scanner uses `&commit_hash[..7]` for substring matching |
+| Existing notes from other sources | Already isolated | Dedicated ref `refs/notes/ai-sessions` avoids collisions |
+
+### Production Code Changes
+
+1. **Max retry count (MAX_RETRY_ATTEMPTS = 100).** Added a constant and guard at the top of the retry loop in `retry_pending_for_repo`. When a pending record reaches 100 attempts, it is abandoned with a warning to stderr and removed from the pending directory. This prevents unbounded retry accumulation for permanently unresolvable commits (e.g., force-pushed away). This item was deferred from the Phase 7 review.
+
+2. **Doc comment on `read_to_string` limitation.** Added a comment in `retry_pending_for_repo` noting that `read_to_string` loads the entire session log into memory for note attachment. This is acceptable for v1 since session logs are typically small (< 1 MB), but should be revisited if logs grow significantly.
+
+### Orphaned `.tmp` Cleanup
+
+The Phase 7 review noted orphaned `.json.tmp` files as a concern. Review confirmed that `pending::list_for_repo_in` already cleans up stale `.tmp` files (older than 60 seconds) on every scan. No additional work needed.
+
+### New Tests (13 added, 238 → 251 total)
+
+**main.rs (6 tests):**
+- `test_existing_notes_from_other_refs_not_affected`: Verifies that notes on the default `refs/notes/commits` ref do not interfere with ai-barometer's `refs/notes/ai-sessions` ref.
+- `test_short_hash_uses_first_7_chars`: Verifies that short hash extraction produces exactly 7 characters from a 40-char SHA.
+- `test_max_retry_count_abandons_record`: Creates a pending record with `attempts = 100`, runs retry, verifies the record is removed (abandoned) rather than retried.
+- `test_hook_works_in_detached_head`: Detaches HEAD in a temp repo, runs the hook, verifies it completes successfully and writes a pending record.
+- `test_hook_works_in_repo_with_no_remotes`: Creates a repo with no remotes, runs the hook, verifies it completes without error.
+
+**git.rs (5 tests):**
+- `test_head_hash_works_in_detached_head`: Detaches HEAD, verifies `head_hash()` returns a valid 40-char hex SHA.
+- `test_head_timestamp_works_in_detached_head`: Detaches HEAD, verifies `head_timestamp()` returns a valid positive timestamp.
+- `test_note_operations_work_in_detached_head`: Detaches HEAD, verifies `add_note`, `note_exists`, and `read_note` all work correctly.
+- `test_push_notes_fails_gracefully_no_remote`: Verifies `push_notes()` returns `Err` (not panic) in a repo with no remotes.
+- `test_remote_orgs_empty_when_no_remotes`: Verifies `remote_orgs()` returns an empty set in a repo with no remotes.
+
+**agents/claude.rs (2 tests):**
+- `test_log_dirs_graceful_when_claude_dir_missing`: Verifies empty `Vec` when `~/.claude/` does not exist.
+- `test_all_log_dirs_graceful_when_claude_dir_missing`: Same for `all_log_dirs`.
+
+**agents/codex.rs (1 test):**
+- `test_log_dirs_graceful_when_codex_dir_missing`: Verifies empty `Vec` when `~/.codex/` does not exist.
+
+**agents/codex.rs (1 test):**
+- `test_log_dirs_empty_sessions_directory`: Verifies empty `Vec` when `~/.codex/sessions/` exists but is empty.

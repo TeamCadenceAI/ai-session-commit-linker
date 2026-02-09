@@ -260,6 +260,29 @@ mod tests {
         assert_eq!(result.len(), 1);
     }
 
+    // -----------------------------------------------------------------------
+    // Phase 12 hardening: missing ~/.claude/ directory
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_log_dirs_graceful_when_claude_dir_missing() {
+        // If ~/.claude/ does not exist at all (not just projects/),
+        // log_dirs should return an empty Vec, not error.
+        let home = TempDir::new().unwrap();
+        // Don't create .claude/ at all
+
+        let result = log_dirs_in(Path::new("/Users/foo/bar"), home.path());
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_all_log_dirs_graceful_when_claude_dir_missing() {
+        // Same for all_log_dirs: missing ~/.claude/ should not error.
+        let home = TempDir::new().unwrap();
+        let result = all_log_dirs_in(home.path());
+        assert!(result.is_empty());
+    }
+
     #[test]
     fn test_log_dirs_hardcoded_roundtrip() {
         // This test uses a hardcoded directory name (not computed via

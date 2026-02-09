@@ -1012,4 +1012,86 @@ mod tests {
 
         std::env::set_current_dir(original_cwd).unwrap();
     }
+
+    // -----------------------------------------------------------------------
+    // Phase 12 hardening: detached HEAD
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_head_hash_works_in_detached_head() {
+        let dir = init_temp_repo();
+        let path = dir.path();
+
+        // Get the current HEAD hash, then detach HEAD
+        let hash = run_git(path, &["rev-parse", "HEAD"]);
+        run_git(path, &["checkout", "--detach", "HEAD"]);
+
+        // `git rev-parse HEAD` should still return the same hash in detached state
+        let detached_hash = git_output_in(path, &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(hash, detached_hash);
+        assert_eq!(detached_hash.len(), 40);
+    }
+
+    #[test]
+    fn test_head_timestamp_works_in_detached_head() {
+        let dir = init_temp_repo();
+        let path = dir.path();
+
+        // Get the timestamp before detaching
+        let ts_before = git_output_in(path, &["show", "-s", "--format=%ct", "HEAD"]).unwrap();
+
+        run_git(path, &["checkout", "--detach", "HEAD"]);
+
+        // Timestamp should still be readable in detached state
+        let ts_after = git_output_in(path, &["show", "-s", "--format=%ct", "HEAD"]).unwrap();
+        assert_eq!(ts_before, ts_after);
+    }
+
+    #[test]
+    fn test_note_operations_work_in_detached_head() {
+        let dir = init_temp_repo();
+        let path = dir.path();
+
+        let hash = run_git(path, &["rev-parse", "HEAD"]);
+        run_git(path, &["checkout", "--detach", "HEAD"]);
+
+        // note_exists_at should work in detached HEAD
+        let exists = note_exists_at(path, &hash).expect("note_exists_at failed in detached HEAD");
+        assert!(!exists);
+
+        // add_note_at should work in detached HEAD
+        add_note_at(path, &hash, "test detached note")
+            .expect("add_note_at failed in detached HEAD");
+
+        // Verify the note was attached
+        let exists = note_exists_at(path, &hash).expect("note_exists_at failed after add");
+        assert!(exists);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 12 hardening: repo with no remotes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn test_push_notes_fails_gracefully_no_remote() {
+        let (_dir, original_cwd) = enter_temp_repo();
+
+        // push_notes should fail (no remote) but not panic
+        let result = push_notes();
+        assert!(result.is_err());
+
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_remote_orgs_empty_when_no_remotes() {
+        let (_dir, original_cwd) = enter_temp_repo();
+
+        let orgs = remote_orgs().expect("remote_orgs failed");
+        assert!(orgs.is_empty());
+
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
 }
