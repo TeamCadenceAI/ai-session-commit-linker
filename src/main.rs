@@ -367,7 +367,7 @@ fn hook_post_commit_inner() -> Result<()> {
         }
     }
 
-    // Step 7: Retry pending commits for this repo (stub — Phase 7 will implement fully)
+    // Step 7: Retry pending commits for this repo
     retry_pending_for_repo(&repo_root_str, &repo_root);
 
     Ok(())
@@ -379,7 +379,7 @@ fn hook_post_commit_inner() -> Result<()> {
 /// is logged. This prevents unbounded retries for commits that can never
 /// be resolved (e.g., the session log was deleted or the commit was from
 /// a different machine).
-const MAX_RETRY_ATTEMPTS: u32 = 100;
+const MAX_RETRY_ATTEMPTS: u32 = 20;
 
 /// Attempt to resolve pending commits for the given repository.
 ///

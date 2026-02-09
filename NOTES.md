@@ -825,3 +825,31 @@ The Phase 7 review noted orphaned `.json.tmp` files as a concern. Review confirm
 
 **agents/codex.rs (1 test):**
 - `test_log_dirs_empty_sessions_directory`: Verifies empty `Vec` when `~/.codex/sessions/` exists but is empty.
+
+---
+
+## Phase 12 Review Triage
+
+A code review was conducted after Phase 12 (REVIEW.md). The review confirmed 251 tests passing, clippy clean (2 expected dead-code warnings), and formatting clean. No bugs were found. Four cleanup items were identified and fixed.
+
+### Fixed
+
+1. **Removed dead code `remote_org()` from git.rs (Review: Dead Code #1).** Deleted the `remote_org()` function (superseded by `remote_orgs()` in Phase 8) and its two serial tests (`test_api_remote_org_no_remote`, `test_api_remote_org_with_remote`). Renamed `test_remote_org_integration` to `test_parse_org_from_url_integration` since it actually tests `parse_org_from_url`, not `remote_org`. This eliminates one of the two clippy dead-code warnings.
+
+2. **Removed unused `chrono` dependency from Cargo.toml (Review: Dead Code #3).** The `chrono` crate was declared as a dependency in Phase 1 for anticipated future use, but was never imported anywhere in the source code. All timestamp handling uses raw `i64` unix timestamps. Removing it reduces compile time and dependency surface.
+
+3. **Fixed stale comment in main.rs (Review: Refactoring #1).** Updated the Step 7 comment from `"stub -- Phase 7 will implement fully"` to just `"Retry pending commits for this repo"`. The retry system was fully implemented in Phase 7.
+
+4. **Reduced `MAX_RETRY_ATTEMPTS` from 100 to 20 (Review: MAX_RETRY_ATTEMPTS Observation).** A value of 100 was unnecessarily high. If the hook fires on every commit, a permanently unresolvable pending record would persist for 100 future commits. A value of 20 is equally safe and more practical. The test (`test_max_retry_count_abandons_record`) uses the constant directly so it adapts automatically.
+
+### Deferred
+
+- **`matched_line` dead code (Review: Dead Code #2):** Kept with existing clippy warning. The field may be useful for debugging or future features.
+- **`_repo_root` parameter on `push::should_push` (Review: Refactoring #2):** Harmless, low priority.
+- **Named constants for time window values (Review: Refactoring #3):** Nice to have but not blocking. The values are used in only one place each.
+- **`read_to_string` + `git notes add -m` pipeline (Review: Spec Problem #1):** Known limitation, documented in code. Future work to switch to `git notes add -F <file>`.
+- **No maximum pending directory size (Review: Spec Problem #2):** Unlikely in practice. `MAX_RETRY_ATTEMPTS` caps individual record lifetime.
+- **Test gaps (Review: Test Quality Gaps):** Race condition test for `read_to_string` failure, orphaned `.tmp` cleanup test, and `catch_unwind` test are all hard to test without injection mechanisms. Accepted as known gaps.
+
+### Test Count
+- Total: 249 tests (was 251 before triage). Removed 2 tests for deleted `remote_org()` function.

@@ -260,27 +260,6 @@ pub fn has_upstream() -> Result<bool> {
     }
 }
 
-/// Extract the owner/org from the first remote URL.
-///
-/// Supports:
-/// - SSH:   `git@github.com:org/repo.git`
-/// - HTTPS: `https://github.com/org/repo.git`
-///
-/// Returns `None` if no remote is configured or the URL cannot be parsed.
-///
-/// **Note:** Only inspects the first remote. Use [`remote_orgs`] to check all
-/// remotes (needed for org filtering per PLAN.md).
-pub fn remote_org() -> Result<Option<String>> {
-    let remotes = git_output(&["remote"])?;
-    let first_remote = match remotes.lines().next() {
-        Some(r) => r,
-        None => return Ok(None),
-    };
-
-    let url = git_output(&["remote", "get-url", first_remote])?;
-    Ok(parse_org_from_url(&url))
-}
-
 /// Extract owner/org from ALL remote URLs.
 ///
 /// Returns a deduplicated list of org names extracted from all configured
@@ -660,11 +639,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // remote_org (integration test with temp repo)
+    // parse_org_from_url (integration test with temp repo)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_remote_org_integration() {
+    fn test_parse_org_from_url_integration() {
         let dir = init_temp_repo();
         let path = dir.path();
         run_git(
@@ -916,33 +895,6 @@ mod tests {
             ],
         );
         assert!(has_upstream().expect("has_upstream failed"));
-        std::env::set_current_dir(original_cwd).unwrap();
-    }
-
-    #[test]
-    #[serial]
-    fn test_api_remote_org_no_remote() {
-        let (_dir, original_cwd) = enter_temp_repo();
-        let org = remote_org().expect("remote_org failed");
-        assert_eq!(org, None);
-        std::env::set_current_dir(original_cwd).unwrap();
-    }
-
-    #[test]
-    #[serial]
-    fn test_api_remote_org_with_remote() {
-        let (dir, original_cwd) = enter_temp_repo();
-        run_git(
-            dir.path(),
-            &[
-                "remote",
-                "add",
-                "origin",
-                "git@github.com:acme-corp/widgets.git",
-            ],
-        );
-        let org = remote_org().expect("remote_org failed");
-        assert_eq!(org, Some("acme-corp".to_string()));
         std::env::set_current_dir(original_cwd).unwrap();
     }
 
