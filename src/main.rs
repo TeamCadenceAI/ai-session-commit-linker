@@ -2,6 +2,7 @@ mod agents;
 mod git;
 mod note;
 mod pending;
+mod push;
 mod scanner;
 
 use anyhow::Result;
@@ -101,6 +102,11 @@ fn run_hook_post_commit() -> Result<()> {
 /// This function is allowed to return errors — the caller (`run_hook_post_commit`)
 /// catches all errors and panics.
 fn hook_post_commit_inner() -> Result<()> {
+    // Step 0: Per-repo enabled check — if disabled, skip EVERYTHING
+    if !push::check_enabled() {
+        return Ok(());
+    }
+
     // Step 1: Get repo root, HEAD hash, HEAD timestamp
     let repo_root = git::repo_root()?;
     let head_hash = git::head_hash()?;
@@ -168,8 +174,10 @@ fn hook_post_commit_inner() -> Result<()> {
                 &head_hash[..7]
             );
 
-            // Push logic (stub — Phase 8 will implement fully)
-            // For now, we skip pushing entirely.
+            // Push notes if conditions are met (consent, org filter, remote exists)
+            if push::should_push(&repo_root) {
+                push::attempt_push();
+            }
         } else {
             // Verification failed — treat as no match, write pending
             if let Err(e) = pending::write_pending(&head_hash, &repo_root_str, head_timestamp) {
@@ -273,6 +281,11 @@ fn retry_pending_for_repo(repo_str: &str, repo_root: &std::path::Path) {
                         &record.commit[..std::cmp::min(7, record.commit.len())]
                     );
                     let _ = pending::remove(&record.commit);
+
+                    // Push if conditions are met
+                    if push::should_push(repo_root) {
+                        push::attempt_push();
+                    }
                 } else {
                     let _ = pending::increment(record);
                 }

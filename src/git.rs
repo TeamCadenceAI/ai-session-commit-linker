@@ -185,9 +185,8 @@ pub fn has_upstream() -> Result<bool> {
 ///
 /// Returns `None` if no remote is configured or the URL cannot be parsed.
 ///
-/// **Note:** Only inspects the first remote. Phase 8 (org filtering) will need
-/// to check all remotes per the PLAN.md requirement: "Extract owner from **all**
-/// Git remotes. If **any** remote matches org, allowed."
+/// **Note:** Only inspects the first remote. Use [`remote_orgs`] to check all
+/// remotes (needed for org filtering per PLAN.md).
 pub fn remote_org() -> Result<Option<String>> {
     let remotes = git_output(&["remote"])?;
     let first_remote = match remotes.lines().next() {
@@ -197,6 +196,32 @@ pub fn remote_org() -> Result<Option<String>> {
 
     let url = git_output(&["remote", "get-url", first_remote])?;
     Ok(parse_org_from_url(&url))
+}
+
+/// Extract owner/org from ALL remote URLs.
+///
+/// Returns a deduplicated list of org names extracted from all configured
+/// remotes. This is used for org filtering: "Extract owner from **all** Git
+/// remotes. If **any** remote matches org, allowed." (PLAN.md)
+///
+/// Returns an empty Vec if no remotes are configured or no URLs can be parsed.
+pub fn remote_orgs() -> Result<Vec<String>> {
+    let remotes = git_output(&["remote"])?;
+    let mut orgs = Vec::new();
+
+    for remote_name in remotes.lines() {
+        if remote_name.is_empty() {
+            continue;
+        }
+        if let Ok(url) = git_output(&["remote", "get-url", remote_name])
+            && let Some(org) = parse_org_from_url(&url)
+            && !orgs.contains(&org)
+        {
+            orgs.push(org);
+        }
+    }
+
+    Ok(orgs)
 }
 
 /// Parse the owner/org segment from a git remote URL.
@@ -251,6 +276,35 @@ pub fn config_get(key: &str) -> Result<Option<String>> {
             let stderr = String::from_utf8_lossy(&output.stderr);
             bail!(
                 "git config --get {:?} failed (exit {}): {}",
+                key,
+                code,
+                stderr.trim()
+            );
+        }
+        return Ok(None);
+    }
+
+    let value =
+        String::from_utf8(output.stdout).context("git config output was not valid UTF-8")?;
+    Ok(Some(value.trim().to_string()))
+}
+
+/// Read a git config value from global scope. Returns `Ok(None)` if the key is not set.
+///
+/// Uses `--global` flag to read only the global config, not repo-local.
+/// This is used for settings like `ai.barometer.org` that are set at install time.
+pub fn config_get_global(key: &str) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .args(["config", "--global", "--get", key])
+        .output()
+        .context("failed to execute git config --global --get")?;
+
+    if !output.status.success() {
+        let code = output.status.code().unwrap_or(-1);
+        if code != 1 {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!(
+                "git config --global --get {:?} failed (exit {}): {}",
                 key,
                 code,
                 stderr.trim()

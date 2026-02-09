@@ -463,3 +463,50 @@ A code review was conducted after Phase 7 (28 findings: 0 critical, 2 medium, 10
 
 ### Test Count
 - Total: 168 tests (was 166 before triage). Added 2 new tests: `test_increment_on_nonexistent_file_creates_it`, `test_list_for_repo_cleans_up_orphaned_tmp_files`.
+
+---
+
+## Phase 8 Decisions
+
+### Module Layout
+- The push decision logic is in `src/push.rs`, wired into the crate via `mod push;` in `main.rs`.
+- Contains five public functions: `check_enabled()`, `should_push()`, `attempt_push()`, `check_org_filter()`, `check_or_request_consent()`.
+
+### Per-Repo Disable: Skips EVERYTHING
+- `git config ai.barometer.enabled false` causes the hook to return immediately before any processing. This is not just a push disable -- it skips session scanning, note attachment, pending record creation, and retry logic. The check is placed at the very top of `hook_post_commit_inner()` (Step 0, before Step 1).
+- Any value other than exactly `"false"` (including unset) is treated as enabled. This ensures the default behavior is to run.
+
+### Push Decision Orchestration
+- `should_push()` orchestrates three checks in order: (1) has upstream remote, (2) org filter passes, (3) autopush consent granted.
+- Each check can independently prevent pushing. If any returns false, notes are attached locally only.
+- The `check_enabled()` check is done by the caller (in `hook_post_commit_inner`) separately because it gates ALL processing, not just push.
+
+### Org Filter
+- The org filter value is stored in `git config --global ai.barometer.org` (global scope, set at install time).
+- Added `git::config_get_global()` to read global-scope config separately from repo-local config.
+- Added `git::remote_orgs()` that extracts orgs from ALL remotes (not just the first). This satisfies the PLAN.md requirement: "Extract owner from **all** Git remotes. If **any** remote matches org, allowed."
+- Org comparison is case-insensitive (`eq_ignore_ascii_case`) to handle GitHub orgs that may differ in case between URLs and the configured filter value.
+- The `remote_orgs()` function deduplicates results (same org from multiple remotes is counted once).
+- If no global org filter is configured, the filter passes (no restriction on push).
+
+### Autopush Consent Flow
+- On first push for a repo (no `ai.barometer.autopush` config set), a clear warning is printed to stderr explaining what will happen and how to disable it.
+- The consent is recorded by setting `git config ai.barometer.autopush true` (repo-local scope).
+- If `ai.barometer.autopush` is explicitly set to `"false"`, push is denied (user opted out).
+- If the config write fails, the push still proceeds for this invocation -- we don't want a config write failure to block a push that the user implicitly consented to by having the tool installed.
+
+### Push Failure Handling
+- `attempt_push()` calls `git::push_notes()` and catches any error, logging it as a warning to stderr.
+- Push failures never block the commit, never return an error, and are never retried automatically in the hook.
+- This matches the PLAN.md safety requirements exactly.
+
+### Push in Retry Path
+- Push logic is also wired into the `retry_pending_for_repo()` function. When a pending commit is successfully resolved and a note is attached, the push decision is evaluated and push is attempted if conditions are met. This ensures notes from retried commits also get pushed.
+
+### Dead Code Warnings
+- The pre-existing `remote_org` function is now unused (replaced by `remote_orgs` for the org filter use case). The warning persists -- `remote_org` may still be useful for future single-remote queries (e.g., the `status` subcommand in Phase 11).
+- The `matched_line` field on `SessionMatch` remains unused but is preserved for future use (e.g., verbose logging in the `hydrate` command).
+
+### Test Count
+- Total: 187 tests (was 168 before Phase 8). Added 19 new tests:
+  - **push module (17 tests):** `test_check_enabled_default_true`, `test_check_enabled_explicitly_true`, `test_check_enabled_explicitly_false`, `test_check_enabled_other_value_treated_as_true`, `test_consent_first_time_grants_and_records`, `test_consent_already_true`, `test_consent_explicitly_false_denies`, `test_consent_second_call_is_silent`, `test_org_filter_no_config_allows_push`, `test_org_filter_matching_org_allows_push`, `test_org_filter_no_remote_denies_push`, `test_should_push_no_remote_returns_false`, `test_should_push_with_remote_and_consent`, `test_should_push_consent_denied_returns_false`, `test_remote_orgs_multiple_remotes`, `test_remote_orgs_deduplicates`, `test_org_filter_case_insensitive_matching`, `test_attempt_push_failure_does_not_panic`, `test_attempt_push_with_unreachable_remote_does_not_panic`.

@@ -92,14 +92,14 @@ This is the critical hot path. Must be fast and never fail the commit.
 
 ## Phase 8: Push Logic
 
-- [ ] Check `git config ai.barometer.autopush` — if unset, this is first push for repo
-- [ ] On first push: print warning to stderr, set `ai.barometer.autopush true`
-- [ ] After consent: push silently
-- [ ] On push failure: log warning to stderr, never block, never retry in hook
-- [ ] Check org filter: extract org from remotes, compare to configured `--org` value
-- [ ] If org doesn't match: attach locally only, skip push
-- [ ] Check per-repo override: `git config ai.barometer.enabled` — if `false`, skip entirely
-- [ ] Unit tests: verify consent flow, org filtering logic
+- [x] Check `git config ai.barometer.autopush` — if unset, this is first push for repo
+- [x] On first push: print warning to stderr, set `ai.barometer.autopush true`
+- [x] After consent: push silently
+- [x] On push failure: log warning to stderr, never block, never retry in hook
+- [x] Check org filter: extract org from remotes, compare to configured `--org` value
+- [x] If org doesn't match: attach locally only, skip push
+- [x] Check per-repo override: `git config ai.barometer.enabled` — if `false`, skip entirely
+- [x] Unit tests: verify consent flow, org filtering logic
 
 ---
 
