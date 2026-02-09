@@ -10,6 +10,22 @@ use std::process::Command;
 /// The dedicated git notes ref for AI session data.
 const NOTES_REF: &str = "refs/notes/ai-sessions";
 
+/// Validate that a commit hash is a valid hex string of 7-40 characters.
+///
+/// This prevents flag injection (e.g., passing `--help` as a commit) and
+/// ensures we only pass well-formed refs to git.
+fn validate_commit_hash(commit: &str) -> Result<()> {
+    let is_valid =
+        commit.len() >= 7 && commit.len() <= 40 && commit.bytes().all(|b| b.is_ascii_hexdigit());
+    if !is_valid {
+        bail!(
+            "invalid commit hash {:?}: must be 7-40 lowercase hex characters",
+            commit
+        );
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Internal helper
 // ---------------------------------------------------------------------------
@@ -73,13 +89,22 @@ pub fn head_timestamp() -> Result<i64> {
 
 /// Check whether an AI-session note already exists for the given commit.
 pub fn note_exists(commit: &str) -> Result<bool> {
-    git_succeeds(&["notes", "--ref", NOTES_REF, "show", commit])
+    validate_commit_hash(commit)?;
+    git_succeeds(&["notes", "--ref", NOTES_REF, "show", "--", commit])
 }
 
 /// Attach an AI-session note to the given commit.
+///
+/// **Precondition:** Callers must check [`note_exists`] first and skip if a note
+/// is already present. `git notes add` will fail if a note already exists for the
+/// given commit. The PLAN.md deduplication rules require checking before attaching:
+/// "if a note already exists, treat as success, do nothing."
 pub fn add_note(commit: &str, content: &str) -> Result<()> {
+    validate_commit_hash(commit)?;
     let output = Command::new("git")
-        .args(["notes", "--ref", NOTES_REF, "add", "-m", content, commit])
+        .args([
+            "notes", "--ref", NOTES_REF, "add", "-m", content, "--", commit,
+        ])
         .output()
         .context("failed to execute git notes add")?;
 
@@ -105,9 +130,15 @@ pub fn push_notes() -> Result<()> {
 }
 
 /// Check whether the repository has at least one configured remote.
+///
+/// Returns `Ok(false)` if `git remote` fails (e.g., not in a git repository)
+/// rather than propagating the error. This matches the `git_succeeds` pattern
+/// used by `note_exists` and makes the function safe to call defensively.
 pub fn has_upstream() -> Result<bool> {
-    let remotes = git_output(&["remote"])?;
-    Ok(!remotes.is_empty())
+    match git_output(&["remote"]) {
+        Ok(remotes) => Ok(!remotes.is_empty()),
+        Err(_) => Ok(false),
+    }
 }
 
 /// Extract the owner/org from the first remote URL.
@@ -117,6 +148,10 @@ pub fn has_upstream() -> Result<bool> {
 /// - HTTPS: `https://github.com/org/repo.git`
 ///
 /// Returns `None` if no remote is configured or the URL cannot be parsed.
+///
+/// **Note:** Only inspects the first remote. Phase 8 (org filtering) will need
+/// to check all remotes per the PLAN.md requirement: "Extract owner from **all**
+/// Git remotes. If **any** remote matches org, allowed."
 pub fn remote_org() -> Result<Option<String>> {
     let remotes = git_output(&["remote"])?;
     let first_remote = match remotes.lines().next() {
@@ -163,6 +198,9 @@ pub fn parse_org_from_url(url: &str) -> Option<String> {
 }
 
 /// Read a git config value. Returns `Ok(None)` if the key is not set.
+///
+/// Distinguishes exit code 1 (key not set) from other exit codes (e.g., 2 for
+/// invalid config file) to avoid silently swallowing genuine errors.
 pub fn config_get(key: &str) -> Result<Option<String>> {
     let output = Command::new("git")
         .args(["config", "--get", key])
@@ -171,6 +209,17 @@ pub fn config_get(key: &str) -> Result<Option<String>> {
 
     if !output.status.success() {
         // Exit code 1 means the key is not set — that is not an error.
+        // Any other non-zero exit (e.g., code 2 for corrupt config) is a real error.
+        let code = output.status.code().unwrap_or(-1);
+        if code != 1 {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!(
+                "git config --get {:?} failed (exit {}): {}",
+                key,
+                code,
+                stderr.trim()
+            );
+        }
         return Ok(None);
     }
 
@@ -200,6 +249,7 @@ pub fn config_set(key: &str, value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::process::Command;
     use tempfile::TempDir;
 
@@ -498,5 +548,225 @@ mod tests {
 
         assert_ne!(hash1, hash2);
         assert_eq!(hash2.len(), 40);
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_commit_hash
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_commit_hash_valid_short() {
+        assert!(validate_commit_hash("abcdef0").is_ok());
+    }
+
+    #[test]
+    fn test_validate_commit_hash_valid_full() {
+        assert!(validate_commit_hash("abcdef0123456789abcdef0123456789abcdef01").is_ok());
+    }
+
+    #[test]
+    fn test_validate_commit_hash_rejects_flag_injection() {
+        assert!(validate_commit_hash("--help").is_err());
+    }
+
+    #[test]
+    fn test_validate_commit_hash_rejects_too_short() {
+        assert!(validate_commit_hash("abc").is_err());
+    }
+
+    #[test]
+    fn test_validate_commit_hash_rejects_non_hex() {
+        assert!(validate_commit_hash("ghijklm").is_err());
+    }
+
+    #[test]
+    fn test_validate_commit_hash_rejects_empty() {
+        assert!(validate_commit_hash("").is_err());
+    }
+
+    #[test]
+    fn test_validate_commit_hash_rejects_too_long() {
+        assert!(validate_commit_hash("a".repeat(41).as_str()).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_org_from_url — edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_org_from_url_https_with_trailing_slash() {
+        // Trailing slash after org — org segment should still parse
+        let org = parse_org_from_url("https://github.com/org/");
+        assert_eq!(org, Some("org".to_string()));
+    }
+
+    #[test]
+    fn test_parse_org_from_url_https_host_only() {
+        // No org segment after host
+        let org = parse_org_from_url("https://github.com/");
+        assert_eq!(org, None);
+    }
+
+    #[test]
+    fn test_parse_org_from_url_https_host_no_trailing_slash() {
+        let org = parse_org_from_url("https://github.com");
+        assert_eq!(org, None);
+    }
+
+    #[test]
+    fn test_parse_org_from_url_ssh_nested_path() {
+        // SSH with nested paths — org is the first segment after the colon
+        let org = parse_org_from_url("git@github.com:org/sub/repo.git");
+        assert_eq!(org, Some("org".to_string()));
+    }
+
+    #[test]
+    fn test_parse_org_from_url_https_with_port() {
+        let org = parse_org_from_url("https://github.com:443/org/repo.git");
+        // The host segment is "github.com:443", org is next path segment
+        assert_eq!(org, Some("org".to_string()));
+    }
+
+    #[test]
+    fn test_parse_org_from_url_https_with_auth() {
+        // URL with authentication credentials embedded
+        let org = parse_org_from_url("https://user:pass@github.com/org/repo.git");
+        // "user:pass@github.com" is treated as host, "org" is the org
+        assert_eq!(org, Some("org".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Public API tests — use set_current_dir, must run serially
+    //
+    // These tests exercise the actual Rust wrapper functions against temp
+    // repos to ensure the wrappers (argument order, trim, error mapping)
+    // work correctly, not just the underlying git commands.
+    // -----------------------------------------------------------------------
+
+    /// Helper: create a temp repo and chdir into it. Returns the TempDir
+    /// (must be kept alive to prevent cleanup) and the original cwd for
+    /// restoration.
+    fn enter_temp_repo() -> (TempDir, PathBuf) {
+        let original_cwd = std::env::current_dir().expect("failed to get cwd");
+        let dir = init_temp_repo();
+        std::env::set_current_dir(dir.path()).expect("failed to chdir into temp repo");
+        (dir, original_cwd)
+    }
+
+    #[test]
+    #[serial]
+    fn test_api_repo_root() {
+        let (_dir, original_cwd) = enter_temp_repo();
+        let root = repo_root().expect("repo_root failed");
+        assert!(root.join("README.md").exists());
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_api_head_hash() {
+        let (_dir, original_cwd) = enter_temp_repo();
+        let hash = head_hash().expect("head_hash failed");
+        assert_eq!(hash.len(), 40);
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_api_head_timestamp() {
+        let (_dir, original_cwd) = enter_temp_repo();
+        let ts = head_timestamp().expect("head_timestamp failed");
+        assert!(ts > 1_577_836_800); // After 2020
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_api_note_exists_and_add_note() {
+        let (_dir, original_cwd) = enter_temp_repo();
+        let hash = head_hash().expect("head_hash failed");
+
+        // No note yet
+        assert!(!note_exists(&hash).expect("note_exists failed"));
+
+        // Add a note via the public API
+        add_note(&hash, "test session data").expect("add_note failed");
+
+        // Now it should exist
+        assert!(note_exists(&hash).expect("note_exists failed after add"));
+
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_api_has_upstream_no_remote() {
+        let (_dir, original_cwd) = enter_temp_repo();
+        assert!(!has_upstream().expect("has_upstream failed"));
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_api_has_upstream_with_remote() {
+        let (dir, original_cwd) = enter_temp_repo();
+        run_git(
+            dir.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/test-org/test-repo.git",
+            ],
+        );
+        assert!(has_upstream().expect("has_upstream failed"));
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_api_remote_org_no_remote() {
+        let (_dir, original_cwd) = enter_temp_repo();
+        let org = remote_org().expect("remote_org failed");
+        assert_eq!(org, None);
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_api_remote_org_with_remote() {
+        let (dir, original_cwd) = enter_temp_repo();
+        run_git(
+            dir.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:acme-corp/widgets.git",
+            ],
+        );
+        let org = remote_org().expect("remote_org failed");
+        assert_eq!(org, Some("acme-corp".to_string()));
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_api_config_get_missing() {
+        let (_dir, original_cwd) = enter_temp_repo();
+        let val = config_get("ai.barometer.nonexistent").expect("config_get failed");
+        assert_eq!(val, None);
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_api_config_set_then_get() {
+        let (_dir, original_cwd) = enter_temp_repo();
+        config_set("ai.barometer.autopush", "true").expect("config_set failed");
+        let val = config_get("ai.barometer.autopush").expect("config_get failed");
+        assert_eq!(val, Some("true".to_string()));
+        std::env::set_current_dir(original_cwd).unwrap();
     }
 }

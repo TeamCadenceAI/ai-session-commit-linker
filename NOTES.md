@@ -83,3 +83,40 @@ A code review was conducted after Phase 1. The review found no bugs and confirme
 
 ### Dev-Dependencies
 - Added `tempfile = "3"` as a dev-dependency for test temp directories. It is only compiled for `cargo test`.
+
+---
+
+## Phase 2 Review Triage
+
+A code review was conducted after Phase 2 (21 findings). The following issues were triaged and addressed:
+
+### Fixed
+
+1. **Commit hash input validation (Review #4, Medium).** Added `validate_commit_hash()` that rejects anything not matching 7-40 hex characters. Called from `note_exists` and `add_note`. Also added `--` separator before positional commit args in git commands to prevent flag injection (e.g., `--help` being interpreted as a git flag). Even though `std::process::Command` prevents shell injection, flag injection was still a risk.
+
+2. **`add_note` precondition documented (Review #1, Medium).** Added a doc comment to `add_note` warning that callers must check `note_exists` first. The PLAN.md deduplication rules require checking before attaching. Did not add `--force` since the caller contract is sufficient and matches the plan's "check then skip" pattern.
+
+3. **`config_get` now distinguishes exit code 1 vs other errors (Review #2, Low).** Previously, all non-zero exits from `git config --get` were treated as "key not set" (`Ok(None)`). Now only exit code 1 returns `Ok(None)`; any other non-zero exit (e.g., code 2 for corrupt config) returns `Err` with the stderr message.
+
+4. **`has_upstream` returns `Ok(false)` on failure (Review #3, Low).** Changed from propagating `git remote` errors to returning `Ok(false)` when the command fails. This matches the `git_succeeds` defensive pattern and makes the function safe to call outside a git repository.
+
+5. **Public API tests via `set_current_dir` (Review #13-14, Medium).** Added 11 serial tests that call the actual Rust wrapper functions (`repo_root`, `head_hash`, `head_timestamp`, `note_exists`, `add_note`, `has_upstream`, `remote_org`, `config_get`, `config_set`) against temp repos using `std::env::set_current_dir`. These use the `serial_test` crate to avoid CWD race conditions. This directly validates the wrapper logic (argument order, `.trim()`, error mapping), not just the underlying git commands.
+
+6. **Edge case tests for `parse_org_from_url` (Review #17, Low).** Added 6 new test cases: trailing slash, host-only URL, host without trailing slash, SSH with nested paths, HTTPS with port, and HTTPS with embedded auth credentials.
+
+7. **`validate_commit_hash` unit tests.** Added 7 tests covering valid short/full hashes and rejection of: flag injection (`--help`), too-short, non-hex, empty, and too-long strings.
+
+8. **`remote_org` Phase 8 note (Review #9/20).** Added a doc comment on `remote_org` noting that it only inspects the first remote and that Phase 8 will need to check all remotes per the PLAN.md requirement.
+
+### Deferred
+
+- **SSH URL parsing edge cases (Review #6-7):** `ssh://` protocol, non-`git@` users, and ports in SSH URLs. Will address in Phase 8 when org filtering is implemented.
+- **`push_notes` testing (Review #15):** Requires a remote, complex setup. Not worth the test infrastructure cost right now.
+- **`remote_org` checking all remotes (Review #9/20):** Phase 8 responsibility.
+- **`config_set` legacy git invocation (Review #12):** The `git config key value` form works and is widely supported. Not urgent.
+- **`add_note`/`push_notes` using `git_output` pattern (Review #11):** Minor refactoring opportunity, low value.
+- **`git_output_in` test helper duplication (Review #18):** Acknowledged but not worth the refactor since the helper is small and test-only.
+- **Config key validation (Review #5):** Low risk since callers are internal and use well-known key names.
+
+### Dev-Dependencies Added
+- `serial_test = "3"` for serializing tests that use `set_current_dir`.
