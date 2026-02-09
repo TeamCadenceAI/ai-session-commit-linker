@@ -408,6 +408,11 @@ const BACKGROUND_RETRY_DELAYS: &[u64] = &[1, 2, 4, 8, 16, 32];
 /// Failures to spawn are silently ignored — the pending system handles
 /// long-term retry as a fallback.
 fn spawn_background_retry(commit: &str, repo: &str, timestamp: i64) {
+    // Never spawn background processes during tests — they outlive the test
+    // and cascade into thousands of orphaned processes.
+    if cfg!(test) {
+        return;
+    }
     let exe = match std::env::current_exe() {
         Ok(e) => e,
         Err(_) => return,
@@ -1344,6 +1349,8 @@ mod tests {
         run_git(path, &["init"]);
         run_git(path, &["config", "user.email", "test@test.com"]);
         run_git(path, &["config", "user.name", "Test User"]);
+        // Override hooksPath to prevent the global post-commit hook from firing
+        run_git(path, &["config", "core.hooksPath", "/dev/null"]);
         std::fs::write(path.join("README.md"), "hello").unwrap();
         run_git(path, &["add", "README.md"]);
         run_git(path, &["commit", "-m", "initial commit"]);
@@ -1387,6 +1394,7 @@ mod tests {
         // Set up temp repo with a commit
         let dir = init_temp_repo();
         let repo_path = dir.path();
+
         let original_cwd = safe_cwd();
 
         // Use a separate temp dir as a fake HOME to avoid polluting the
@@ -1532,6 +1540,7 @@ mod tests {
     fn test_hook_post_commit_no_match_writes_pending() {
         let dir = init_temp_repo();
         let repo_path = dir.path();
+
         let original_cwd = safe_cwd();
 
         // Use a fake HOME so pending records are written to a temp dir
@@ -1618,6 +1627,7 @@ mod tests {
 
         let dir = init_temp_repo();
         let repo_path = dir.path();
+
         let original_cwd = safe_cwd();
 
         let fake_home = TempDir::new().expect("failed to create fake home");
@@ -1720,6 +1730,7 @@ mod tests {
 
         let dir = init_temp_repo();
         let repo_path = dir.path();
+
         let original_cwd = safe_cwd();
 
         let fake_home = TempDir::new().expect("failed to create fake home");
@@ -1853,6 +1864,7 @@ mod tests {
 
         let dir = init_temp_repo();
         let repo_path = dir.path();
+
         let original_cwd = safe_cwd();
 
         let fake_home = TempDir::new().expect("failed to create fake home");
@@ -2019,6 +2031,7 @@ mod tests {
 
         let dir = init_temp_repo();
         let repo_path = dir.path();
+
         let original_cwd = safe_cwd();
 
         let fake_home = TempDir::new().expect("failed to create fake home");
@@ -2189,6 +2202,8 @@ mod tests {
     #[test]
     #[serial]
     fn test_install_with_org_sets_global_config() {
+        // Ensure CWD is valid (previous serial test may have left it in a deleted temp dir)
+        let _original_cwd = safe_cwd();
         let fake_home = TempDir::new().expect("failed to create fake home");
         let original_home = std::env::var("HOME").ok();
         let original_global = std::env::var("GIT_CONFIG_GLOBAL").ok();
@@ -2376,6 +2391,7 @@ mod tests {
 
         let dir = init_temp_repo();
         let repo_path = dir.path();
+
         let original_cwd = safe_cwd();
 
         let fake_home = TempDir::new().expect("failed to create fake home");

@@ -460,6 +460,8 @@ mod tests {
         // Set required user config for commits
         run_git(path, &["config", "user.email", "test@test.com"]);
         run_git(path, &["config", "user.name", "Test User"]);
+        // Override hooksPath to prevent the global post-commit hook from firing
+        run_git(path, &["config", "core.hooksPath", "/dev/null"]);
         // Create an initial commit
         std::fs::write(path.join("README.md"), "hello").unwrap();
         run_git(path, &["add", "README.md"]);

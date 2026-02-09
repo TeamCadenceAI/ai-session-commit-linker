@@ -844,6 +844,8 @@ also not json {{{{
         run_git(path, &["init"]);
         run_git(path, &["config", "user.email", "test@test.com"]);
         run_git(path, &["config", "user.name", "Test User"]);
+        // Override hooksPath to prevent the global post-commit hook from firing
+        run_git(path, &["config", "core.hooksPath", "/dev/null"]);
         fs::write(path.join("README.md"), "hello").unwrap();
         run_git(path, &["add", "README.md"]);
         run_git(path, &["commit", "-m", "initial commit"]);
