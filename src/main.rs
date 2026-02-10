@@ -247,8 +247,8 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
     }
 
     // Step 6: Run hydration for the last 7 days
-    eprintln!("[ai-session-commit-linker] Running initial hydration (last 7 days)...");
-    if let Err(e) = run_hydrate("7d", false) {
+    eprintln!("[ai-session-commit-linker] Running initial hydration (last 30 days)...");
+    if let Err(e) = run_hydrate("30d", false) {
         eprintln!("[ai-session-commit-linker] error: hydration failed: {}", e);
         had_errors = true;
     }
