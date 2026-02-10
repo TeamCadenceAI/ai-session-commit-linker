@@ -151,22 +151,24 @@ pub fn parse_session_metadata(file: &Path) -> SessionMetadata {
             Err(_) => continue,
         };
 
-        // Extract session_id
+        // Extract session_id (top-level or nested under payload for Codex)
         if metadata.session_id.is_none()
             && let Some(id) = value
                 .get("session_id")
                 .or_else(|| value.get("sessionId"))
+                .or_else(|| value.pointer("/payload/id"))
                 .and_then(|v| v.as_str())
         {
             metadata.session_id = Some(id.to_string());
         }
 
-        // Extract cwd / workdir
+        // Extract cwd / workdir (top-level or nested under payload for Codex)
         if metadata.cwd.is_none()
             && let Some(cwd) = value
                 .get("cwd")
                 .or_else(|| value.get("workdir"))
                 .or_else(|| value.get("working_directory"))
+                .or_else(|| value.pointer("/payload/cwd"))
                 .and_then(|v| v.as_str())
         {
             metadata.cwd = Some(cwd.to_string());
@@ -830,6 +832,79 @@ also not json {{{{
         let metadata = parse_session_metadata(&file);
 
         assert_eq!(metadata.session_id, Some("first-id".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_session_metadata — Codex format (nested under payload)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_metadata_codex_session_meta() {
+        let dir = TempDir::new().unwrap();
+        // Real Codex session_meta format: id and cwd nested under payload
+        let content = r#"{"timestamp":"2026-02-10T01:52:21.832Z","type":"session_meta","payload":{"id":"019c453f-e731-7bd1-9d05-c571ec59ca6b","cwd":"/Users/foo/dev/my-project","originator":"codex_cli_rs","cli_version":"0.98.0"}}"#;
+        let file = write_temp_file(dir.path(), "session.jsonl", content);
+
+        let metadata = parse_session_metadata(&file);
+
+        assert_eq!(
+            metadata.session_id,
+            Some("019c453f-e731-7bd1-9d05-c571ec59ca6b".to_string())
+        );
+        assert_eq!(metadata.cwd, Some("/Users/foo/dev/my-project".to_string()));
+    }
+
+    #[test]
+    fn test_parse_metadata_codex_payload_id_only() {
+        let dir = TempDir::new().unwrap();
+        // Only payload.id present, no cwd
+        let content = r#"{"type":"session_meta","payload":{"id":"abc-123"}}"#;
+        let file = write_temp_file(dir.path(), "session.jsonl", content);
+
+        let metadata = parse_session_metadata(&file);
+
+        assert_eq!(metadata.session_id, Some("abc-123".to_string()));
+        assert_eq!(metadata.cwd, None);
+    }
+
+    #[test]
+    fn test_parse_metadata_codex_payload_cwd_only() {
+        let dir = TempDir::new().unwrap();
+        // Only payload.cwd present, no id
+        let content = r#"{"type":"session_meta","payload":{"cwd":"/Users/foo/bar"}}"#;
+        let file = write_temp_file(dir.path(), "session.jsonl", content);
+
+        let metadata = parse_session_metadata(&file);
+
+        assert_eq!(metadata.session_id, None);
+        assert_eq!(metadata.cwd, Some("/Users/foo/bar".to_string()));
+    }
+
+    #[test]
+    fn test_parse_metadata_top_level_takes_priority_over_payload() {
+        let dir = TempDir::new().unwrap();
+        // Both top-level and payload fields present -- top-level wins (first-value-wins)
+        let content = r#"{"session_id":"top-level-id","cwd":"/top/level"}
+{"type":"session_meta","payload":{"id":"payload-id","cwd":"/payload/path"}}
+"#;
+        let file = write_temp_file(dir.path(), "session.jsonl", content);
+
+        let metadata = parse_session_metadata(&file);
+
+        assert_eq!(metadata.session_id, Some("top-level-id".to_string()));
+        assert_eq!(metadata.cwd, Some("/top/level".to_string()));
+    }
+
+    #[test]
+    fn test_extract_commit_hashes_from_codex_function_call_output() {
+        let dir = TempDir::new().unwrap();
+        // Real Codex function_call_output format with git commit output
+        let content = r#"{"timestamp":"2026-02-10T02:13:37.205Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_fEoWO6fq3tRI8VsBgjkdxRfp","output":"Chunk ID: f0cd33\nWall time: 0.0525 seconds\nProcess exited with code 0\nOriginal token count: 40\nOutput:\n[main df69283] Create detailed TODO plan\n 1 file changed, 229 insertions(+)\n create mode 100644 TODO.md\n"}}"#;
+        let file = write_temp_file(dir.path(), "session.jsonl", content);
+
+        let hashes = extract_commit_hashes(&file);
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(hashes[0], "df69283");
     }
 
     // -----------------------------------------------------------------------
