@@ -448,7 +448,10 @@ fn infer_agent_type(path: &Path) -> AgentType {
         AgentType::Codex
     } else if path_str.contains(".cursor") || path_str.contains("/Cursor/") {
         AgentType::Cursor
-    } else if path_str.contains("/Antigravity/") {
+    } else if path_str.contains("/Antigravity/")
+        || path_str.contains("/antigravity-api/")
+        || path_str.contains("/.ai-session-commit-linker/antigravity-api/")
+    {
         AgentType::Antigravity
     } else if path_str.contains("/Code/") {
         AgentType::Copilot
@@ -629,6 +632,14 @@ mod tests {
     fn test_infer_agent_type_antigravity() {
         let path = Path::new(
             "/Users/foo/Library/Application Support/Antigravity/User/workspaceStorage/x/chatSessions/session.json",
+        );
+        assert_eq!(infer_agent_type(path), AgentType::Antigravity);
+    }
+
+    #[test]
+    fn test_infer_agent_type_antigravity_api_cache() {
+        let path = Path::new(
+            "/Users/foo/.ai-session-commit-linker/antigravity-api/abc.json",
         );
         assert_eq!(infer_agent_type(path), AgentType::Antigravity);
     }

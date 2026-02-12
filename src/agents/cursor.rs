@@ -37,18 +37,42 @@ fn log_dirs_in(home: &Path) -> Vec<PathBuf> {
         .join("workspaceStorage");
     dirs.extend(find_chat_session_dirs(&ws_root));
 
-    // Cursor projects directory.
+    // Cursor projects directory (scan recursively for json/txt files).
     let projects_dir = home.join(".cursor").join("projects");
-    if let Ok(entries) = fs::read_dir(&projects_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                dirs.push(path);
-            }
+    collect_dirs_with_exts(&projects_dir, &mut dirs, &["json", "txt"]);
+
+    dirs
+}
+
+/// Recursively collect directories that contain at least one file with a matching extension.
+fn collect_dirs_with_exts(dir: &Path, results: &mut Vec<PathBuf>, exts: &[&str]) {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+
+    let mut has_match = false;
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        let path = entry.path();
+        if path.is_dir() {
+            collect_dirs_with_exts(&path, results, exts);
+        } else if !has_match
+            && let Some(ext) = path.extension().and_then(|e| e.to_str())
+            && exts.iter().any(|allowed| allowed.eq_ignore_ascii_case(ext))
+        {
+            has_match = true;
         }
     }
 
-    dirs
+    if has_match {
+        results.push(dir.to_path_buf());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -78,6 +102,7 @@ mod tests {
 
         let projects_dir = home.path().join(".cursor").join("projects").join("p1");
         fs::create_dir_all(&projects_dir).unwrap();
+        fs::write(projects_dir.join("session.txt"), "content").unwrap();
 
         let dirs = log_dirs_in(home.path());
 
