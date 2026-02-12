@@ -7,7 +7,8 @@ use std::path::Path;
 
 const EMAIL_CONFIG_KEY: &str = "ai.session-commit-linker.email";
 const SCOPE_CONFIG_KEY: &str = "ai.session-commit-linker.scope";
-const SCOPE_CURRENT_REPO_KEY: &str = "ai.session-commit-linker.scope.current_repo";
+const SCOPE_CURRENT_REPO_KEY: &str = "ai.session-commit-linker.scope.current-repo";
+const SCOPE_CURRENT_REPO_KEY_LEGACY: &str = "ai.session-commit-linker.scope.current_repo";
 const SCOPE_SELECTED_REPOS_KEY: &str = "ai.session-commit-linker.scope.selected";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -91,10 +92,7 @@ pub fn is_repo_in_scope(repo_root: &Path) -> bool {
 
     match get_scope_mode() {
         ScopeMode::All => true,
-        ScopeMode::Current => match crate::git::config_get_global(SCOPE_CURRENT_REPO_KEY) {
-            Ok(Some(current)) => current == repo_str,
-            _ => false,
-        },
+        ScopeMode::Current => current_scope_repo().is_some_and(|current| current == repo_str),
         ScopeMode::Selected => get_selected_repos().iter().any(|r| r == &repo_str),
     }
 }
@@ -320,6 +318,18 @@ fn current_repo_root_str() -> Result<String> {
 fn save_selected_repos(repos: &[String]) -> Result<()> {
     let serialized = serde_json::to_string(repos)?;
     crate::git::config_set_global(SCOPE_SELECTED_REPOS_KEY, &serialized)
+}
+
+fn current_scope_repo() -> Option<String> {
+    match crate::git::config_get_global(SCOPE_CURRENT_REPO_KEY) {
+        Ok(Some(v)) => return Some(v),
+        _ => {}
+    }
+    // Legacy fallback for development snapshots that used an underscore key.
+    match crate::git::config_get_global(SCOPE_CURRENT_REPO_KEY_LEGACY) {
+        Ok(Some(v)) => Some(v),
+        _ => None,
+    }
 }
 
 fn parse_scope_mode(raw: &str) -> Option<ScopeMode> {
