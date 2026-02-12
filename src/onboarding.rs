@@ -10,6 +10,19 @@ const SCOPE_CONFIG_KEY: &str = "ai.session-commit-linker.scope";
 const SCOPE_CURRENT_REPO_KEY: &str = "ai.session-commit-linker.scope.current-repo";
 const SCOPE_CURRENT_REPO_KEY_LEGACY: &str = "ai.session-commit-linker.scope.current_repo";
 const SCOPE_SELECTED_REPOS_KEY: &str = "ai.session-commit-linker.scope.selected";
+const FTUE_BANNER: &str = r#"
+   ______          __
+  / ____/___ _____/ /__  ____  ________
+ / /   / __ `/ __  / _ \/ __ \/ ___/ _ \
+/ /___/ /_/ / /_/ /  __/ / / / /__/  __/
+\____/\__,_/\__,_/\___/_/ /_/\___/\___/
+
+   ________    ____
+  / ____/ /   /  _/
+ / /   / /    / /
+/ /___/ /____/ /
+\____/_____/___/
+"#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ScopeMode {
@@ -32,6 +45,17 @@ impl ScopeMode {
 pub fn get_email() -> Option<String> {
     match crate::git::config_get_global(EMAIL_CONFIG_KEY) {
         Ok(Some(email)) if !email.trim().is_empty() => Some(email.trim().to_string()),
+        _ => None,
+    }
+}
+
+/// Detect the user's email from `git config --global user.email`.
+///
+/// This is the GitHub-associated email that most developers already have
+/// configured. Returns `None` if unset or empty.
+fn detect_git_email() -> Option<String> {
+    match crate::git::config_get_global("user.email") {
+        Ok(Some(raw)) => normalize_email(&raw),
         _ => None,
     }
 }
@@ -128,14 +152,21 @@ pub fn get_selected_repos() -> Vec<String> {
 
 /// Install-time onboarding for email and repo scope.
 pub fn run_install_onboarding(force_first_time_experience: bool) -> Result<()> {
+    if force_first_time_experience {
+        print_ftue_banner();
+    }
     ensure_email_on_install(force_first_time_experience)?;
     ensure_scope_on_install(force_first_time_experience)?;
+    if force_first_time_experience {
+        print_ftue_completion();
+    }
     Ok(())
 }
 
-/// Install-time onboarding: prompt for email if not configured.
+/// Install-time onboarding: auto-detect email from git config.
 ///
-/// In non-interactive environments this is a no-op with a warning.
+/// Uses `git config --global user.email` (the GitHub-associated email)
+/// rather than prompting the user. Falls back gracefully if not set.
 pub fn ensure_email_on_install(force_prompt: bool) -> Result<()> {
     if !force_prompt {
         if let Some(existing) = get_email() {
@@ -147,27 +178,19 @@ pub fn ensure_email_on_install(force_prompt: bool) -> Result<()> {
         }
     }
 
-    if !io::stdin().is_terminal() {
+    // Auto-detect from git config user.email
+    if let Some(detected) = detect_git_email() {
+        let saved = set_email(&detected)?;
         eprintln!(
-            "[ai-session-commit-linker] Onboarding: no TTY; skip email prompt (run `ai-session-commit-linker onboard --email <you@example.com>` later)"
+            "[ai-session-commit-linker] Onboarding: detected email from git config: {}",
+            saved
         );
         return Ok(());
     }
 
     eprintln!(
-        "[ai-session-commit-linker] Onboarding: enter your email for session attribution (blank to skip)"
+        "[ai-session-commit-linker] Onboarding: no git user.email found; run `ai-session-commit-linker onboard --email <you@example.com>` to set"
     );
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    let trimmed = input.trim();
-
-    if trimmed.is_empty() {
-        eprintln!("[ai-session-commit-linker] Onboarding skipped.");
-        return Ok(());
-    }
-
-    let saved = set_email(trimmed)?;
-    eprintln!("[ai-session-commit-linker] Onboarding complete: {}", saved);
     Ok(())
 }
 
@@ -222,6 +245,9 @@ pub fn ensure_scope_on_install(force_prompt: bool) -> Result<()> {
 }
 
 /// Run explicit onboarding command.
+///
+/// With `--email`: use the provided value.
+/// Without: auto-detect from `git config --global user.email`.
 pub fn run_onboarding(email: Option<&str>) -> Result<()> {
     if let Some(value) = email {
         let saved = set_email(value)?;
@@ -232,26 +258,17 @@ pub fn run_onboarding(email: Option<&str>) -> Result<()> {
         return Ok(());
     }
 
-    if !io::stdin().is_terminal() {
-        bail!("non-interactive mode requires --email");
+    // Auto-detect from git config user.email
+    if let Some(detected) = detect_git_email() {
+        let saved = set_email(&detected)?;
+        eprintln!(
+            "[ai-session-commit-linker] Detected email from git config: {}",
+            saved
+        );
+        return Ok(());
     }
 
-    eprint!("Email: ");
-    io::stderr().flush().ok();
-
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        bail!("email is required");
-    }
-
-    let saved = set_email(trimmed)?;
-    eprintln!(
-        "[ai-session-commit-linker] Saved onboarding email: {}",
-        saved
-    );
-    Ok(())
+    bail!("no git user.email found; use --email <you@example.com> to set manually");
 }
 
 fn collect_selected_repos_interactively() -> Result<()> {
@@ -339,6 +356,47 @@ fn parse_scope_mode(raw: &str) -> Option<ScopeMode> {
         "selected" => Some(ScopeMode::Selected),
         _ => None,
     }
+}
+
+fn print_ftue_banner() {
+    eprintln!("[ai-session-commit-linker]");
+    for line in FTUE_BANNER.trim_matches('\n').lines() {
+        eprintln!("[ai-session-commit-linker] {}", line);
+    }
+    eprintln!("[ai-session-commit-linker] Cadence CLI setup");
+    eprintln!("[ai-session-commit-linker]");
+}
+
+fn print_ftue_completion() {
+    eprintln!("[ai-session-commit-linker]");
+    eprintln!("[ai-session-commit-linker] ================================================");
+    eprintln!("[ai-session-commit-linker] Thank you. You are now set up.");
+    eprintln!("[ai-session-commit-linker] The following repos are configured:");
+    match get_scope_mode() {
+        ScopeMode::All => {
+            eprintln!("[ai-session-commit-linker]   - all repos");
+        }
+        ScopeMode::Current => {
+            if let Some(repo) = current_scope_repo() {
+                eprintln!("[ai-session-commit-linker]   - {}", repo);
+            } else {
+                eprintln!("[ai-session-commit-linker]   - current repo (not available right now)");
+            }
+        }
+        ScopeMode::Selected => {
+            let selected = get_selected_repos();
+            if selected.is_empty() {
+                eprintln!("[ai-session-commit-linker]   - (none selected yet)");
+            } else {
+                for repo in selected {
+                    eprintln!("[ai-session-commit-linker]   - {}", repo);
+                }
+            }
+        }
+    }
+    eprintln!("[ai-session-commit-linker] Nothing more to do.");
+    eprintln!("[ai-session-commit-linker] ================================================");
+    eprintln!("[ai-session-commit-linker]");
 }
 
 fn read_yes_no(prompt: &str, default_yes: bool) -> Result<bool> {
