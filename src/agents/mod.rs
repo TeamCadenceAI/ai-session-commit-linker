@@ -25,31 +25,6 @@ pub fn encode_repo_path(path: &Path) -> String {
     path_str.replace('/', "-")
 }
 
-/// Filter `.jsonl` files in the given directories whose modification time
-/// falls within +/- `window_secs` of `commit_time`.
-///
-/// - `dirs`: directories to search for `.jsonl` files
-/// - `commit_time`: Unix epoch timestamp of the commit
-/// - `window_secs`: maximum absolute difference in seconds between file mtime and commit_time
-///
-/// Files that cannot be read or whose metadata is unavailable are silently skipped.
-pub fn candidate_files(dirs: &[PathBuf], commit_time: i64, window_secs: i64) -> Vec<PathBuf> {
-    candidate_files_with_exts(dirs, commit_time, window_secs, &["jsonl"])
-}
-
-/// Find all `.jsonl` files in the given directories whose modification time
-/// is within `since_secs` seconds of `now`.
-///
-/// This is used by the `hydrate` command to find recently-modified session
-/// logs regardless of any specific commit time. Unlike `candidate_files`,
-/// which filters by a symmetric window around a commit timestamp, this
-/// filters by `mtime >= now - since_secs`.
-///
-/// Files that cannot be read or whose metadata is unavailable are silently skipped.
-pub fn recent_files(dirs: &[PathBuf], now: i64, since_secs: i64) -> Vec<PathBuf> {
-    recent_files_with_exts(dirs, now, since_secs, &["jsonl"])
-}
-
 /// Filter files in the given directories whose modification time falls within
 /// +/- `window_secs` of `commit_time`, and whose extension matches `exts`.
 pub fn candidate_files_with_exts(
@@ -394,7 +369,8 @@ mod tests {
         fs::write(&file, "{}").unwrap();
         set_file_mtime(&file, commit_time);
 
-        let result = candidate_files(&[dir.path().to_path_buf()], commit_time, 600);
+        let result =
+            candidate_files_with_exts(&[dir.path().to_path_buf()], commit_time, 600, &["jsonl"]);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], file);
     }
@@ -410,7 +386,8 @@ mod tests {
         fs::write(&file, "{}").unwrap();
         set_file_mtime(&file, commit_time + window);
 
-        let result = candidate_files(&[dir.path().to_path_buf()], commit_time, window);
+        let result =
+            candidate_files_with_exts(&[dir.path().to_path_buf()], commit_time, window, &["jsonl"]);
         assert_eq!(result.len(), 1);
     }
 
@@ -425,7 +402,8 @@ mod tests {
         fs::write(&file, "{}").unwrap();
         set_file_mtime(&file, commit_time + window + 1);
 
-        let result = candidate_files(&[dir.path().to_path_buf()], commit_time, window);
+        let result =
+            candidate_files_with_exts(&[dir.path().to_path_buf()], commit_time, window, &["jsonl"]);
         assert!(result.is_empty());
     }
 
@@ -440,7 +418,8 @@ mod tests {
         fs::write(&file, "{}").unwrap();
         set_file_mtime(&file, commit_time - window - 1);
 
-        let result = candidate_files(&[dir.path().to_path_buf()], commit_time, window);
+        let result =
+            candidate_files_with_exts(&[dir.path().to_path_buf()], commit_time, window, &["jsonl"]);
         assert!(result.is_empty());
     }
 
@@ -459,7 +438,8 @@ mod tests {
         fs::write(&json_file, "{}").unwrap();
         set_file_mtime(&json_file, commit_time);
 
-        let result = candidate_files(&[dir.path().to_path_buf()], commit_time, 600);
+        let result =
+            candidate_files_with_exts(&[dir.path().to_path_buf()], commit_time, 600, &["jsonl"]);
         assert!(result.is_empty());
     }
 
@@ -477,26 +457,28 @@ mod tests {
         fs::write(&file2, "{}").unwrap();
         set_file_mtime(&file2, commit_time);
 
-        let result = candidate_files(
+        let result = candidate_files_with_exts(
             &[dir1.path().to_path_buf(), dir2.path().to_path_buf()],
             commit_time,
             600,
+            &["jsonl"],
         );
         assert_eq!(result.len(), 2);
     }
 
     #[test]
     fn test_candidate_files_empty_dirs() {
-        let result = candidate_files(&[], 1_700_000_000, 600);
+        let result = candidate_files_with_exts(&[], 1_700_000_000, 600, &["jsonl"]);
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_candidate_files_nonexistent_dir() {
-        let result = candidate_files(
+        let result = candidate_files_with_exts(
             &[PathBuf::from("/nonexistent/dir/that/does/not/exist")],
             1_700_000_000,
             600,
+            &["jsonl"],
         );
         assert!(result.is_empty());
     }
@@ -517,7 +499,8 @@ mod tests {
         fs::write(&out_file, "{}").unwrap();
         set_file_mtime(&out_file, commit_time + 1000);
 
-        let result = candidate_files(&[dir.path().to_path_buf()], commit_time, window);
+        let result =
+            candidate_files_with_exts(&[dir.path().to_path_buf()], commit_time, window, &["jsonl"]);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], in_file);
     }
@@ -531,7 +514,8 @@ mod tests {
         let fake_dir = dir.path().join("sneaky.jsonl");
         fs::create_dir(&fake_dir).unwrap();
 
-        let result = candidate_files(&[dir.path().to_path_buf()], commit_time, 600);
+        let result =
+            candidate_files_with_exts(&[dir.path().to_path_buf()], commit_time, 600, &["jsonl"]);
         assert!(result.is_empty());
     }
 
@@ -550,7 +534,8 @@ mod tests {
         fs::write(&file, "{}").unwrap();
         set_file_mtime(&file, now - 3 * 86_400); // 3 days ago
 
-        let result = recent_files(&[dir.path().to_path_buf()], now, since_secs);
+        let result =
+            recent_files_with_exts(&[dir.path().to_path_buf()], now, since_secs, &["jsonl"]);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], file);
     }
@@ -566,7 +551,8 @@ mod tests {
         fs::write(&file, "{}").unwrap();
         set_file_mtime(&file, now - 10 * 86_400); // 10 days ago
 
-        let result = recent_files(&[dir.path().to_path_buf()], now, since_secs);
+        let result =
+            recent_files_with_exts(&[dir.path().to_path_buf()], now, since_secs, &["jsonl"]);
         assert!(result.is_empty());
     }
 
@@ -581,7 +567,8 @@ mod tests {
         fs::write(&file, "{}").unwrap();
         set_file_mtime(&file, now - since_secs); // exactly at the cutoff
 
-        let result = recent_files(&[dir.path().to_path_buf()], now, since_secs);
+        let result =
+            recent_files_with_exts(&[dir.path().to_path_buf()], now, since_secs, &["jsonl"]);
         assert_eq!(result.len(), 1, "file at exact cutoff should be included");
     }
 
@@ -594,19 +581,24 @@ mod tests {
         fs::write(&txt_file, "{}").unwrap();
         set_file_mtime(&txt_file, now);
 
-        let result = recent_files(&[dir.path().to_path_buf()], now, 86_400);
+        let result = recent_files_with_exts(&[dir.path().to_path_buf()], now, 86_400, &["jsonl"]);
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_recent_files_empty_dirs() {
-        let result = recent_files(&[], 1_700_000_000, 86_400);
+        let result = recent_files_with_exts(&[], 1_700_000_000, 86_400, &["jsonl"]);
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_recent_files_nonexistent_dir() {
-        let result = recent_files(&[PathBuf::from("/nonexistent/dir")], 1_700_000_000, 86_400);
+        let result = recent_files_with_exts(
+            &[PathBuf::from("/nonexistent/dir")],
+            1_700_000_000,
+            86_400,
+            &["jsonl"],
+        );
         assert!(result.is_empty());
     }
 

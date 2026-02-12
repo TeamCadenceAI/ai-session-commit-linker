@@ -160,28 +160,26 @@ pub fn parse_session_metadata(file: &Path) -> SessionMetadata {
         };
 
         // Extract session_id (top-level or nested under payload for Codex)
-        if metadata.session_id.is_none() {
-            if let Some(id) = value
+        if metadata.session_id.is_none()
+            && let Some(id) = value
                 .get("session_id")
                 .or_else(|| value.get("sessionId"))
                 .or_else(|| value.pointer("/payload/id"))
                 .and_then(|v| v.as_str())
-            {
-                metadata.session_id = Some(id.to_string());
-            }
+        {
+            metadata.session_id = Some(id.to_string());
         }
 
         // Extract cwd / workdir (top-level or nested under payload for Codex)
-        if metadata.cwd.is_none() {
-            if let Some(cwd) = value
+        if metadata.cwd.is_none()
+            && let Some(cwd) = value
                 .get("cwd")
                 .or_else(|| value.get("workdir"))
                 .or_else(|| value.get("working_directory"))
                 .or_else(|| value.pointer("/payload/cwd"))
                 .and_then(|v| v.as_str())
-            {
-                metadata.cwd = Some(cwd.to_string());
-            }
+        {
+            metadata.cwd = Some(cwd.to_string());
         }
 
         // If we have both fields, stop early
@@ -191,19 +189,19 @@ pub fn parse_session_metadata(file: &Path) -> SessionMetadata {
     }
 
     // Fallback: parse full JSON (chatSessions format).
-    if metadata.session_id.is_none() || metadata.cwd.is_none() {
-        if let Some(value) = read_json_value(file) {
-            if metadata.session_id.is_none() {
-                if let Some(id) = value.get("sessionId").and_then(|v| v.as_str()) {
-                    metadata.session_id = Some(id.to_string());
-                }
-            }
+    if (metadata.session_id.is_none() || metadata.cwd.is_none())
+        && let Some(value) = read_json_value(file)
+    {
+        if metadata.session_id.is_none()
+            && let Some(id) = value.get("sessionId").and_then(|v| v.as_str())
+        {
+            metadata.session_id = Some(id.to_string());
+        }
 
-            if metadata.cwd.is_none() {
-                if let Some(path) = extract_cwd_from_value(&value) {
-                    metadata.cwd = Some(path);
-                }
-            }
+        if metadata.cwd.is_none()
+            && let Some(path) = extract_cwd_from_value(&value)
+        {
+            metadata.cwd = Some(path);
         }
     }
 
@@ -261,17 +259,17 @@ pub fn session_time_range(file: &Path) -> Option<(i64, i64)> {
         }
     }
 
-    if min_ts.is_none() || max_ts.is_none() {
-        if let Some(value) = read_json_value(file) {
-            let mut all = Vec::new();
-            collect_timestamp_candidates(&value, &mut all);
-            for candidate in all {
-                if let Some(ts) =
-                    parse_timestamp(&candidate).or_else(|| parse_numeric_timestamp(&candidate))
-                {
-                    min_ts = Some(min_ts.map_or(ts, |min| min.min(ts)));
-                    max_ts = Some(max_ts.map_or(ts, |max| max.max(ts)));
-                }
+    if (min_ts.is_none() || max_ts.is_none())
+        && let Some(value) = read_json_value(file)
+    {
+        let mut all = Vec::new();
+        collect_timestamp_candidates(&value, &mut all);
+        for candidate in all {
+            if let Some(ts) =
+                parse_timestamp(&candidate).or_else(|| parse_numeric_timestamp(&candidate))
+            {
+                min_ts = Some(min_ts.map_or(ts, |min| min.min(ts)));
+                max_ts = Some(max_ts.map_or(ts, |max| max.max(ts)));
             }
         }
     }
