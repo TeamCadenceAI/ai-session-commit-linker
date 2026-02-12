@@ -1,7 +1,11 @@
 [package]
-name = "ai-session-commit-linker"
+name = "cadence-cli"
 version = "0.1.5"
 edition = "2024"
+
+[[bin]]
+name = "cadence"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"

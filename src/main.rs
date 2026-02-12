@@ -9,12 +9,12 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::process;
 
-/// AI Session Commit Linker: attach AI coding agent session logs to Git commits via git notes.
+/// Cadence CLI: attach AI coding agent session logs to Git commits via git notes.
 ///
 /// Provides provenance and measurement of AI-assisted development
 /// without polluting commit history.
 #[derive(Parser, Debug)]
-#[command(name = "ai-session-commit-linker", version, about)]
+#[command(name = "cadence", version, about)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -22,7 +22,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Install AI Session Commit Linker: set up git hooks and run initial hydration.
+    /// Install Cadence CLI: set up git hooks and run initial hydration.
     Install {
         /// Optional GitHub org filter for push scoping.
         #[arg(long)]
@@ -49,7 +49,7 @@ enum Command {
     /// Retry attaching notes for pending (unresolved) commits.
     Retry,
 
-    /// Show AI Session Commit Linker status for the current repository.
+    /// Show Cadence CLI status for the current repository.
     Status,
 }
 
@@ -57,6 +57,13 @@ enum Command {
 enum HookCommand {
     /// Post-commit hook: attempt to attach AI session note to HEAD.
     PostCommit,
+    /// Pre-push hook: sync notes with the push remote.
+    PrePush {
+        /// Remote name provided by git.
+        remote: String,
+        /// Remote URL provided by git.
+        url: String,
+    },
     /// Background retry with exponential backoff (hidden, internal use only).
     #[command(hide = true)]
     PostCommitRetry {
@@ -79,9 +86,10 @@ enum HookCommand {
 /// 1. Set `git config --global core.hooksPath ~/.git-hooks`
 /// 2. Create `~/.git-hooks/` directory if missing
 /// 3. Write `~/.git-hooks/post-commit` shim script
-/// 4. Make shim executable (chmod +x)
-/// 5. If `--org` provided, persist org filter to global git config
-/// 6. Run hydration for the last 7 days
+/// 4. Write `~/.git-hooks/pre-push` shim script
+/// 5. Make shims executable (chmod +x)
+/// 6. If `--org` provided, persist org filter to global git config
+/// 7. Run hydration for the last 7 days
 ///
 /// Errors at each step are reported but do not prevent subsequent steps
 /// from being attempted.
@@ -89,10 +97,53 @@ fn run_install(org: Option<String>) -> Result<()> {
     run_install_inner(org, None)
 }
 
+fn is_cadence_hook(content: &str) -> bool {
+    content.contains("cadence hook") || content.contains("ai-session-commit-linker")
+}
+
+fn hook_command_exe() -> String {
+    if cfg!(debug_assertions) {
+        if let Some(path) = debug_hook_exe_path() {
+            return path;
+        }
+    }
+    "cadence".to_string()
+}
+
+fn debug_hook_exe_path() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    if let Some(name) = exe.file_name().and_then(|s| s.to_str()) {
+        if name.starts_with("cadence") {
+            return Some(exe.display().to_string());
+        }
+    }
+
+    let dir = exe.parent()?;
+    if dir.file_name().and_then(|s| s.to_str()) == Some("deps") {
+        let candidate = dir.parent()?.join("cadence");
+        if candidate.exists() {
+            return Some(candidate.display().to_string());
+        }
+    }
+
+    None
+}
+
+fn post_commit_hook_content() -> String {
+    format!("#!/bin/sh\nexec {} hook post-commit\n", hook_command_exe())
+}
+
+fn pre_push_hook_content() -> String {
+    format!(
+        "#!/bin/sh\nexec {} hook pre-push \"$1\" \"$2\"\n",
+        hook_command_exe()
+    )
+}
+
 /// Inner implementation of install, accepting an optional home directory override
 /// for testability. If `home_override` is `None`, uses the real home directory.
 fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path>) -> Result<()> {
-    eprintln!("[ai-session-commit-linker] Installing...");
+    eprintln!("[cadence] Installing...");
 
     let home = match home_override {
         Some(h) => h.to_path_buf(),
@@ -109,16 +160,10 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
     // Step 1: Set git config --global core.hooksPath ~/.git-hooks
     match git::config_set_global("core.hooksPath", &hooks_dir_str) {
         Ok(()) => {
-            eprintln!(
-                "[ai-session-commit-linker] Set core.hooksPath = {}",
-                hooks_dir_str
-            );
+            eprintln!("[cadence] Set core.hooksPath = {}", hooks_dir_str);
         }
         Err(e) => {
-            eprintln!(
-                "[ai-session-commit-linker] error: failed to set core.hooksPath: {}",
-                e
-            );
+            eprintln!("[cadence] error: failed to set core.hooksPath: {}", e);
             had_errors = true;
         }
     }
@@ -127,50 +172,42 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
     if !hooks_dir.exists() {
         match std::fs::create_dir_all(&hooks_dir) {
             Ok(()) => {
-                eprintln!("[ai-session-commit-linker] Created {}", hooks_dir_str);
+                eprintln!("[cadence] Created {}", hooks_dir_str);
             }
             Err(e) => {
-                eprintln!(
-                    "[ai-session-commit-linker] error: failed to create {}: {}",
-                    hooks_dir_str, e
-                );
+                eprintln!("[cadence] error: failed to create {}: {}", hooks_dir_str, e);
                 had_errors = true;
             }
         }
     } else {
-        eprintln!(
-            "[ai-session-commit-linker] {} already exists",
-            hooks_dir_str
-        );
+        eprintln!("[cadence] {} already exists", hooks_dir_str);
     }
 
     // Step 3 & 4: Write post-commit shim and make it executable
     let shim_path = hooks_dir.join("post-commit");
-    let shim_content = "#!/bin/sh\nexec ai-session-commit-linker hook post-commit\n";
+    let shim_content = post_commit_hook_content();
 
     // Check if hook already exists
     let should_write = if shim_path.exists() {
         match std::fs::read_to_string(&shim_path) {
             Ok(existing) => {
-                if existing.contains("ai-session-commit-linker") {
-                    eprintln!(
-                        "[ai-session-commit-linker] post-commit hook already installed, updating"
-                    );
+                if is_cadence_hook(&existing) {
+                    eprintln!("[cadence] post-commit hook already installed, updating");
                     true
                 } else {
                     // Back up the existing hook before overwriting
-                    let backup_path = hooks_dir.join("post-commit.pre-ai-session-commit-linker");
+                    let backup_path = hooks_dir.join("post-commit.pre-cadence");
                     match std::fs::copy(&shim_path, &backup_path) {
                         Ok(_) => {
                             eprintln!(
-                                "[ai-session-commit-linker] warning: {} exists but was not created by ai-session-commit-linker; backed up to {}",
+                                "[cadence] warning: {} exists but was not created by cadence; backed up to {}",
                                 shim_path.display(),
                                 backup_path.display()
                             );
                         }
                         Err(e) => {
                             eprintln!(
-                                "[ai-session-commit-linker] warning: {} exists but was not created by ai-session-commit-linker; failed to back up: {}",
+                                "[cadence] warning: {} exists but was not created by cadence; failed to back up: {}",
                                 shim_path.display(),
                                 e
                             );
@@ -181,7 +218,7 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
             }
             Err(_) => {
                 eprintln!(
-                    "[ai-session-commit-linker] warning: could not read existing {}; overwriting",
+                    "[cadence] warning: could not read existing {}; overwriting",
                     shim_path.display()
                 );
                 true
@@ -194,7 +231,7 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
     if should_write {
         match std::fs::write(&shim_path, shim_content) {
             Ok(()) => {
-                eprintln!("[ai-session-commit-linker] Wrote {}", shim_path.display());
+                eprintln!("[cadence] Wrote {}", shim_path.display());
 
                 // Make executable (Unix only)
                 #[cfg(unix)]
@@ -203,14 +240,11 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
                     let perms = std::fs::Permissions::from_mode(0o755);
                     match std::fs::set_permissions(&shim_path, perms) {
                         Ok(()) => {
-                            eprintln!(
-                                "[ai-session-commit-linker] Made {} executable",
-                                shim_path.display()
-                            );
+                            eprintln!("[cadence] Made {} executable", shim_path.display());
                         }
                         Err(e) => {
                             eprintln!(
-                                "[ai-session-commit-linker] error: failed to chmod {}: {}",
+                                "[cadence] error: failed to chmod {}: {}",
                                 shim_path.display(),
                                 e
                             );
@@ -221,8 +255,86 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
             }
             Err(e) => {
                 eprintln!(
-                    "[ai-session-commit-linker] error: failed to write {}: {}",
+                    "[cadence] error: failed to write {}: {}",
                     shim_path.display(),
+                    e
+                );
+                had_errors = true;
+            }
+        }
+    }
+
+    // Step 4b: Write pre-push shim and make it executable
+    let pre_push_path = hooks_dir.join("pre-push");
+    let pre_push_content = pre_push_hook_content();
+
+    let should_write_pre_push = if pre_push_path.exists() {
+        match std::fs::read_to_string(&pre_push_path) {
+            Ok(existing) => {
+                if is_cadence_hook(&existing) {
+                    eprintln!("[cadence] pre-push hook already installed, updating");
+                    true
+                } else {
+                    let backup_path = hooks_dir.join("pre-push.pre-cadence");
+                    match std::fs::copy(&pre_push_path, &backup_path) {
+                        Ok(_) => {
+                            eprintln!(
+                                "[cadence] warning: {} exists but was not created by cadence; backed up to {}",
+                                pre_push_path.display(),
+                                backup_path.display()
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[cadence] warning: {} exists but was not created by cadence; failed to back up: {}",
+                                pre_push_path.display(),
+                                e
+                            );
+                        }
+                    }
+                    true
+                }
+            }
+            Err(_) => {
+                eprintln!(
+                    "[cadence] warning: could not read existing {}; overwriting",
+                    pre_push_path.display()
+                );
+                true
+            }
+        }
+    } else {
+        true
+    };
+
+    if should_write_pre_push {
+        match std::fs::write(&pre_push_path, pre_push_content) {
+            Ok(()) => {
+                eprintln!("[cadence] Wrote {}", pre_push_path.display());
+
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let perms = std::fs::Permissions::from_mode(0o755);
+                    match std::fs::set_permissions(&pre_push_path, perms) {
+                        Ok(()) => {
+                            eprintln!("[cadence] Made {} executable", pre_push_path.display());
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[cadence] error: failed to chmod {}: {}",
+                                pre_push_path.display(),
+                                e
+                            );
+                            had_errors = true;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "[cadence] error: failed to write {}: {}",
+                    pre_push_path.display(),
                     e
                 );
                 had_errors = true;
@@ -234,29 +346,37 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
     if let Some(ref org_value) = org {
         match git::config_set_global("ai.session-commit-linker.org", org_value) {
             Ok(()) => {
-                eprintln!("[ai-session-commit-linker] Set org filter: {}", org_value);
+                eprintln!("[cadence] Set org filter: {}", org_value);
             }
             Err(e) => {
-                eprintln!(
-                    "[ai-session-commit-linker] error: failed to set org filter: {}",
-                    e
-                );
+                eprintln!("[cadence] error: failed to set org filter: {}", e);
                 had_errors = true;
             }
         }
     }
 
     // Step 6: Run hydration for the last 7 days
-    eprintln!("[ai-session-commit-linker] Running initial hydration (last 30 days)...");
+    eprintln!("[cadence] Running initial hydration (last 30 days)...");
     if let Err(e) = run_hydrate("30d", false) {
-        eprintln!("[ai-session-commit-linker] error: hydration failed: {}", e);
+        eprintln!("[cadence] error: hydration failed: {}", e);
         had_errors = true;
     }
 
+    // Optional: sync notes for the current repo if a push remote resolves
+    if let Ok(Some(remote)) = git::resolve_push_remote() {
+        let consented = matches!(
+            git::config_get("ai.session-commit-linker.autopush"),
+            Ok(Some(val)) if val == "true"
+        );
+        if consented && push::check_org_filter_remote(&remote) {
+            push::sync_notes_for_remote(&remote);
+        }
+    }
+
     if had_errors {
-        eprintln!("[ai-session-commit-linker] Installation completed with errors (see above)");
+        eprintln!("[cadence] Installation completed with errors (see above)");
     } else {
-        eprintln!("[ai-session-commit-linker] Installation complete!");
+        eprintln!("[cadence] Installation complete!");
     }
 
     Ok(())
@@ -269,7 +389,7 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
 ///
 /// The outer wrapper uses `std::panic::catch_unwind` to catch panics, and
 /// an inner `Result` to catch all other errors. Any failure is logged to
-/// stderr with the `[ai-session-commit-linker]` prefix and silently ignored.
+/// stderr with the `[cadence]` prefix and silently ignored.
 fn run_hook_post_commit() -> Result<()> {
     // Catch-all: catch panics
     let result = std::panic::catch_unwind(|| -> Result<()> { hook_post_commit_inner() });
@@ -277,14 +397,33 @@ fn run_hook_post_commit() -> Result<()> {
     match result {
         Ok(Ok(())) => {} // Success
         Ok(Err(e)) => {
-            eprintln!("[ai-session-commit-linker] warning: hook failed: {}", e);
+            eprintln!("[cadence] warning: hook failed: {}", e);
         }
         Err(_) => {
-            eprintln!("[ai-session-commit-linker] warning: hook panicked (this is a bug)");
+            eprintln!("[cadence] warning: hook panicked (this is a bug)");
         }
     }
 
     // Always succeed — never block the commit
+    Ok(())
+}
+
+/// The pre-push hook handler. Must never block the push.
+fn run_hook_pre_push(remote: &str, url: &str) -> Result<()> {
+    let remote = remote.to_string();
+    let url = url.to_string();
+    let result = std::panic::catch_unwind(|| -> Result<()> { hook_pre_push_inner(&remote, &url) });
+
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            eprintln!("[cadence] warning: hook failed: {}", e);
+        }
+        Err(_) => {
+            eprintln!("[cadence] warning: hook panicked (this is a bug)");
+        }
+    }
+
     Ok(())
 }
 
@@ -333,17 +472,11 @@ fn hook_post_commit_inner() -> Result<()> {
             let session_log = match std::fs::read_to_string(&matched.file_path) {
                 Ok(content) => content,
                 Err(e) => {
-                    eprintln!(
-                        "[ai-session-commit-linker] warning: failed to read session log: {}",
-                        e
-                    );
+                    eprintln!("[cadence] warning: failed to read session log: {}", e);
                     if let Err(e) =
                         pending::write_pending(&head_hash, &repo_root_str, head_timestamp)
                     {
-                        eprintln!(
-                            "[ai-session-commit-linker] warning: failed to write pending record: {}",
-                            e
-                        );
+                        eprintln!("[cadence] warning: failed to write pending record: {}", e);
                     }
                     spawn_background_retry(&head_hash, &repo_root_str, head_timestamp);
                     // Skip note attachment; retry will pick this up later
@@ -364,14 +497,15 @@ fn hook_post_commit_inner() -> Result<()> {
             )?;
 
             eprintln!(
-                "[ai-session-commit-linker] attached session {} to commit {}",
+                "[cadence] attached session {} to commit {}",
                 session_id,
                 &head_hash[..7]
             );
 
-            // Push notes if conditions are met (consent, org filter, remote exists)
-            if push::should_push() {
-                push::attempt_push();
+            if let Ok(Some(remote)) = git::resolve_push_remote()
+                && push::should_push_remote(&remote)
+            {
+                push::attempt_push_remote(&remote);
             }
 
             attached = true;
@@ -386,17 +520,11 @@ fn hook_post_commit_inner() -> Result<()> {
             let session_log = match std::fs::read_to_string(&fallback.file_path) {
                 Ok(content) => content,
                 Err(e) => {
-                    eprintln!(
-                        "[ai-session-commit-linker] warning: failed to read session log: {}",
-                        e
-                    );
+                    eprintln!("[cadence] warning: failed to read session log: {}", e);
                     if let Err(e) =
                         pending::write_pending(&head_hash, &repo_root_str, head_timestamp)
                     {
-                        eprintln!(
-                            "[ai-session-commit-linker] warning: failed to write pending record: {}",
-                            e
-                        );
+                        eprintln!("[cadence] warning: failed to write pending record: {}", e);
                     }
                     spawn_background_retry(&head_hash, &repo_root_str, head_timestamp);
                     return Ok(());
@@ -413,13 +541,15 @@ fn hook_post_commit_inner() -> Result<()> {
             )?;
 
             eprintln!(
-                "[ai-session-commit-linker] attached session {} to commit {} (time window match)",
+                "[cadence] attached session {} to commit {} (time window match)",
                 fallback.session_id,
                 &head_hash[..7]
             );
 
-            if push::should_push() {
-                push::attempt_push();
+            if let Ok(Some(remote)) = git::resolve_push_remote()
+                && push::should_push_remote(&remote)
+            {
+                push::attempt_push_remote(&remote);
             }
 
             attached = true;
@@ -429,16 +559,26 @@ fn hook_post_commit_inner() -> Result<()> {
     if !attached {
         // No match found — write pending record
         if let Err(e) = pending::write_pending(&head_hash, &repo_root_str, head_timestamp) {
-            eprintln!(
-                "[ai-session-commit-linker] warning: failed to write pending record: {}",
-                e
-            );
+            eprintln!("[cadence] warning: failed to write pending record: {}", e);
         }
         spawn_background_retry(&head_hash, &repo_root_str, head_timestamp);
     }
 
     // Step 7: Retry pending commits for this repo
     retry_pending_for_repo(&repo_root_str, &repo_root);
+
+    Ok(())
+}
+
+/// Inner implementation of the pre-push hook.
+fn hook_pre_push_inner(remote: &str, _url: &str) -> Result<()> {
+    if !git::check_enabled() {
+        return Ok(());
+    }
+
+    if push::should_push_remote(remote) {
+        push::sync_notes_for_remote(remote);
+    }
 
     Ok(())
 }
@@ -706,13 +846,15 @@ fn try_resolve_single_commit(
                 .is_ok()
                 {
                     eprintln!(
-                        "[ai-session-commit-linker] retry: attached session {} to commit {} (time window match)",
+                        "[cadence] retry: attached session {} to commit {} (time window match)",
                         fallback.session_id,
                         &commit[..std::cmp::min(7, commit.len())]
                     );
 
-                    if push::should_push() {
-                        push::attempt_push();
+                    if let Ok(Some(remote)) = git::resolve_push_remote()
+                        && push::should_push_remote(&remote)
+                    {
+                        push::attempt_push_remote(&remote);
                     }
 
                     return ResolveResult::Attached;
@@ -746,13 +888,15 @@ fn try_resolve_single_commit(
             .is_ok()
             {
                 eprintln!(
-                    "[ai-session-commit-linker] retry: attached session {} to commit {} (time window match)",
+                    "[cadence] retry: attached session {} to commit {} (time window match)",
                     fallback.session_id,
                     &commit[..std::cmp::min(7, commit.len())]
                 );
 
-                if push::should_push() {
-                    push::attempt_push();
+                if let Ok(Some(remote)) = git::resolve_push_remote()
+                    && push::should_push_remote(&remote)
+                {
+                    push::attempt_push_remote(&remote);
                 }
 
                 return ResolveResult::Attached;
@@ -781,14 +925,16 @@ fn try_resolve_single_commit(
     .is_ok()
     {
         eprintln!(
-            "[ai-session-commit-linker] retry: attached session {} to commit {}",
+            "[cadence] retry: attached session {} to commit {}",
             session_id,
             &commit[..std::cmp::min(7, commit.len())]
         );
 
         // Push if conditions are met
-        if push::should_push() {
-            push::attempt_push();
+        if let Ok(Some(remote)) = git::resolve_push_remote()
+            && push::should_push_remote(&remote)
+        {
+            push::attempt_push_remote(&remote);
         }
 
         ResolveResult::Attached
@@ -819,7 +965,7 @@ fn retry_pending_for_repo(repo_str: &str, repo_root: &std::path::Path) {
         // Check if max retry attempts exceeded -- abandon the record
         if record.attempts >= MAX_RETRY_ATTEMPTS {
             eprintln!(
-                "[ai-session-commit-linker] warning: abandoning pending commit {} after {} attempts",
+                "[cadence] warning: abandoning pending commit {} after {} attempts",
                 &record.commit[..std::cmp::min(7, record.commit.len())],
                 record.attempts
             );
@@ -888,16 +1034,13 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
 
     // Step 1: Collect all recent session logs (repo-agnostic)
     eprintln!(
-        "[ai-session-commit-linker] Scanning agent logs (last {} days)...",
+        "[cadence] Scanning agent logs (last {} days)...",
         since_days
     );
 
     // Step 2: Find all session files modified within the --since window
     let files = agents::all_recent_files(now, since_secs);
-    eprintln!(
-        "[ai-session-commit-linker] Found {} session logs",
-        files.len()
-    );
+    eprintln!("[cadence] Found {} session logs", files.len());
     if !files.is_empty() {
         let mut counts: std::collections::BTreeMap<String, usize> =
             std::collections::BTreeMap::new();
@@ -910,10 +1053,7 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
             .map(|(agent, count)| format!("{agent}={count}"))
             .collect::<Vec<_>>()
             .join(", ");
-        eprintln!(
-            "[ai-session-commit-linker]   Agents with sessions: {}",
-            summary
-        );
+        eprintln!("[cadence]   Agents with sessions: {}", summary);
     }
 
     // Counters for final summary
@@ -983,7 +1123,7 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
 
     // Step 4: Process sessions grouped by repo
     for (repo_display, sessions) in &sessions_by_repo {
-        eprintln!("[ai-session-commit-linker] {}", repo_display);
+        eprintln!("[cadence] {}", repo_display);
 
         let mut repo_total = 0usize;
         let mut repo_with_commits = 0usize;
@@ -1008,7 +1148,7 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
                     continue;
                 }
 
-                let header = format!("[ai-session-commit-linker]   {} |", session_display);
+                let header = format!("[cadence]   {} |", session_display);
 
                 let time_range =
                     if let Some((start, end)) = scanner::session_time_range(&session.file) {
@@ -1131,7 +1271,7 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
             let mut session_skipped = 0usize;
             let mut messages: Vec<String> = Vec::new();
 
-            let header = format!("[ai-session-commit-linker]   {} |", session_display);
+            let header = format!("[cadence]   {} |", session_display);
 
             for hash in &commit_hashes {
                 // Verify the commit exists in the resolved repo
@@ -1230,28 +1370,30 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
             } else {
                 eprintln!("{}", header);
                 for msg in &messages {
-                    eprintln!("[ai-session-commit-linker]     {}", msg);
+                    eprintln!("[cadence]     {}", msg);
                 }
             }
         }
 
         // Per-repo summary
         eprintln!(
-            "[ai-session-commit-linker]   {} sessions, {} with commits, {} without",
+            "[cadence]   {} sessions, {} with commits, {} without",
             repo_total, repo_with_commits, repo_without_commits
         );
     }
 
     // Final summary
     eprintln!(
-        "[ai-session-commit-linker] Done. {} attached, {} fallback attached, {} skipped, {} errors.",
+        "[cadence] Done. {} attached, {} fallback attached, {} skipped, {} errors.",
         attached, fallback_attached, skipped, errors
     );
 
     // Step 7: Push if requested
     if do_push {
-        eprintln!("[ai-session-commit-linker] Pushing notes...");
-        push::attempt_push();
+        eprintln!("[cadence] Pushing notes...");
+        if let Ok(Some(remote)) = git::resolve_push_remote() {
+            push::attempt_push_remote(&remote);
+        }
     }
 
     Ok(())
@@ -1266,14 +1408,11 @@ fn run_retry() -> Result<()> {
         .unwrap_or(0);
 
     if pending_count == 0 {
-        eprintln!("[ai-session-commit-linker] no pending commits for this repo");
+        eprintln!("[cadence] no pending commits for this repo");
         return Ok(());
     }
 
-    eprintln!(
-        "[ai-session-commit-linker] retrying {} pending commit(s)...",
-        pending_count
-    );
+    eprintln!("[cadence] retrying {} pending commit(s)...", pending_count);
     retry_pending_for_repo(&repo_str, &repo_root);
 
     let remaining = pending::list_for_repo(&repo_str)
@@ -1281,24 +1420,24 @@ fn run_retry() -> Result<()> {
         .unwrap_or(0);
     let resolved = pending_count - remaining;
     eprintln!(
-        "[ai-session-commit-linker] retry complete: {} resolved, {} still pending",
+        "[cadence] retry complete: {} resolved, {} still pending",
         resolved, remaining
     );
 
     Ok(())
 }
 
-/// The status subcommand: show AI Session Commit Linker configuration and state.
+/// The status subcommand: show Cadence CLI configuration and state.
 ///
 /// Displays:
 /// - Current repo root (or a message if not in a git repo)
-/// - Hooks path and whether the post-commit shim is installed
+/// - Hooks path and whether the post-commit/pre-push shims are installed
 /// - Number of pending retries for the current repo
 /// - Org filter config (if any)
 /// - Autopush consent status
 /// - Per-repo enabled/disabled status
 ///
-/// All output uses the `[ai-session-commit-linker]` prefix on stderr.
+/// All output uses the `[cadence]` prefix on stderr.
 /// Handles being called outside a git repo gracefully.
 fn run_status() -> Result<()> {
     run_status_inner(&mut std::io::stderr())
@@ -1307,25 +1446,16 @@ fn run_status() -> Result<()> {
 /// Inner implementation of `run_status` that writes to a `Write` impl.
 /// This allows tests to capture the output for verification.
 fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
-    writeln!(w, "[ai-session-commit-linker] Status").ok();
+    writeln!(w, "[cadence] Status").ok();
 
     // --- Repo root ---
     let repo_root = match git::repo_root() {
         Ok(root) => {
-            writeln!(
-                w,
-                "[ai-session-commit-linker]   Repo: {}",
-                root.to_string_lossy()
-            )
-            .ok();
+            writeln!(w, "[cadence]   Repo: {}", root.to_string_lossy()).ok();
             Some(root)
         }
         Err(_) => {
-            writeln!(
-                w,
-                "[ai-session-commit-linker]   Repo: (not in a git repository)"
-            )
-            .ok();
+            writeln!(w, "[cadence]   Repo: (not in a git repository)").ok();
             None
         }
     };
@@ -1333,25 +1463,27 @@ fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
     // --- Hooks path and shim status ---
     match git::config_get_global("core.hooksPath") {
         Ok(Some(path)) => {
-            let shim_path = std::path::Path::new(&path).join("post-commit");
-            let shim_installed = match std::fs::read_to_string(&shim_path) {
-                Ok(content) => content.contains("ai-session-commit-linker"),
+            let post_path = std::path::Path::new(&path).join("post-commit");
+            let post_installed = match std::fs::read_to_string(&post_path) {
+                Ok(content) => is_cadence_hook(&content),
                 Err(_) => false,
             };
-            let installed_str = if shim_installed { "yes" } else { "no" };
+            let pre_path = std::path::Path::new(&path).join("pre-push");
+            let pre_installed = match std::fs::read_to_string(&pre_path) {
+                Ok(content) => is_cadence_hook(&content),
+                Err(_) => false,
+            };
+            let post_str = if post_installed { "yes" } else { "no" };
+            let pre_str = if pre_installed { "yes" } else { "no" };
             writeln!(
                 w,
-                "[ai-session-commit-linker]   Hooks path: {} (shim installed: {})",
-                path, installed_str
+                "[cadence]   Hooks path: {} (post-commit: {}, pre-push: {})",
+                path, post_str, pre_str
             )
             .ok();
         }
         _ => {
-            writeln!(
-                w,
-                "[ai-session-commit-linker]   Hooks path: (not configured)"
-            )
-            .ok();
+            writeln!(w, "[cadence]   Hooks path: (not configured)").ok();
         }
     }
 
@@ -1361,27 +1493,18 @@ fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
         let pending_count = pending::list_for_repo(&repo_str)
             .map(|r| r.len())
             .unwrap_or(0);
-        writeln!(
-            w,
-            "[ai-session-commit-linker]   Pending retries: {}",
-            pending_count
-        )
-        .ok();
+        writeln!(w, "[cadence]   Pending retries: {}", pending_count).ok();
     } else {
-        writeln!(
-            w,
-            "[ai-session-commit-linker]   Pending retries: (n/a - not in a repo)"
-        )
-        .ok();
+        writeln!(w, "[cadence]   Pending retries: (n/a - not in a repo)").ok();
     }
 
     // --- Org filter ---
     match git::config_get_global("ai.session-commit-linker.org") {
         Ok(Some(org)) => {
-            writeln!(w, "[ai-session-commit-linker]   Org filter: {}", org).ok();
+            writeln!(w, "[cadence]   Org filter: {}", org).ok();
         }
         _ => {
-            writeln!(w, "[ai-session-commit-linker]   Org filter: (none)").ok();
+            writeln!(w, "[cadence]   Org filter: (none)").ok();
         }
     }
 
@@ -1389,49 +1512,33 @@ fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
     if repo_root.is_some() {
         match git::config_get("ai.session-commit-linker.autopush") {
             Ok(Some(val)) if val == "true" => {
-                writeln!(
-                    w,
-                    "[ai-session-commit-linker]   Auto-push: enabled (consented)"
-                )
-                .ok();
+                writeln!(w, "[cadence]   Auto-push: enabled (consented)").ok();
             }
             Ok(Some(val)) if val == "false" => {
-                writeln!(
-                    w,
-                    "[ai-session-commit-linker]   Auto-push: disabled (opted out)"
-                )
-                .ok();
+                writeln!(w, "[cadence]   Auto-push: disabled (opted out)").ok();
             }
             _ => {
                 writeln!(
                     w,
-                    "[ai-session-commit-linker]   Auto-push: not yet configured (will prompt on first push)"
+                    "[cadence]   Auto-push: not yet configured (will prompt on first push)"
                 )
                 .ok();
             }
         }
     } else {
-        writeln!(
-            w,
-            "[ai-session-commit-linker]   Auto-push: (n/a - not in a repo)"
-        )
-        .ok();
+        writeln!(w, "[cadence]   Auto-push: (n/a - not in a repo)").ok();
     }
 
     // --- Per-repo enabled/disabled ---
     if repo_root.is_some() {
         let enabled = git::check_enabled();
         if enabled {
-            writeln!(w, "[ai-session-commit-linker]   Repo enabled: yes").ok();
+            writeln!(w, "[cadence]   Repo enabled: yes").ok();
         } else {
-            writeln!(w, "[ai-session-commit-linker]   Repo enabled: no").ok();
+            writeln!(w, "[cadence]   Repo enabled: no").ok();
         }
     } else {
-        writeln!(
-            w,
-            "[ai-session-commit-linker]   Repo enabled: (n/a - not in a repo)"
-        )
-        .ok();
+        writeln!(w, "[cadence]   Repo enabled: (n/a - not in a repo)").ok();
     }
 
     Ok(())
@@ -1448,6 +1555,7 @@ fn main() {
         Command::Install { org } => run_install(org),
         Command::Hook { hook_command } => match hook_command {
             HookCommand::PostCommit => run_hook_post_commit(),
+            HookCommand::PrePush { remote, url } => run_hook_pre_push(&remote, &url),
             HookCommand::PostCommitRetry {
                 commit,
                 repo,
@@ -1460,7 +1568,7 @@ fn main() {
     };
 
     if let Err(e) = result {
-        eprintln!("[ai-session-commit-linker] error: {}", e);
+        eprintln!("[cadence] error: {}", e);
         process::exit(1);
     }
 }
@@ -1477,13 +1585,13 @@ mod tests {
 
     #[test]
     fn cli_parses_install() {
-        let cli = Cli::parse_from(["ai-session-commit-linker", "install"]);
+        let cli = Cli::parse_from(["cadence", "install"]);
         assert!(matches!(cli.command, Command::Install { org: None }));
     }
 
     #[test]
     fn cli_parses_install_with_org() {
-        let cli = Cli::parse_from(["ai-session-commit-linker", "install", "--org", "my-org"]);
+        let cli = Cli::parse_from(["cadence", "install", "--org", "my-org"]);
         match cli.command {
             Command::Install { org } => assert_eq!(org.as_deref(), Some("my-org")),
             _ => panic!("expected Install command"),
@@ -1492,7 +1600,7 @@ mod tests {
 
     #[test]
     fn cli_parses_hook_post_commit() {
-        let cli = Cli::parse_from(["ai-session-commit-linker", "hook", "post-commit"]);
+        let cli = Cli::parse_from(["cadence", "hook", "post-commit"]);
         assert!(matches!(
             cli.command,
             Command::Hook {
@@ -1502,9 +1610,29 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_hook_pre_push() {
+        let cli = Cli::parse_from([
+            "cadence",
+            "hook",
+            "pre-push",
+            "origin",
+            "git@github.com:org/repo.git",
+        ]);
+        match cli.command {
+            Command::Hook {
+                hook_command: HookCommand::PrePush { remote, url },
+            } => {
+                assert_eq!(remote, "origin");
+                assert_eq!(url, "git@github.com:org/repo.git");
+            }
+            _ => panic!("expected Hook PrePush command"),
+        }
+    }
+
+    #[test]
     fn cli_parses_hook_post_commit_retry() {
         let cli = Cli::parse_from([
-            "ai-session-commit-linker",
+            "cadence",
             "hook",
             "post-commit-retry",
             "abcdef0123456789abcdef0123456789abcdef01",
@@ -1530,7 +1658,7 @@ mod tests {
 
     #[test]
     fn cli_parses_hydrate_defaults() {
-        let cli = Cli::parse_from(["ai-session-commit-linker", "hydrate"]);
+        let cli = Cli::parse_from(["cadence", "hydrate"]);
         match cli.command {
             Command::Hydrate { since, push } => {
                 assert_eq!(since, "7d");
@@ -1542,13 +1670,7 @@ mod tests {
 
     #[test]
     fn cli_parses_hydrate_with_flags() {
-        let cli = Cli::parse_from([
-            "ai-session-commit-linker",
-            "hydrate",
-            "--since",
-            "30d",
-            "--push",
-        ]);
+        let cli = Cli::parse_from(["cadence", "hydrate", "--since", "30d", "--push"]);
         match cli.command {
             Command::Hydrate { since, push } => {
                 assert_eq!(since, "30d");
@@ -1560,13 +1682,13 @@ mod tests {
 
     #[test]
     fn cli_parses_retry() {
-        let cli = Cli::parse_from(["ai-session-commit-linker", "retry"]);
+        let cli = Cli::parse_from(["cadence", "retry"]);
         assert!(matches!(cli.command, Command::Retry));
     }
 
     #[test]
     fn cli_parses_status() {
-        let cli = Cli::parse_from(["ai-session-commit-linker", "status"]);
+        let cli = Cli::parse_from(["cadence", "status"]);
         assert!(matches!(cli.command, Command::Status));
     }
 
@@ -1748,25 +1870,25 @@ mod tests {
 
     #[test]
     fn cli_rejects_unknown_subcommand() {
-        let result = Cli::try_parse_from(["ai-session-commit-linker", "frobnicate"]);
+        let result = Cli::try_parse_from(["cadence", "frobnicate"]);
         assert!(result.is_err());
     }
 
     #[test]
     fn cli_rejects_hook_without_sub_subcommand() {
-        let result = Cli::try_parse_from(["ai-session-commit-linker", "hook"]);
+        let result = Cli::try_parse_from(["cadence", "hook"]);
         assert!(result.is_err());
     }
 
     #[test]
     fn cli_rejects_hydrate_since_missing_value() {
-        let result = Cli::try_parse_from(["ai-session-commit-linker", "hydrate", "--since"]);
+        let result = Cli::try_parse_from(["cadence", "hydrate", "--since"]);
         assert!(result.is_err());
     }
 
     #[test]
     fn cli_rejects_no_subcommand() {
-        let result = Cli::try_parse_from(["ai-session-commit-linker"]);
+        let result = Cli::try_parse_from(["cadence"]);
         assert!(result.is_err());
     }
 
@@ -2349,7 +2471,7 @@ mod tests {
         // Pending record should exist
         let pending_path = fake_home
             .path()
-            .join(".ai-session-commit-linker")
+            .join(".cadence/cli")
             .join("pending")
             .join(format!("{}.json", head_hash));
         assert!(pending_path.exists(), "pending record should exist");
@@ -2427,7 +2549,7 @@ mod tests {
         let original_cwd = safe_cwd();
 
         // Use a fake HOME so pending records are written to a temp dir
-        // instead of the real ~/.ai-session-commit-linker/pending/.
+        // instead of the real ~/.cadence/cli/pending/.
         let fake_home = TempDir::new().expect("failed to create fake home");
         let original_home = std::env::var("HOME").ok();
         // SAFETY: This test is #[serial], so no other threads are reading
@@ -2463,7 +2585,7 @@ mod tests {
         // A pending record should have been written inside the fake home
         let pending_path = fake_home
             .path()
-            .join(".ai-session-commit-linker")
+            .join(".cadence/cli")
             .join("pending")
             .join(format!("{}.json", head_hash));
         assert!(pending_path.exists(), "pending record should exist");
@@ -2532,7 +2654,7 @@ mod tests {
         // Verify pending record was created
         let pending_path = fake_home
             .path()
-            .join(".ai-session-commit-linker")
+            .join(".cadence/cli")
             .join("pending")
             .join(format!("{}.json", first_hash));
         assert!(pending_path.exists(), "pending record should exist");
@@ -2635,7 +2757,7 @@ mod tests {
         // increments it to 2 (because retry also fails to find a session log).
         let pending_path = fake_home
             .path()
-            .join(".ai-session-commit-linker")
+            .join(".cadence/cli")
             .join("pending")
             .join(format!("{}.json", first_hash));
         let content = std::fs::read_to_string(&pending_path).unwrap();
@@ -3512,7 +3634,7 @@ mod tests {
 
         let pending_path = fake_home
             .path()
-            .join(".ai-session-commit-linker")
+            .join(".cadence/cli")
             .join("pending")
             .join(format!("{}.json", first_hash));
         assert!(pending_path.exists(), "pending record should exist");
@@ -4012,8 +4134,20 @@ mod tests {
 
         let shim_content = std::fs::read_to_string(&shim_path).unwrap();
         assert_eq!(
-            shim_content, "#!/bin/sh\nexec ai-session-commit-linker hook post-commit\n",
+            shim_content,
+            post_commit_hook_content(),
             "shim content should match exactly"
+        );
+
+        // Verify pre-push shim was written
+        let pre_push_path = hooks_dir.join("pre-push");
+        assert!(pre_push_path.exists(), "pre-push shim should exist");
+
+        let pre_push_content = std::fs::read_to_string(&pre_push_path).unwrap();
+        assert_eq!(
+            pre_push_content,
+            pre_push_hook_content(),
+            "pre-push shim content should match exactly"
         );
 
         // Verify shim is executable
@@ -4026,6 +4160,14 @@ mod tests {
                 mode & 0o111 != 0,
                 "shim should be executable, got mode {:o}",
                 mode
+            );
+
+            let pre_perms = std::fs::metadata(&pre_push_path).unwrap().permissions();
+            let pre_mode = pre_perms.mode();
+            assert!(
+                pre_mode & 0o111 != 0,
+                "pre-push shim should be executable, got mode {:o}",
+                pre_mode
             );
         }
 
@@ -4113,13 +4255,14 @@ mod tests {
         let result2 = run_install_inner(None, Some(fake_home.path()));
         assert!(result2.is_ok());
 
-        // Shim should still be correct
+        // Shims should still be correct
         let shim_path = fake_home.path().join(".git-hooks").join("post-commit");
         let content = std::fs::read_to_string(&shim_path).unwrap();
-        assert_eq!(
-            content,
-            "#!/bin/sh\nexec ai-session-commit-linker hook post-commit\n"
-        );
+        assert_eq!(content, post_commit_hook_content());
+
+        let pre_push_path = fake_home.path().join(".git-hooks").join("pre-push");
+        let pre_content = std::fs::read_to_string(&pre_push_path).unwrap();
+        assert_eq!(pre_content, pre_push_hook_content());
 
         // Restore
         unsafe {
@@ -4137,7 +4280,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_install_detects_existing_non_linker_hook() {
-        // If a post-commit hook exists that was NOT created by ai-session-commit-linker,
+        // If a post-commit hook exists that was NOT created by cadence,
         // install should still overwrite it (with a warning).
         let fake_home = TempDir::new().expect("failed to create fake home");
         let original_home = std::env::var("HOME").ok();
@@ -4151,32 +4294,45 @@ mod tests {
             std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
         }
 
-        // Pre-create hooks dir and a non-linker hook
+        // Pre-create hooks dir and non-linker hooks
         let hooks_dir = fake_home.path().join(".git-hooks");
         std::fs::create_dir_all(&hooks_dir).unwrap();
         let shim_path = hooks_dir.join("post-commit");
         std::fs::write(&shim_path, "#!/bin/sh\necho 'custom hook'\n").unwrap();
+        let pre_push_path = hooks_dir.join("pre-push");
+        std::fs::write(&pre_push_path, "#!/bin/sh\necho 'custom pre-push'\n").unwrap();
 
         let result = run_install_inner(None, Some(fake_home.path()));
         assert!(result.is_ok());
 
-        // The shim should now be the ai-session-commit-linker one (overwritten)
+        // The shim should now be the cadence one (overwritten)
         let content = std::fs::read_to_string(&shim_path).unwrap();
-        assert_eq!(
-            content,
-            "#!/bin/sh\nexec ai-session-commit-linker hook post-commit\n"
-        );
+        assert_eq!(content, post_commit_hook_content());
+
+        let pre_content = std::fs::read_to_string(&pre_push_path).unwrap();
+        assert_eq!(pre_content, pre_push_hook_content());
 
         // The original hook should have been backed up
-        let backup_path = hooks_dir.join("post-commit.pre-ai-session-commit-linker");
+        let backup_path = hooks_dir.join("post-commit.pre-cadence");
         assert!(
             backup_path.exists(),
-            "backup of original hook should exist at post-commit.pre-ai-session-commit-linker"
+            "backup of original hook should exist at post-commit.pre-cadence"
         );
         let backup_content = std::fs::read_to_string(&backup_path).unwrap();
         assert_eq!(
             backup_content, "#!/bin/sh\necho 'custom hook'\n",
             "backup should contain the original hook content"
+        );
+
+        let pre_backup_path = hooks_dir.join("pre-push.pre-cadence");
+        assert!(
+            pre_backup_path.exists(),
+            "backup of original hook should exist at pre-push.pre-cadence"
+        );
+        let pre_backup_content = std::fs::read_to_string(&pre_backup_path).unwrap();
+        assert_eq!(
+            pre_backup_content, "#!/bin/sh\necho 'custom pre-push'\n",
+            "backup should contain the original pre-push hook content"
         );
 
         // Restore
@@ -4195,7 +4351,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_install_detects_existing_linker_hook() {
-        // If a post-commit hook exists that WAS created by ai-session-commit-linker,
+        // If a post-commit hook exists that WAS created by cadence,
         // install should update it silently.
         let fake_home = TempDir::new().expect("failed to create fake home");
         let original_home = std::env::var("HOME").ok();
@@ -4209,25 +4365,23 @@ mod tests {
             std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
         }
 
-        // Pre-create hooks dir with an existing ai-session-commit-linker hook
+        // Pre-create hooks dir with existing cadence hooks
         let hooks_dir = fake_home.path().join(".git-hooks");
         std::fs::create_dir_all(&hooks_dir).unwrap();
         let shim_path = hooks_dir.join("post-commit");
-        std::fs::write(
-            &shim_path,
-            "#!/bin/sh\nexec ai-session-commit-linker hook post-commit\n",
-        )
-        .unwrap();
+        std::fs::write(&shim_path, post_commit_hook_content()).unwrap();
+        let pre_push_path = hooks_dir.join("pre-push");
+        std::fs::write(&pre_push_path, pre_push_hook_content()).unwrap();
 
         let result = run_install_inner(None, Some(fake_home.path()));
         assert!(result.is_ok());
 
         // The shim should still be correct
         let content = std::fs::read_to_string(&shim_path).unwrap();
-        assert_eq!(
-            content,
-            "#!/bin/sh\nexec ai-session-commit-linker hook post-commit\n"
-        );
+        assert_eq!(content, post_commit_hook_content());
+
+        let pre_content = std::fs::read_to_string(&pre_push_path).unwrap();
+        assert_eq!(pre_content, pre_push_hook_content());
 
         // Restore
         unsafe {
@@ -4425,13 +4579,11 @@ mod tests {
         std::fs::create_dir_all(&hooks_dir).unwrap();
         let hooks_dir_str = hooks_dir.to_string_lossy().to_string();
 
-        // Write the ai-session-commit-linker shim
+        // Write the cadence shims
         let shim_path = hooks_dir.join("post-commit");
-        std::fs::write(
-            &shim_path,
-            "#!/bin/sh\nexec ai-session-commit-linker hook post-commit\n",
-        )
-        .unwrap();
+        std::fs::write(&shim_path, post_commit_hook_content()).unwrap();
+        let pre_push_path = hooks_dir.join("pre-push");
+        std::fs::write(&pre_push_path, pre_push_hook_content()).unwrap();
 
         let global_config = fake_home.path().join("fake-global-gitconfig");
         std::fs::write(
@@ -4453,8 +4605,13 @@ mod tests {
 
         let output = String::from_utf8(buf).unwrap();
         assert!(
-            output.contains("shim installed: yes"),
-            "should show shim installed, got: {}",
+            output.contains("post-commit: yes"),
+            "should show post-commit installed, got: {}",
+            output
+        );
+        assert!(
+            output.contains("pre-push: yes"),
+            "should show pre-push installed, got: {}",
             output
         );
 
@@ -4488,10 +4645,7 @@ mod tests {
         let git_repo_root = run_git(repo_path, &["rev-parse", "--show-toplevel"]);
 
         // Write some pending records for this repo
-        let pending_dir = fake_home
-            .path()
-            .join(".ai-session-commit-linker")
-            .join("pending");
+        let pending_dir = fake_home.path().join(".cadence/cli").join("pending");
         std::fs::create_dir_all(&pending_dir).unwrap();
 
         for i in 0..3 {
@@ -4674,7 +4828,7 @@ mod tests {
 
     #[test]
     fn test_existing_notes_from_other_refs_not_affected() {
-        // AI Session Commit Linker uses refs/notes/ai-sessions. Existing notes from
+        // Cadence CLI uses refs/notes/ai-sessions. Existing notes from
         // other refs (e.g., the default refs/notes/commits) should not
         // be affected by our operations.
         let dir = init_temp_repo();
@@ -4782,10 +4936,7 @@ mod tests {
         let first_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
 
         // Create a pending record with attempts >= MAX_RETRY_ATTEMPTS
-        let pending_dir = fake_home
-            .path()
-            .join(".ai-session-commit-linker")
-            .join("pending");
+        let pending_dir = fake_home.path().join(".cadence/cli").join("pending");
         std::fs::create_dir_all(&pending_dir).unwrap();
 
         let record = serde_json::json!({

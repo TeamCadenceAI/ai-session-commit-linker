@@ -450,7 +450,7 @@ fn infer_agent_type(path: &Path) -> AgentType {
         AgentType::Cursor
     } else if path_str.contains("/Antigravity/")
         || path_str.contains("/antigravity-api/")
-        || path_str.contains("/.ai-session-commit-linker/antigravity-api/")
+        || path_str.contains("/.cadence/cli/antigravity-api/")
     {
         AgentType::Antigravity
     } else if path_str.contains("/Code/") {
@@ -638,7 +638,7 @@ mod tests {
 
     #[test]
     fn test_infer_agent_type_antigravity_api_cache() {
-        let path = Path::new("/Users/foo/.ai-session-commit-linker/antigravity-api/abc.json");
+        let path = Path::new("/Users/foo/.cadence/cli/antigravity-api/abc.json");
         assert_eq!(infer_agent_type(path), AgentType::Antigravity);
     }
 

@@ -3,22 +3,6 @@
 version = 4
 
 [[package]]
-name = "ai-session-commit-linker"
-version = "0.1.5"
-dependencies = [
- "anyhow",
- "clap",
- "filetime",
- "reqwest",
- "serde",
- "serde_json",
- "serial_test",
- "sha2",
- "tempfile",
- "time",
-]
-
-[[package]]
 name = "anstream"
 version = "0.6.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -112,6 +96,22 @@ name = "bytes"
 version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
+
+[[package]]
+name = "cadence-cli"
+version = "0.1.5"
+dependencies = [
+ "anyhow",
+ "clap",
+ "filetime",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "sha2",
+ "tempfile",
+ "time",
+]
 
 [[package]]
 name = "cc"
