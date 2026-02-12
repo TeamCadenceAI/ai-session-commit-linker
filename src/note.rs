@@ -2,8 +2,8 @@
 //!
 //! Produces human-readable notes with a YAML-style header delimited by `---`
 //! followed by the verbatim session log (JSONL) payload. The header contains
-//! metadata fields: agent, session_id, repo, commit, confidence, and
-//! payload_sha256.
+//! metadata fields: agent, session_id, user_email, repo, commit,
+//! confidence, uploaded_data_sha256, and payload_sha256.
 
 use crate::scanner::AgentType;
 use sha2::{Digest, Sha256};
@@ -19,9 +19,11 @@ use sha2::{Digest, Sha256};
 /// ---
 /// agent: claude-code | codex
 /// session_id: <uuid>
+/// user_email: <onboarded email or unknown>
 /// repo: <path>
 /// commit: <full hash>
 /// confidence: exact_hash_match
+/// uploaded_data_sha256: <hash>
 /// payload_sha256: <hash>
 /// ---
 /// <verbatim session log (JSONL)>
@@ -47,17 +49,21 @@ pub fn format(
     repo: &str,
     commit: &str,
     session_log: &str,
+    user_email: Option<&str>,
 ) -> anyhow::Result<String> {
     crate::git::validate_commit_hash(commit)?;
     let sha = payload_sha256(session_log);
+    let email = user_email.unwrap_or("unknown");
 
     let mut note = String::new();
     note.push_str("---\n");
     note.push_str(&format!("agent: {}\n", agent));
     note.push_str(&format!("session_id: {}\n", session_id));
+    note.push_str(&format!("user_email: {}\n", email));
     note.push_str(&format!("repo: {}\n", repo));
     note.push_str(&format!("commit: {}\n", commit));
     note.push_str("confidence: exact_hash_match\n");
+    note.push_str(&format!("uploaded_data_sha256: {}\n", sha));
     note.push_str(&format!("payload_sha256: {}\n", sha));
     note.push_str("---\n");
     note.push_str(session_log);
@@ -136,7 +142,15 @@ mod tests {
 {"type":"tool_result","content":"done"}
 "#;
 
-        let note = format(&AgentType::Claude, session_id, repo, commit, session_log).unwrap();
+        let note = format(
+            &AgentType::Claude,
+            session_id,
+            repo,
+            commit,
+            session_log,
+            Some("dev@example.com"),
+        )
+        .unwrap();
 
         // Verify the note starts with ---
         assert!(note.starts_with("---\n"));
@@ -152,12 +166,14 @@ mod tests {
         let header = parts[1];
         assert!(header.contains("agent: claude-code\n"));
         assert!(header.contains("session_id: abc-123-def-456\n"));
+        assert!(header.contains("user_email: dev@example.com\n"));
         assert!(header.contains("repo: /Users/foo/dev/my-repo\n"));
         assert!(header.contains("commit: 655dd38a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e\n"));
         assert!(header.contains("confidence: exact_hash_match\n"));
 
         // Verify the payload_sha256 in the header matches the actual SHA-256
         let expected_sha = payload_sha256(session_log);
+        assert!(header.contains(&format!("uploaded_data_sha256: {}\n", expected_sha)));
         assert!(header.contains(&format!("payload_sha256: {}\n", expected_sha)));
 
         // parts[2] is the verbatim payload after the closing ---
@@ -172,6 +188,7 @@ mod tests {
             "/repo",
             "aabbccdd00112233",
             "payload",
+            Some("user@example.com"),
         )
         .unwrap();
 
@@ -180,11 +197,13 @@ mod tests {
         assert_eq!(lines[0], "---");
         assert!(lines[1].starts_with("agent: "));
         assert!(lines[2].starts_with("session_id: "));
-        assert!(lines[3].starts_with("repo: "));
-        assert!(lines[4].starts_with("commit: "));
-        assert!(lines[5].starts_with("confidence: "));
-        assert!(lines[6].starts_with("payload_sha256: "));
-        assert_eq!(lines[7], "---");
+        assert!(lines[3].starts_with("user_email: "));
+        assert!(lines[4].starts_with("repo: "));
+        assert!(lines[5].starts_with("commit: "));
+        assert!(lines[6].starts_with("confidence: "));
+        assert!(lines[7].starts_with("uploaded_data_sha256: "));
+        assert!(lines[8].starts_with("payload_sha256: "));
+        assert_eq!(lines[9], "---");
     }
 
     #[test]
@@ -195,6 +214,7 @@ mod tests {
             "/repo",
             "0000000000000000000000000000000000000000",
             "",
+            None,
         )
         .unwrap();
 
@@ -224,6 +244,7 @@ mod tests {
             "/repo",
             "aabbccdd00112233",
             session_log,
+            None,
         )
         .unwrap();
 
@@ -247,6 +268,7 @@ mod tests {
             "/repo",
             "aabbccdd00112233",
             session_log,
+            None,
         )
         .unwrap();
 
@@ -256,7 +278,15 @@ mod tests {
 
     #[test]
     fn test_format_codex_agent() {
-        let note = format(&AgentType::Codex, "sid", "/repo", "aabbccdd00112233", "log").unwrap();
+        let note = format(
+            &AgentType::Codex,
+            "sid",
+            "/repo",
+            "aabbccdd00112233",
+            "log",
+            None,
+        )
+        .unwrap();
         assert!(note.contains("agent: codex\n"));
     }
 
@@ -269,6 +299,7 @@ mod tests {
             "/repo",
             "aabbccdd00112233",
             session_log,
+            None,
         )
         .unwrap();
 
@@ -292,6 +323,7 @@ mod tests {
             "/foo",
             "655dd38a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e",
             session_log,
+            None,
         )
         .unwrap();
 
@@ -322,6 +354,7 @@ mod tests {
             "/repo",
             "aabbccdd00112233",
             session_log,
+            None,
         )
         .unwrap();
 
@@ -345,19 +378,26 @@ mod tests {
 
     #[test]
     fn test_format_rejects_invalid_commit_hash() {
-        let result = format(&AgentType::Claude, "sid", "/repo", "not-a-hash", "log");
+        let result = format(
+            &AgentType::Claude,
+            "sid",
+            "/repo",
+            "not-a-hash",
+            "log",
+            None,
+        );
         assert!(result.is_err());
     }
 
     #[test]
     fn test_format_rejects_empty_commit_hash() {
-        let result = format(&AgentType::Claude, "sid", "/repo", "", "log");
+        let result = format(&AgentType::Claude, "sid", "/repo", "", "log", None);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_format_rejects_short_commit_hash() {
-        let result = format(&AgentType::Claude, "sid", "/repo", "abcdef", "log");
+        let result = format(&AgentType::Claude, "sid", "/repo", "abcdef", "log", None);
         assert!(result.is_err());
     }
 }

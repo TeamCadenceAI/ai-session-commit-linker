@@ -1,6 +1,7 @@
 mod agents;
 mod git;
 mod note;
+mod onboarding;
 mod pending;
 mod push;
 mod scanner;
@@ -27,6 +28,9 @@ enum Command {
         /// Optional GitHub org filter for push scoping.
         #[arg(long)]
         org: Option<String>,
+        /// Force first-time onboarding prompts (development/testing).
+        #[arg(long = "ftue", alias = "first-time-experience")]
+        first_time_experience: bool,
     },
 
     /// Git hook entry points.
@@ -49,8 +53,45 @@ enum Command {
     /// Retry attaching notes for pending (unresolved) commits.
     Retry,
 
+    /// Run onboarding to capture user email for note attribution.
+    Onboard {
+        /// Email to set non-interactively.
+        #[arg(long)]
+        email: Option<String>,
+    },
+
+    /// Manage repository scope for hook processing.
+    Scope {
+        #[command(subcommand)]
+        scope_command: ScopeCommand,
+    },
+
+    /// Uninstall and reset AI Session Commit Linker configuration/state.
+    Uninstall,
+
     /// Show AI Session Commit Linker status for the current repository.
     Status,
+}
+
+#[derive(Subcommand, Debug)]
+enum ScopeCommand {
+    /// Set scope mode: current, all, or selected.
+    Set {
+        #[arg(value_enum)]
+        mode: onboarding::ScopeMode,
+    },
+    /// Add a repo to selected scope allowlist.
+    Add {
+        /// Path within target repository.
+        repo: String,
+    },
+    /// Remove a repo from selected scope allowlist.
+    Remove {
+        /// Path within target repository.
+        repo: String,
+    },
+    /// List current scope config.
+    List,
 }
 
 #[derive(Subcommand, Debug)]
@@ -85,13 +126,17 @@ enum HookCommand {
 ///
 /// Errors at each step are reported but do not prevent subsequent steps
 /// from being attempted.
-fn run_install(org: Option<String>) -> Result<()> {
-    run_install_inner(org, None)
+fn run_install(org: Option<String>, first_time_experience: bool) -> Result<()> {
+    run_install_inner(org, None, first_time_experience)
 }
 
 /// Inner implementation of install, accepting an optional home directory override
 /// for testability. If `home_override` is `None`, uses the real home directory.
-fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path>) -> Result<()> {
+fn run_install_inner(
+    org: Option<String>,
+    home_override: Option<&std::path::Path>,
+    first_time_experience: bool,
+) -> Result<()> {
     eprintln!("[ai-session-commit-linker] Installing...");
 
     let home = match home_override {
@@ -105,6 +150,14 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
 
     // Track whether any step failed (but continue regardless)
     let mut had_errors = false;
+
+    // Step 0: onboarding (capture user email and scope)
+    if let Err(e) = onboarding::run_install_onboarding(first_time_experience) {
+        eprintln!(
+            "[ai-session-commit-linker] warning: onboarding not completed: {}",
+            e
+        );
+    }
 
     // Step 1: Set git config --global core.hooksPath ~/.git-hooks
     match git::config_set_global("core.hooksPath", &hooks_dir_str) {
@@ -300,9 +353,13 @@ fn hook_post_commit_inner() -> Result<()> {
 
     // Step 1: Get repo root, HEAD hash, HEAD timestamp
     let repo_root = git::repo_root()?;
+    if !onboarding::is_repo_in_scope(&repo_root) {
+        return Ok(());
+    }
     let head_hash = git::head_hash()?;
     let head_timestamp = git::head_timestamp()?;
     let repo_root_str = repo_root.to_string_lossy().to_string();
+    let user_email = onboarding::get_email();
 
     // Step 2: Deduplication — if note already exists, exit early
     if git::note_exists(&head_hash)? {
@@ -364,6 +421,7 @@ fn hook_post_commit_inner() -> Result<()> {
                 &repo_root_str,
                 &head_hash,
                 &session_log,
+                user_email.as_deref(),
             )?;
 
             // Attach the note
@@ -459,6 +517,9 @@ fn spawn_background_retry(commit: &str, repo: &str, timestamp: i64) {
 /// The pending system handles long-term retry if this process fails.
 fn run_hook_post_commit_retry(commit: &str, repo: &str, timestamp: i64) -> Result<()> {
     let repo_root = std::path::Path::new(repo);
+    if !onboarding::is_repo_in_scope(repo_root) {
+        return Ok(());
+    }
 
     for delay in BACKGROUND_RETRY_DELAYS {
         std::thread::sleep(std::time::Duration::from_secs(*delay));
@@ -542,6 +603,7 @@ fn try_resolve_single_commit(
         Ok(content) => content,
         Err(_) => return ResolveResult::TransientError,
     };
+    let user_email = onboarding::get_email();
 
     let session_id = metadata.session_id.as_deref().unwrap_or("unknown");
 
@@ -551,6 +613,7 @@ fn try_resolve_single_commit(
         repo_str,
         commit,
         &session_log,
+        user_email.as_deref(),
     ) {
         Ok(c) => c,
         Err(_) => return ResolveResult::TransientError,
@@ -662,6 +725,7 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
+    let user_email = onboarding::get_email();
 
     // Step 1: Collect all log directories (repo-agnostic)
     eprintln!(
@@ -781,6 +845,9 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
             if !git::check_enabled_at(&session.repo_root) {
                 continue;
             }
+            if !onboarding::is_repo_in_scope(&session.repo_root) {
+                continue;
+            }
 
             // For each hash, attach note if missing.
             // Buffer messages so we can combine a single status with the header.
@@ -849,6 +916,7 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
                     &repo_str,
                     hash,
                     &session_log,
+                    user_email.as_deref(),
                 ) {
                     Ok(c) => c,
                     Err(e) => {
@@ -916,6 +984,10 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
 
 fn run_retry() -> Result<()> {
     let repo_root = git::repo_root()?;
+    if !onboarding::is_repo_in_scope(&repo_root) {
+        eprintln!("[ai-session-commit-linker] current repo is outside configured scope");
+        return Ok(());
+    }
     let repo_str = repo_root.to_string_lossy().to_string();
 
     let pending_count = pending::list_for_repo(&repo_str)
@@ -942,6 +1014,107 @@ fn run_retry() -> Result<()> {
         resolved, remaining
     );
 
+    Ok(())
+}
+
+fn run_onboard(email: Option<String>) -> Result<()> {
+    onboarding::run_onboarding(email.as_deref())
+}
+
+fn run_scope(scope_command: ScopeCommand) -> Result<()> {
+    match scope_command {
+        ScopeCommand::Set { mode } => {
+            onboarding::set_scope_mode_with_context(mode, None)?;
+            eprintln!("[ai-session-commit-linker] scope set to {}", mode.as_str());
+        }
+        ScopeCommand::Add { repo } => {
+            let resolved = onboarding::add_selected_repo(&repo)?;
+            eprintln!(
+                "[ai-session-commit-linker] added repo to scope: {}",
+                resolved
+            );
+        }
+        ScopeCommand::Remove { repo } => {
+            let resolved = onboarding::remove_selected_repo(&repo)?;
+            eprintln!(
+                "[ai-session-commit-linker] removed repo from scope: {}",
+                resolved
+            );
+        }
+        ScopeCommand::List => {
+            let mode = onboarding::get_scope_mode();
+            eprintln!("[ai-session-commit-linker] scope mode: {}", mode.as_str());
+            if matches!(mode, onboarding::ScopeMode::Selected) {
+                let repos = onboarding::get_selected_repos();
+                if repos.is_empty() {
+                    eprintln!("[ai-session-commit-linker] selected repos: (none)");
+                } else {
+                    eprintln!("[ai-session-commit-linker] selected repos:");
+                    for repo in repos {
+                        eprintln!("[ai-session-commit-linker]   {}", repo);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_uninstall() -> Result<()> {
+    eprintln!("[ai-session-commit-linker] Uninstalling and resetting state...");
+
+    // Global keys set/used by this tool.
+    let global_keys = [
+        "core.hooksPath",
+        "ai.session-commit-linker.org",
+        "ai.session-commit-linker.email",
+        "ai.session-commit-linker.scope",
+        "ai.session-commit-linker.scope.current_repo",
+        "ai.session-commit-linker.scope.selected",
+    ];
+    for key in global_keys {
+        if let Err(e) = git::config_unset_global(key) {
+            eprintln!(
+                "[ai-session-commit-linker] warning: failed to unset global {}: {}",
+                key, e
+            );
+        }
+    }
+
+    // Repo-local keys (if currently in a repo).
+    let local_keys = [
+        "ai.session-commit-linker.autopush",
+        "ai.session-commit-linker.enabled",
+    ];
+    if git::repo_root().is_ok() {
+        for key in local_keys {
+            if let Err(e) = git::config_unset(key) {
+                eprintln!(
+                    "[ai-session-commit-linker] warning: failed to unset local {}: {}",
+                    key, e
+                );
+            }
+        }
+    }
+
+    // Remove tool state directories from home.
+    if let Some(home) = agents::home_dir() {
+        let hooks_dir = home.join(".git-hooks");
+        let state_dir = home.join(".ai-session-commit-linker");
+        for dir in [hooks_dir, state_dir] {
+            if dir.exists()
+                && let Err(e) = std::fs::remove_dir_all(&dir)
+            {
+                eprintln!(
+                    "[ai-session-commit-linker] warning: failed to remove {}: {}",
+                    dir.display(),
+                    e
+                );
+            }
+        }
+    }
+
+    eprintln!("[ai-session-commit-linker] Uninstall complete.");
     Ok(())
 }
 
@@ -1042,6 +1215,46 @@ fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
         }
     }
 
+    // --- Onboarding email ---
+    match onboarding::get_email() {
+        Some(email) => {
+            writeln!(w, "[ai-session-commit-linker]   User email: {}", email).ok();
+        }
+        None => {
+            writeln!(
+                w,
+                "[ai-session-commit-linker]   User email: (not set; run `ai-session-commit-linker onboard`)"
+            )
+            .ok();
+        }
+    }
+
+    // --- Scope ---
+    let scope_mode = onboarding::get_scope_mode();
+    writeln!(
+        w,
+        "[ai-session-commit-linker]   Scope: {}",
+        scope_mode.as_str()
+    )
+    .ok();
+    if matches!(scope_mode, onboarding::ScopeMode::Selected) {
+        let selected = onboarding::get_selected_repos();
+        if selected.is_empty() {
+            writeln!(
+                w,
+                "[ai-session-commit-linker]   Scope selected repos: (none)"
+            )
+            .ok();
+        } else {
+            writeln!(
+                w,
+                "[ai-session-commit-linker]   Scope selected repos: {}",
+                selected.len()
+            )
+            .ok();
+        }
+    }
+
     // --- Autopush consent ---
     if repo_root.is_some() {
         match git::config_get("ai.session-commit-linker.autopush") {
@@ -1102,7 +1315,10 @@ fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Command::Install { org } => run_install(org),
+        Command::Install {
+            org,
+            first_time_experience,
+        } => run_install(org, first_time_experience),
         Command::Hook { hook_command } => match hook_command {
             HookCommand::PostCommit => run_hook_post_commit(),
             HookCommand::PostCommitRetry {
@@ -1113,6 +1329,9 @@ fn main() {
         },
         Command::Hydrate { since, push } => run_hydrate(&since, push),
         Command::Retry => run_retry(),
+        Command::Onboard { email } => run_onboard(email),
+        Command::Scope { scope_command } => run_scope(scope_command),
+        Command::Uninstall => run_uninstall(),
         Command::Status => run_status(),
     };
 
@@ -1133,16 +1352,44 @@ mod tests {
     #[test]
     fn cli_parses_install() {
         let cli = Cli::parse_from(["ai-session-commit-linker", "install"]);
-        assert!(matches!(cli.command, Command::Install { org: None }));
+        assert!(matches!(
+            cli.command,
+            Command::Install {
+                org: None,
+                first_time_experience: false
+            }
+        ));
     }
 
     #[test]
     fn cli_parses_install_with_org() {
         let cli = Cli::parse_from(["ai-session-commit-linker", "install", "--org", "my-org"]);
         match cli.command {
-            Command::Install { org } => assert_eq!(org.as_deref(), Some("my-org")),
+            Command::Install {
+                org,
+                first_time_experience,
+            } => {
+                assert_eq!(org.as_deref(), Some("my-org"));
+                assert!(!first_time_experience);
+            }
             _ => panic!("expected Install command"),
         }
+    }
+
+    #[test]
+    fn cli_parses_install_first_time_experience() {
+        let cli = Cli::parse_from([
+            "ai-session-commit-linker",
+            "install",
+            "--first-time-experience",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Command::Install {
+                first_time_experience: true,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1220,9 +1467,59 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_onboard() {
+        let cli = Cli::parse_from(["ai-session-commit-linker", "onboard"]);
+        assert!(matches!(cli.command, Command::Onboard { email: None }));
+    }
+
+    #[test]
+    fn cli_parses_onboard_with_email() {
+        let cli = Cli::parse_from([
+            "ai-session-commit-linker",
+            "onboard",
+            "--email",
+            "user@example.com",
+        ]);
+        match cli.command {
+            Command::Onboard { email } => assert_eq!(email.as_deref(), Some("user@example.com")),
+            _ => panic!("expected Onboard command"),
+        }
+    }
+
+    #[test]
     fn cli_parses_status() {
         let cli = Cli::parse_from(["ai-session-commit-linker", "status"]);
         assert!(matches!(cli.command, Command::Status));
+    }
+
+    #[test]
+    fn cli_parses_uninstall() {
+        let cli = Cli::parse_from(["ai-session-commit-linker", "uninstall"]);
+        assert!(matches!(cli.command, Command::Uninstall));
+    }
+
+    #[test]
+    fn cli_parses_scope_set() {
+        let cli = Cli::parse_from(["ai-session-commit-linker", "scope", "set", "selected"]);
+        assert!(matches!(
+            cli.command,
+            Command::Scope {
+                scope_command: ScopeCommand::Set {
+                    mode: onboarding::ScopeMode::Selected
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn cli_parses_scope_add() {
+        let cli = Cli::parse_from(["ai-session-commit-linker", "scope", "add", "."]);
+        assert!(matches!(
+            cli.command,
+            Command::Scope {
+                scope_command: ScopeCommand::Add { .. }
+            }
+        ));
     }
 
     #[test]
@@ -1244,7 +1541,7 @@ mod tests {
             std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
         }
 
-        let result = run_install_inner(None, Some(fake_home.path()));
+        let result = run_install_inner(None, Some(fake_home.path()), false);
         assert!(result.is_ok());
 
         // Restore
@@ -2241,7 +2538,7 @@ mod tests {
             std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
         }
 
-        let result = run_install_inner(None, Some(fake_home.path()));
+        let result = run_install_inner(None, Some(fake_home.path()), false);
         assert!(result.is_ok());
 
         // Verify hooks directory was created
@@ -2308,7 +2605,7 @@ mod tests {
             std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
         }
 
-        let result = run_install_inner(Some("my-org".to_string()), Some(fake_home.path()));
+        let result = run_install_inner(Some("my-org".to_string()), Some(fake_home.path()), false);
         assert!(result.is_ok());
 
         // Verify org was persisted to global config
@@ -2348,11 +2645,11 @@ mod tests {
         }
 
         // First install
-        let result1 = run_install_inner(None, Some(fake_home.path()));
+        let result1 = run_install_inner(None, Some(fake_home.path()), false);
         assert!(result1.is_ok());
 
         // Second install
-        let result2 = run_install_inner(None, Some(fake_home.path()));
+        let result2 = run_install_inner(None, Some(fake_home.path()), false);
         assert!(result2.is_ok());
 
         // Shim should still be correct
@@ -2399,7 +2696,7 @@ mod tests {
         let shim_path = hooks_dir.join("post-commit");
         std::fs::write(&shim_path, "#!/bin/sh\necho 'custom hook'\n").unwrap();
 
-        let result = run_install_inner(None, Some(fake_home.path()));
+        let result = run_install_inner(None, Some(fake_home.path()), false);
         assert!(result.is_ok());
 
         // The shim should now be the ai-session-commit-linker one (overwritten)
@@ -2461,7 +2758,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = run_install_inner(None, Some(fake_home.path()));
+        let result = run_install_inner(None, Some(fake_home.path()), false);
         assert!(result.is_ok());
 
         // The shim should still be correct
@@ -2541,7 +2838,7 @@ mod tests {
 
         // Run install (which should run hydration as its final step)
         std::env::set_current_dir(repo_path).expect("failed to chdir");
-        let result = run_install_inner(None, Some(fake_home.path()));
+        let result = run_install_inner(None, Some(fake_home.path()), false);
         assert!(result.is_ok());
 
         // Verify a note was attached to the commit by hydration

@@ -475,6 +475,46 @@ pub fn config_set_global(key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Unset a repo-local git config key.
+///
+/// Uses `--unset-all` so repeated keys are removed. Returns `Ok(())` if the
+/// key does not exist.
+pub fn config_unset(key: &str) -> Result<()> {
+    let output = Command::new("git")
+        .args(["config", "--unset-all", key])
+        .output()
+        .context("failed to execute git config --unset-all")?;
+
+    if !output.status.success() {
+        let code = output.status.code().unwrap_or(-1);
+        if code != 5 && code != 1 {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("git config --unset-all failed: {}", stderr.trim());
+        }
+    }
+    Ok(())
+}
+
+/// Unset a global git config key.
+///
+/// Uses `--unset-all` so repeated keys are removed. Returns `Ok(())` if the
+/// key does not exist.
+pub fn config_unset_global(key: &str) -> Result<()> {
+    let output = Command::new("git")
+        .args(["config", "--global", "--unset-all", key])
+        .output()
+        .context("failed to execute git config --global --unset-all")?;
+
+    if !output.status.success() {
+        let code = output.status.code().unwrap_or(-1);
+        if code != 5 && code != 1 {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("git config --global --unset-all failed: {}", stderr.trim());
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
