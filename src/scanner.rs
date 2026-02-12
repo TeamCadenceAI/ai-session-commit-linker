@@ -325,6 +325,11 @@ pub fn verify_match(metadata: &SessionMetadata, repo_root: &Path, commit: &str) 
     crate::git::commit_exists_at(repo_root, commit).unwrap_or_default()
 }
 
+/// Public wrapper to infer agent type from a log file path.
+pub fn agent_type_from_path(path: &Path) -> AgentType {
+    infer_agent_type(path)
+}
+
 /// Extract commit hashes from git commit confirmation output in a session log.
 ///
 /// Looks specifically for the `[branch HASH]` pattern that git outputs when

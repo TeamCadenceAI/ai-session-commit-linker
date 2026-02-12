@@ -898,6 +898,23 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
         "[ai-session-commit-linker] Found {} session logs",
         files.len()
     );
+    if !files.is_empty() {
+        let mut counts: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for file in &files {
+            let agent = scanner::agent_type_from_path(file).to_string();
+            *counts.entry(agent).or_insert(0) += 1;
+        }
+        let summary = counts
+            .into_iter()
+            .map(|(agent, count)| format!("{agent}={count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!(
+            "[ai-session-commit-linker]   Agents with sessions: {}",
+            summary
+        );
+    }
 
     // Counters for final summary
     let mut attached = 0usize;
