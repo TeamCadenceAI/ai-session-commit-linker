@@ -1,4 +1,5 @@
 mod agents;
+mod api_client;
 mod config;
 mod git;
 mod gpg;
