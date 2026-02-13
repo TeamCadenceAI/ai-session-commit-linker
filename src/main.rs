@@ -3528,7 +3528,6 @@ mod tests {
 
     use serde_json::json;
     use serial_test::serial;
-    use std::path::PathBuf;
     use tempfile::TempDir;
 
     /// Helper: create a temporary git repo with one commit.
