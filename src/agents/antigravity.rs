@@ -470,25 +470,18 @@ mod tests {
     use serde_json::json;
     use std::fs;
     use tempfile::TempDir;
+    use crate::agents::app_config_dir_in;
 
     #[test]
     fn test_antigravity_log_dirs_collects_chat_sessions() {
         let home = TempDir::new().unwrap();
-        let ws_root = home
-            .path()
-            .join("Library")
-            .join("Application Support")
-            .join("Antigravity")
+        let ws_root = app_config_dir_in("Antigravity", home.path())
             .join("User")
             .join("workspaceStorage")
             .join("abc")
             .join("chatSessions");
         fs::create_dir_all(&ws_root).unwrap();
-        let other_root = home
-            .path()
-            .join("Library")
-            .join("Application Support")
-            .join("Antigravity")
+        let other_root = app_config_dir_in("Antigravity", home.path())
             .join("User")
             .join("other")
             .join("chatSessions");
