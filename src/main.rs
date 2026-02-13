@@ -2068,10 +2068,12 @@ impl Prompter for DialoguerPrompter {
 fn gpg_install_guidance() -> &'static str {
     if cfg!(target_os = "macos") {
         "Install GPG: brew install gnupg"
+    } else if cfg!(target_os = "windows") {
+        "Install GPG: winget install GnuPG.GnuPG  (or install from the GnuPG website)"
     } else if cfg!(target_os = "linux") {
         "Install GPG: sudo apt install gnupg  (or your distro's package manager)"
     } else {
-        "Install GPG: download from https://gnupg.org/download/"
+        "Install GPG: download from the GnuPG website"
     }
 }
 

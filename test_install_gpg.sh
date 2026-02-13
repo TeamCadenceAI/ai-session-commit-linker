@@ -433,7 +433,7 @@ test_ensure_gpg_missing_brew_missing() {
     TESTS_RUN=$((TESTS_RUN + 1))
     assert_contains "$_output" "Homebrew is not installed" "Shows Homebrew not installed message"
     TESTS_RUN=$((TESTS_RUN + 1))
-    assert_contains "$_output" "https://gnupg.org/download/" "Shows manual install URL"
+    assert_contains "$_output" "Install GPG manually" "Shows manual install guidance"
     cleanup_test_env
 }
 

@@ -1,7 +1,9 @@
 //! Antigravity log discovery (VS Code style workspace storage + local API).
 //!
 //! Antigravity stores chat sessions under:
-//! ~/Library/Application Support/Antigravity/User/workspaceStorage/*/chatSessions/*.json
+//! - macOS: ~/Library/Application Support/Antigravity/User/workspaceStorage/*/chatSessions/*.json
+//! - Linux: ~/.config/Antigravity/User/workspaceStorage/*/chatSessions/*.json
+//! - Windows: %APPDATA%\\Antigravity\\User\\workspaceStorage\\*\\chatSessions\\*.json
 //!
 //! If local API discovery succeeds, this module also writes API-fetched
 //! conversations into `~/.cadence/cli/antigravity-api/*.json`.
@@ -10,7 +12,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use super::{find_chat_session_dirs, home_dir};
+use super::{app_config_dir_in, find_chat_session_dirs, home_dir};
 
 /// Return all Antigravity log directories for use by the post-commit hook.
 pub fn log_dirs() -> Vec<PathBuf> {
@@ -27,17 +29,10 @@ pub fn all_log_dirs() -> Vec<PathBuf> {
 }
 
 fn log_dirs_in(home: &Path) -> Vec<PathBuf> {
-    let ws_root = home
-        .join("Library")
-        .join("Application Support")
-        .join("Antigravity")
+    let ws_root = app_config_dir_in("Antigravity", home)
         .join("User")
         .join("workspaceStorage");
-    let user_root = home
-        .join("Library")
-        .join("Application Support")
-        .join("Antigravity")
-        .join("User");
+    let user_root = app_config_dir_in("Antigravity", home).join("User");
 
     let mut dirs = BTreeSet::new();
     for dir in find_chat_session_dirs(&ws_root) {
