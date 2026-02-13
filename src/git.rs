@@ -309,6 +309,14 @@ pub fn add_note(commit: &str, content: &str) -> Result<()> {
 /// Push the AI-session notes ref to the provided remote.
 pub fn push_notes(remote: &str) -> Result<()> {
     let output = Command::new("git")
+        .args([
+            "-c",
+            "credential.helper=",
+            "-c",
+            "credential.interactive=never",
+        ])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "echo")
         .args(["push", remote, NOTES_REF])
         .output()
         .context("failed to execute git push")?;

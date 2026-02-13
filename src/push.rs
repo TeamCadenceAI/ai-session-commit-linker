@@ -117,6 +117,12 @@ fn sync_notes_for_remote_inner(remote: &str) -> Result<()> {
 
     let fetch_start = std::time::Instant::now();
     let fetch_status = Command::new("git")
+        .args([
+            "-c",
+            "credential.helper=",
+            "-c",
+            "credential.interactive=never",
+        ])
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_ASKPASS", "echo")
         .args(["fetch", remote, &fetch_spec])
@@ -140,6 +146,12 @@ fn sync_notes_for_remote_inner(remote: &str) -> Result<()> {
     if fetched {
         let merge_start = std::time::Instant::now();
         let merge_status = Command::new("git")
+            .args([
+                "-c",
+                "credential.helper=",
+                "-c",
+                "credential.interactive=never",
+            ])
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_ASKPASS", "echo")
             .args(["notes", "--ref", git::NOTES_REF, "merge", &temp_ref])
@@ -160,6 +172,12 @@ fn sync_notes_for_remote_inner(remote: &str) -> Result<()> {
         }
 
         let _ = Command::new("git")
+            .args([
+                "-c",
+                "credential.helper=",
+                "-c",
+                "credential.interactive=never",
+            ])
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_ASKPASS", "echo")
             .args(["update-ref", "-d", &temp_ref])
@@ -181,7 +199,14 @@ fn sync_notes_for_remote_inner(remote: &str) -> Result<()> {
     }
 
     let push_start = std::time::Instant::now();
+    eprintln!("[cadence] sync: push start");
     let push_status = Command::new("git")
+        .args([
+            "-c",
+            "credential.helper=",
+            "-c",
+            "credential.interactive=never",
+        ])
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_ASKPASS", "echo")
         .args(["push", remote, git::NOTES_REF])
@@ -202,6 +227,12 @@ fn sync_notes_for_remote_inner(remote: &str) -> Result<()> {
 
 fn local_notes_hash() -> Result<Option<String>> {
     let output = Command::new("git")
+        .args([
+            "-c",
+            "credential.helper=",
+            "-c",
+            "credential.interactive=never",
+        ])
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_ASKPASS", "echo")
         .args(["show-ref", "--verify", "--hash", git::NOTES_REF])
@@ -224,6 +255,12 @@ fn local_notes_hash() -> Result<Option<String>> {
 fn remote_notes_hash(remote: &str) -> Result<Option<String>> {
     let start = std::time::Instant::now();
     let output = Command::new("git")
+        .args([
+            "-c",
+            "credential.helper=",
+            "-c",
+            "credential.interactive=never",
+        ])
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_ASKPASS", "echo")
         .args(["ls-remote", "--refs", remote, git::NOTES_REF])
