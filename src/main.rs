@@ -2326,6 +2326,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::app_config_dir_in;
     use time::OffsetDateTime;
     use time::format_description::well_known::Rfc3339;
 
@@ -3667,11 +3668,7 @@ mod tests {
         let head_ts_str = run_git(repo_path, &["show", "-s", "--format=%ct", "HEAD"]);
         let head_ts: i64 = head_ts_str.parse().unwrap();
 
-        let chat_dir = fake_home
-            .path()
-            .join("Library")
-            .join("Application Support")
-            .join("Cursor")
+        let chat_dir = app_config_dir_in("Cursor", fake_home.path())
             .join("User")
             .join("workspaceStorage")
             .join("ws1")
@@ -3810,11 +3807,7 @@ mod tests {
         let head_ts_str = run_git(repo_path, &["show", "-s", "--format=%ct", "HEAD"]);
         let head_ts: i64 = head_ts_str.parse().unwrap();
 
-        let chat_dir = fake_home
-            .path()
-            .join("Library")
-            .join("Application Support")
-            .join("Code")
+        let chat_dir = app_config_dir_in("Code", fake_home.path())
             .join("User")
             .join("workspaceStorage")
             .join("ws1")
@@ -3887,11 +3880,7 @@ mod tests {
         let head_ts_str = run_git(repo_path, &["show", "-s", "--format=%ct", "HEAD"]);
         let head_ts: i64 = head_ts_str.parse().unwrap();
 
-        let chat_dir = fake_home
-            .path()
-            .join("Library")
-            .join("Application Support")
-            .join("Antigravity")
+        let chat_dir = app_config_dir_in("Antigravity", fake_home.path())
             .join("User")
             .join("workspaceStorage")
             .join("ws1")
@@ -4567,11 +4556,7 @@ mod tests {
         let git_repo_root = run_git(repo_path, &["rev-parse", "--show-toplevel"]);
         let head_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
 
-        let chat_dir = fake_home
-            .path()
-            .join("Library")
-            .join("Application Support")
-            .join("Cursor")
+        let chat_dir = app_config_dir_in("Cursor", fake_home.path())
             .join("User")
             .join("workspaceStorage")
             .join("ws1")
@@ -4712,11 +4697,7 @@ mod tests {
         let git_repo_root = run_git(repo_path, &["rev-parse", "--show-toplevel"]);
         let head_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
 
-        let chat_dir = fake_home
-            .path()
-            .join("Library")
-            .join("Application Support")
-            .join("Code")
+        let chat_dir = app_config_dir_in("Code", fake_home.path())
             .join("User")
             .join("workspaceStorage")
             .join("ws1")
@@ -4790,11 +4771,7 @@ mod tests {
         let git_repo_root = run_git(repo_path, &["rev-parse", "--show-toplevel"]);
         let head_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
 
-        let chat_dir = fake_home
-            .path()
-            .join("Library")
-            .join("Application Support")
-            .join("Antigravity")
+        let chat_dir = app_config_dir_in("Antigravity", fake_home.path())
             .join("User")
             .join("workspaceStorage")
             .join("ws1")
