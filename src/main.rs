@@ -6940,6 +6940,7 @@ mod tests {
 
     #[test]
     #[serial]
+    #[cfg(unix)]
     fn test_hook_fails_when_gpg_unavailable_but_recipient_configured() {
         let env = GpgHookTestEnv::setup();
 
@@ -6961,11 +6962,7 @@ mod tests {
             .unwrap()
             .trim()
             .to_string();
-
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(&git_bin, restricted_bin.path().join("git")).unwrap();
-        }
+        std::os::unix::fs::symlink(&git_bin, restricted_bin.path().join("git")).unwrap();
 
         unsafe { std::env::set_var("PATH", restricted_bin.path()) };
 

@@ -1546,12 +1546,17 @@ also not json {{{{
         let claude_dir = log_dir.path().join(".claude").join("projects");
         fs::create_dir_all(&claude_dir).unwrap();
 
+        let header = serde_json::json!({
+            "session_id": "e2e-session",
+            "cwd": dir.path().to_string_lossy().to_string(),
+        })
+        .to_string();
         let content = format!(
-            r#"{{"session_id":"e2e-session","cwd":"{cwd}"}}
+            r#"{header}
 {{"type":"tool_result","content":"[main {short}] fix bug\n 1 file changed"}}
 {{"type":"assistant","message":"Done"}}
 "#,
-            cwd = dir.path().to_string_lossy(),
+            header = header,
             short = &commit_hash[..7],
         );
         let file = write_temp_file(&claude_dir, "session.jsonl", &content);
