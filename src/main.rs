@@ -1,4 +1,5 @@
 mod agents;
+mod config;
 mod git;
 mod gpg;
 mod note;
@@ -2327,9 +2328,9 @@ fn main() {
 mod tests {
     use super::*;
     use crate::agents::app_config_dir_in;
+    use std::path::PathBuf;
     use time::OffsetDateTime;
     use time::format_description::well_known::Rfc3339;
-    use std::path::PathBuf;
 
     fn run_gpg_setup_with_io(input: &mut dyn std::io::BufRead, output: &mut Vec<u8>) -> Result<()> {
         let mut prompter = BufferedPrompter::new(input);
