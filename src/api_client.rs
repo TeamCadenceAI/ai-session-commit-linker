@@ -316,7 +316,7 @@ fn extract_error_message(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
 
     /// A minimal HTTP mock server for testing.
@@ -948,5 +948,4 @@ mod tests {
         assert!(result.created_at.is_none());
         assert!(result.expires_at.is_none());
     }
-
 }

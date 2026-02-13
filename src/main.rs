@@ -70,6 +70,18 @@ enum Command {
         #[command(subcommand)]
         gpg_command: GpgCommands,
     },
+
+    /// Authenticate with the AI Barometer API.
+    Auth {
+        #[command(subcommand)]
+        auth_command: AuthCommands,
+    },
+
+    /// Manage encryption keys on the AI Barometer API.
+    Keys {
+        #[command(subcommand)]
+        keys_command: Option<KeysCommands>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -111,6 +123,37 @@ enum GpgCommands {
     Status,
     /// Set up GPG encryption.
     Setup,
+}
+
+#[derive(Subcommand, Debug)]
+enum AuthCommands {
+    /// Authenticate with the AI Barometer API via browser-based GitHub OAuth.
+    Login {
+        /// Override the API base URL (default: production).
+        #[arg(long)]
+        api_url: Option<String>,
+    },
+    /// Remove stored API credentials.
+    Logout,
+    /// Show current authentication status.
+    Status,
+}
+
+#[derive(Subcommand, Debug)]
+enum KeysCommands {
+    /// Show encryption key status on the server.
+    Status,
+    /// Export and upload a GPG private key to the API.
+    Push {
+        /// Path to the private key file to upload (default: export from GPG keyring).
+        #[arg(long)]
+        key: Option<String>,
+        /// Skip confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Test server-side decryption of an encrypted note.
+    Test,
 }
 
 // ---------------------------------------------------------------------------
@@ -2286,6 +2329,34 @@ fn persist_setup_config_with(
 }
 
 // ---------------------------------------------------------------------------
+// Auth & Keys stub handlers
+// ---------------------------------------------------------------------------
+
+fn run_auth_login(_api_url: Option<String>) -> Result<()> {
+    Ok(())
+}
+
+fn run_auth_logout() -> Result<()> {
+    Ok(())
+}
+
+fn run_auth_status() -> Result<()> {
+    Ok(())
+}
+
+fn run_keys_status() -> Result<()> {
+    Ok(())
+}
+
+fn run_keys_push(_key: Option<String>, _yes: bool) -> Result<()> {
+    Ok(())
+}
+
+fn run_keys_test() -> Result<()> {
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -2313,6 +2384,16 @@ fn main() {
             GpgCommands::Status => run_gpg_status(),
             GpgCommands::Setup => run_gpg_setup(),
         },
+        Command::Auth { auth_command } => match auth_command {
+            AuthCommands::Login { api_url } => run_auth_login(api_url),
+            AuthCommands::Logout => run_auth_logout(),
+            AuthCommands::Status => run_auth_status(),
+        },
+        Command::Keys { keys_command } => match keys_command.unwrap_or(KeysCommands::Status) {
+            KeysCommands::Status => run_keys_status(),
+            KeysCommands::Push { key, yes } => run_keys_push(key, yes),
+            KeysCommands::Test => run_keys_test(),
+        },
     };
 
     if let Err(e) = result {
@@ -2329,6 +2410,7 @@ fn main() {
 mod tests {
     use super::*;
     use crate::agents::app_config_dir_in;
+    use clap::CommandFactory;
     use std::path::PathBuf;
     use time::OffsetDateTime;
     use time::format_description::well_known::Rfc3339;
@@ -2724,6 +2806,345 @@ mod tests {
     fn cli_rejects_no_subcommand() {
         let result = Cli::try_parse_from(["cadence"]);
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Auth & Keys CLI parsing tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cli_parses_auth_login() {
+        let cli = Cli::parse_from(["cadence", "auth", "login"]);
+        match cli.command {
+            Command::Auth { auth_command } => match auth_command {
+                AuthCommands::Login { api_url } => assert!(api_url.is_none()),
+                _ => panic!("expected Login command"),
+            },
+            _ => panic!("expected Auth command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_auth_login_with_api_url() {
+        let cli = Cli::parse_from([
+            "cadence",
+            "auth",
+            "login",
+            "--api-url",
+            "https://example.com",
+        ]);
+        match cli.command {
+            Command::Auth { auth_command } => match auth_command {
+                AuthCommands::Login { api_url } => {
+                    assert_eq!(api_url.as_deref(), Some("https://example.com"));
+                }
+                _ => panic!("expected Login command"),
+            },
+            _ => panic!("expected Auth command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_auth_logout() {
+        let cli = Cli::parse_from(["cadence", "auth", "logout"]);
+        assert!(matches!(
+            cli.command,
+            Command::Auth {
+                auth_command: AuthCommands::Logout
+            }
+        ));
+    }
+
+    #[test]
+    fn cli_parses_auth_status() {
+        let cli = Cli::parse_from(["cadence", "auth", "status"]);
+        assert!(matches!(
+            cli.command,
+            Command::Auth {
+                auth_command: AuthCommands::Status
+            }
+        ));
+    }
+
+    #[test]
+    fn cli_rejects_auth_without_subcommand() {
+        let result = Cli::try_parse_from(["cadence", "auth"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cli_parses_keys_status() {
+        let cli = Cli::parse_from(["cadence", "keys", "status"]);
+        assert!(matches!(
+            cli.command,
+            Command::Keys {
+                keys_command: Some(KeysCommands::Status)
+            }
+        ));
+    }
+
+    #[test]
+    fn cli_parses_keys_push_no_flags() {
+        let cli = Cli::parse_from(["cadence", "keys", "push"]);
+        match cli.command {
+            Command::Keys {
+                keys_command: Some(KeysCommands::Push { key, yes }),
+            } => {
+                assert!(key.is_none());
+                assert!(!yes);
+            }
+            _ => panic!("expected Keys Push command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_keys_push_with_key() {
+        let cli = Cli::parse_from(["cadence", "keys", "push", "--key", "/tmp/private.key"]);
+        match cli.command {
+            Command::Keys {
+                keys_command: Some(KeysCommands::Push { key, yes }),
+            } => {
+                assert_eq!(key.as_deref(), Some("/tmp/private.key"));
+                assert!(!yes);
+            }
+            _ => panic!("expected Keys Push command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_keys_push_with_yes() {
+        let cli = Cli::parse_from(["cadence", "keys", "push", "--yes"]);
+        match cli.command {
+            Command::Keys {
+                keys_command: Some(KeysCommands::Push { key, yes }),
+            } => {
+                assert!(key.is_none());
+                assert!(yes);
+            }
+            _ => panic!("expected Keys Push command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_keys_push_with_all_flags() {
+        let cli = Cli::parse_from([
+            "cadence",
+            "keys",
+            "push",
+            "--key",
+            "/tmp/private.key",
+            "--yes",
+        ]);
+        match cli.command {
+            Command::Keys {
+                keys_command: Some(KeysCommands::Push { key, yes }),
+            } => {
+                assert_eq!(key.as_deref(), Some("/tmp/private.key"));
+                assert!(yes);
+            }
+            _ => panic!("expected Keys Push command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_keys_test() {
+        let cli = Cli::parse_from(["cadence", "keys", "test"]);
+        assert!(matches!(
+            cli.command,
+            Command::Keys {
+                keys_command: Some(KeysCommands::Test)
+            }
+        ));
+    }
+
+    #[test]
+    fn cli_keys_defaults_to_status() {
+        let cli = Cli::parse_from(["cadence", "keys"]);
+        assert!(
+            matches!(cli.command, Command::Keys { keys_command: None }),
+            "bare 'cadence keys' should parse successfully with no subcommand"
+        );
+        // Dispatch will default None to KeysCommands::Status via unwrap_or.
+    }
+
+    // -----------------------------------------------------------------------
+    // Auth & Keys stub handler tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn run_auth_login_stub_returns_ok() {
+        assert!(run_auth_login(None).is_ok());
+    }
+
+    #[test]
+    fn run_auth_login_stub_with_url_returns_ok() {
+        assert!(run_auth_login(Some("https://example.com".to_string())).is_ok());
+    }
+
+    #[test]
+    fn run_auth_logout_stub_returns_ok() {
+        assert!(run_auth_logout().is_ok());
+    }
+
+    #[test]
+    fn run_auth_status_stub_returns_ok() {
+        assert!(run_auth_status().is_ok());
+    }
+
+    #[test]
+    fn run_keys_status_stub_returns_ok() {
+        assert!(run_keys_status().is_ok());
+    }
+
+    #[test]
+    fn run_keys_push_stub_returns_ok() {
+        assert!(run_keys_push(None, false).is_ok());
+    }
+
+    #[test]
+    fn run_keys_test_stub_returns_ok() {
+        assert!(run_keys_test().is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Auth & Keys help output tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn help_output_contains_auth_command() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(
+            help.contains("auth"),
+            "top-level help should mention auth, got: {}",
+            help
+        );
+        assert!(
+            help.contains("Authenticate with the AI Barometer API"),
+            "top-level help should show auth description, got: {}",
+            help
+        );
+    }
+
+    #[test]
+    fn help_output_contains_keys_command() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(
+            help.contains("keys"),
+            "top-level help should mention keys, got: {}",
+            help
+        );
+        assert!(
+            help.contains("Manage encryption keys"),
+            "top-level help should show keys description, got: {}",
+            help
+        );
+    }
+
+    #[test]
+    fn help_output_preserves_existing_commands() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(
+            help.contains("install"),
+            "help should still mention install"
+        );
+        assert!(help.contains("hook"), "help should still mention hook");
+        assert!(
+            help.contains("hydrate"),
+            "help should still mention hydrate"
+        );
+        assert!(help.contains("status"), "help should still mention status");
+        assert!(help.contains("gpg"), "help should still mention gpg");
+    }
+
+    #[test]
+    fn auth_help_shows_subcommands() {
+        let mut cmd = Cli::command();
+        let auth_cmd = cmd
+            .find_subcommand_mut("auth")
+            .expect("auth subcommand should exist");
+        let help = auth_cmd.render_long_help().to_string();
+        assert!(help.contains("login"), "auth help should show login");
+        assert!(help.contains("logout"), "auth help should show logout");
+        assert!(help.contains("status"), "auth help should show status");
+        assert!(
+            help.contains("browser-based GitHub OAuth"),
+            "auth login description should mention GitHub OAuth, got: {}",
+            help
+        );
+        assert!(
+            help.contains("Remove stored API credentials"),
+            "auth logout description should be present, got: {}",
+            help
+        );
+    }
+
+    #[test]
+    fn keys_help_shows_subcommands() {
+        let mut cmd = Cli::command();
+        let keys_cmd = cmd
+            .find_subcommand_mut("keys")
+            .expect("keys subcommand should exist");
+        let help = keys_cmd.render_long_help().to_string();
+        assert!(help.contains("status"), "keys help should show status");
+        assert!(help.contains("push"), "keys help should show push");
+        assert!(help.contains("test"), "keys help should show test");
+        assert!(
+            help.contains("encryption key status"),
+            "keys status description should be present, got: {}",
+            help
+        );
+        assert!(
+            help.contains("Upload a GPG private key")
+                || help.contains("upload a GPG private key")
+                || help.contains("Export and upload"),
+            "keys push description should mention key upload, got: {}",
+            help
+        );
+    }
+
+    #[test]
+    fn keys_push_help_shows_flags() {
+        let mut cmd = Cli::command();
+        let keys_cmd = cmd
+            .find_subcommand_mut("keys")
+            .expect("keys subcommand should exist");
+        let push_cmd = keys_cmd
+            .find_subcommand_mut("push")
+            .expect("push subcommand should exist");
+        let help = push_cmd.render_long_help().to_string();
+        assert!(help.contains("--key"), "push help should show --key flag");
+        assert!(help.contains("--yes"), "push help should show --yes flag");
+        assert!(
+            help.contains("private key file"),
+            "push --key help should describe the key path, got: {}",
+            help
+        );
+        assert!(
+            help.contains("confirmation prompt") || help.contains("Skip confirmation"),
+            "push --yes help should describe skipping confirmation, got: {}",
+            help
+        );
+    }
+
+    #[test]
+    fn auth_login_help_shows_api_url_flag() {
+        let mut cmd = Cli::command();
+        let auth_cmd = cmd
+            .find_subcommand_mut("auth")
+            .expect("auth subcommand should exist");
+        let login_cmd = auth_cmd
+            .find_subcommand_mut("login")
+            .expect("login subcommand should exist");
+        let help = login_cmd.render_long_help().to_string();
+        assert!(
+            help.contains("--api-url"),
+            "login help should show --api-url flag"
+        );
+        assert!(
+            help.contains("API base URL"),
+            "login --api-url help should describe overriding the API URL, got: {}",
+            help
+        );
     }
 
     // -----------------------------------------------------------------------
