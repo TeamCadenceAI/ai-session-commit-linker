@@ -346,56 +346,68 @@ fn parse_scope_mode(raw: &str) -> Option<ScopeMode> {
 }
 
 fn print_ftue_banner() {
-    eprintln!("[ai-session-commit-linker]");
-    eprintln!("[ai-session-commit-linker] Cadence CLI");
-    eprintln!("[ai-session-commit-linker] First-time setup");
-    eprintln!("[ai-session-commit-linker] How it works:");
+    eprintln!();
+    eprintln!("{}", crate::ui::title("Cadence CLI First-Time Setup"));
+    eprintln!();
+    eprintln!("{}", crate::ui::info("How it works:"));
     eprintln!(
-        "[ai-session-commit-linker]   On each commit, a hook links your latest AI session to that commit as a git note."
+        "{}",
+        crate::ui::info(
+            "On each commit, a hook links your latest AI session to that commit as a git note."
+        )
     );
-    eprintln!("[ai-session-commit-linker]");
+    eprintln!();
 }
 
 fn print_ftue_completion() {
-    eprintln!("[ai-session-commit-linker]");
-    eprintln!("[ai-session-commit-linker] ================================================");
-    eprintln!("[ai-session-commit-linker] Setup complete.");
+    eprintln!();
+    eprintln!("{}", crate::ui::ok("Setup complete."));
     eprintln!(
-        "[ai-session-commit-linker] A global post-commit hook is installed. New commits are processed automatically."
+        "{}",
+        crate::ui::info(
+            "A global post-commit hook is installed. New commits are processed automatically."
+        )
     );
     eprintln!(
-        "[ai-session-commit-linker] If allowed by your settings, notes may also be pushed to origin."
+        "{}",
+        crate::ui::info("If allowed by your settings, notes may also be pushed to origin.")
     );
-    eprintln!("[ai-session-commit-linker] Configured repository scope:");
+    eprintln!("{}", crate::ui::info("Configured repository scope:"));
     match get_scope_mode() {
         ScopeMode::All => {
-            eprintln!("[ai-session-commit-linker]   - all repositories");
+            eprintln!("   - all repositories");
         }
         ScopeMode::Current => {
             if let Some(repo) = current_scope_repo() {
-                eprintln!("[ai-session-commit-linker]   - {}", repo);
+                eprintln!("   - {}", repo);
             } else {
-                eprintln!("[ai-session-commit-linker]   - current repo (not available right now)");
+                eprintln!("   - current repo (not available right now)");
             }
         }
         ScopeMode::Selected => {
             let selected = get_selected_repos();
             if selected.is_empty() {
-                eprintln!("[ai-session-commit-linker]   - (none selected yet)");
+                eprintln!("   - (none selected yet)");
             } else {
                 for repo in selected {
-                    eprintln!("[ai-session-commit-linker]   - {}", repo);
+                    eprintln!("   - {}", repo);
                 }
             }
         }
     }
-    eprintln!("[ai-session-commit-linker] Check status: ai-session-commit-linker status");
     eprintln!(
-        "[ai-session-commit-linker] View upload activity: ai-session-commit-linker uploads list"
+        "{}",
+        crate::ui::info("Check status: ai-session-commit-linker status")
     );
-    eprintln!("[ai-session-commit-linker] Manage scope: ai-session-commit-linker scope list");
-    eprintln!("[ai-session-commit-linker] ================================================");
-    eprintln!("[ai-session-commit-linker]");
+    eprintln!(
+        "{}",
+        crate::ui::info("View upload activity: ai-session-commit-linker uploads list")
+    );
+    eprintln!(
+        "{}",
+        crate::ui::info("Manage scope: ai-session-commit-linker scope list")
+    );
+    eprintln!();
 }
 
 fn read_yes_no(prompt: &str, default_yes: bool) -> Result<bool> {

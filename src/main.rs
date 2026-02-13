@@ -5,11 +5,21 @@ mod onboarding;
 mod pending;
 mod push;
 mod scanner;
+mod ui;
 mod uploads;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::process;
+
+fn cli_styles() -> clap::builder::Styles {
+    use clap::builder::styling::{AnsiColor, Effects, Styles};
+    Styles::styled()
+        .header(AnsiColor::Cyan.on_default().effects(Effects::BOLD))
+        .usage(AnsiColor::Cyan.on_default().effects(Effects::BOLD))
+        .literal(AnsiColor::Green.on_default().effects(Effects::BOLD))
+        .placeholder(AnsiColor::Yellow.on_default())
+}
 
 /// AI Session Commit Linker: attach AI coding agent session logs to Git commits via git notes.
 ///
@@ -20,7 +30,8 @@ use std::process;
     name = "ai-session-commit-linker",
     version,
     about,
-    after_help = "Examples:\n  ai-session-commit-linker install --ftue\n  ai-session-commit-linker reset\n  ai-session-commit-linker status\n  ai-session-commit-linker uploads list --since 30d\n  ai-session-commit-linker uploads show <event-id>\n  ai-session-commit-linker onboard --email you@example.com\n  ai-session-commit-linker scope set selected\n  ai-session-commit-linker scope add /path/to/repo\n  ai-session-commit-linker scope list\n  ai-session-commit-linker hydrate --since 30d --push\n  ai-session-commit-linker retry"
+    styles = cli_styles(),
+    after_help = "Quick Start:\n  ai-session-commit-linker install --ftue\n  ai-session-commit-linker status\n  ai-session-commit-linker uploads list --since 30d\n\nExamples:\n  ai-session-commit-linker reset\n  ai-session-commit-linker uploads show <event-id>\n  ai-session-commit-linker onboard --email you@example.com\n  ai-session-commit-linker scope set selected\n  ai-session-commit-linker scope add /path/to/repo\n  ai-session-commit-linker scope list\n  ai-session-commit-linker hydrate --since 30d --push\n  ai-session-commit-linker retry"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -165,12 +176,16 @@ fn run_install_inner(
     home_override: Option<&std::path::Path>,
     first_time_experience: bool,
 ) -> Result<()> {
-    eprintln!("[ai-session-commit-linker] Installing...");
+    eprintln!();
+    eprintln!("{}", ui::title("AI Session Commit Linker Setup"));
+    eprintln!();
     eprintln!(
-        "[ai-session-commit-linker] This tool links AI coding sessions to commits using git notes."
+        "{}",
+        ui::info("This tool links AI coding sessions to commits using git notes.")
     );
     eprintln!(
-        "[ai-session-commit-linker] It runs locally for your configured scope and can push notes to your remote."
+        "{}",
+        ui::info("It runs locally for your configured scope and can push notes to your remote.")
     );
 
     let home = match home_override {
@@ -197,14 +212,14 @@ fn run_install_inner(
     match git::config_set_global("core.hooksPath", &hooks_dir_str) {
         Ok(()) => {
             eprintln!(
-                "[ai-session-commit-linker] Set core.hooksPath = {}",
-                hooks_dir_str
+                "{}",
+                ui::ok(&format!("Set core.hooksPath = {}", hooks_dir_str))
             );
         }
         Err(e) => {
             eprintln!(
-                "[ai-session-commit-linker] error: failed to set core.hooksPath: {}",
-                e
+                "{}",
+                ui::warn(&format!("failed to set core.hooksPath: {}", e))
             );
             had_errors = true;
         }
@@ -214,21 +229,18 @@ fn run_install_inner(
     if !hooks_dir.exists() {
         match std::fs::create_dir_all(&hooks_dir) {
             Ok(()) => {
-                eprintln!("[ai-session-commit-linker] Created {}", hooks_dir_str);
+                eprintln!("{}", ui::ok(&format!("Created {}", hooks_dir_str)));
             }
             Err(e) => {
                 eprintln!(
-                    "[ai-session-commit-linker] error: failed to create {}: {}",
-                    hooks_dir_str, e
+                    "{}",
+                    ui::warn(&format!("failed to create {}: {}", hooks_dir_str, e))
                 );
                 had_errors = true;
             }
         }
     } else {
-        eprintln!(
-            "[ai-session-commit-linker] {} already exists",
-            hooks_dir_str
-        );
+        eprintln!("{}", ui::info(&format!("{} already exists", hooks_dir_str)));
     }
 
     // Step 3 & 4: Write post-commit shim and make it executable
@@ -281,7 +293,7 @@ fn run_install_inner(
     if should_write {
         match std::fs::write(&shim_path, shim_content) {
             Ok(()) => {
-                eprintln!("[ai-session-commit-linker] Wrote {}", shim_path.display());
+                eprintln!("{}", ui::ok(&format!("Wrote {}", shim_path.display())));
 
                 // Make executable (Unix only)
                 #[cfg(unix)]
@@ -291,8 +303,8 @@ fn run_install_inner(
                     match std::fs::set_permissions(&shim_path, perms) {
                         Ok(()) => {
                             eprintln!(
-                                "[ai-session-commit-linker] Made {} executable",
-                                shim_path.display()
+                                "{}",
+                                ui::ok(&format!("Made {} executable", shim_path.display()))
                             );
                         }
                         Err(e) => {
@@ -321,7 +333,7 @@ fn run_install_inner(
     if let Some(ref org_value) = org {
         match git::config_set_global("ai.session-commit-linker.org", org_value) {
             Ok(()) => {
-                eprintln!("[ai-session-commit-linker] Set org filter: {}", org_value);
+                eprintln!("{}", ui::ok(&format!("Set org filter: {}", org_value)));
             }
             Err(e) => {
                 eprintln!(
@@ -334,30 +346,50 @@ fn run_install_inner(
     }
 
     // Step 6: Run hydration for the last 7 days
-    eprintln!("[ai-session-commit-linker] Running initial hydration (last 30 days)...");
+    eprintln!(
+        "{}",
+        ui::info("Running initial hydration (last 30 days)...")
+    );
     if let Err(e) = run_hydrate("30d", false) {
         eprintln!("[ai-session-commit-linker] error: hydration failed: {}", e);
         had_errors = true;
     }
 
     if had_errors {
-        eprintln!("[ai-session-commit-linker] Installation completed with errors (see above)");
         eprintln!(
-            "[ai-session-commit-linker] Additional setup may be required; run `ai-session-commit-linker status`."
+            "{}",
+            ui::warn("Installation completed with warnings/errors.")
+        );
+        eprintln!(
+            "{}",
+            ui::info("Additional setup may be required; run `ai-session-commit-linker status`.")
         );
     } else {
-        eprintln!("[ai-session-commit-linker] Setup complete.");
+        eprintln!();
+        eprintln!("{}", ui::ok("Setup complete."));
         eprintln!(
-            "[ai-session-commit-linker] A global post-commit hook is installed. New commits are processed automatically."
+            "{}",
+            ui::info(
+                "A global post-commit hook is installed. New commits are processed automatically."
+            )
         );
         eprintln!(
-            "[ai-session-commit-linker] If allowed by your settings, notes may also be pushed to origin."
+            "{}",
+            ui::info("If allowed by your settings, notes may also be pushed to origin.")
         );
-        eprintln!("[ai-session-commit-linker] Check status: ai-session-commit-linker status");
         eprintln!(
-            "[ai-session-commit-linker] View upload activity: ai-session-commit-linker uploads list"
+            "{}",
+            ui::info("Check status: ai-session-commit-linker status")
         );
-        eprintln!("[ai-session-commit-linker] Manage scope: ai-session-commit-linker scope list");
+        eprintln!(
+            "{}",
+            ui::info("View upload activity: ai-session-commit-linker uploads list")
+        );
+        eprintln!(
+            "{}",
+            ui::info("Manage scope: ai-session-commit-linker scope list")
+        );
+        eprintln!();
     }
 
     Ok(())
@@ -1115,39 +1147,45 @@ fn run_uploads(uploads_command: UploadsCommand) -> Result<()> {
             let events = uploads::list_events(Some(since_secs))?;
             if events.is_empty() {
                 eprintln!(
-                    "[ai-session-commit-linker] No upload attempts found in the last {}.",
-                    since
+                    "{}",
+                    ui::info(&format!("No upload attempts found in the last {}.", since))
                 );
                 return Ok(());
             }
 
+            eprintln!();
             eprintln!(
-                "[ai-session-commit-linker] Upload attempts (last {}): {}",
-                since,
-                events.len()
+                "{}",
+                ui::title(&format!("Upload Attempts (last {})", since))
             );
+            eprintln!();
             for event in events {
+                let status_icon = if event.status == "success" {
+                    "✓"
+                } else {
+                    "⚠"
+                };
                 eprintln!(
-                    "[ai-session-commit-linker]   {}  time={}  status={}  trigger={}  repo={}  remote={}",
-                    event.id, event.time, event.status, event.trigger, event.repo, event.remote
+                    "  {}  {}  time={}  trigger={}  repo={}  remote={}",
+                    status_icon, event.id, event.time, event.trigger, event.repo, event.remote
                 );
             }
+            eprintln!();
         }
         UploadsCommand::Show { id } => match uploads::get_event(&id)? {
             Some(event) => {
-                eprintln!("[ai-session-commit-linker] Upload event {}", event.id);
-                eprintln!("[ai-session-commit-linker]   time: {}", event.time);
-                eprintln!("[ai-session-commit-linker]   status: {}", event.status);
-                eprintln!("[ai-session-commit-linker]   trigger: {}", event.trigger);
-                eprintln!("[ai-session-commit-linker]   repo: {}", event.repo);
-                eprintln!("[ai-session-commit-linker]   remote: {}", event.remote);
-                eprintln!(
-                    "[ai-session-commit-linker]   notes ref: {}",
-                    event.notes_ref
-                );
+                eprintln!();
+                eprintln!("{}", ui::title(&format!("Upload Event {}", event.id)));
+                eprintln!("  time: {}", event.time);
+                eprintln!("  status: {}", event.status);
+                eprintln!("  trigger: {}", event.trigger);
+                eprintln!("  repo: {}", event.repo);
+                eprintln!("  remote: {}", event.remote);
+                eprintln!("  notes ref: {}", event.notes_ref);
                 if let Some(err) = event.error {
-                    eprintln!("[ai-session-commit-linker]   error: {}", err);
+                    eprintln!("  error: {}", err);
                 }
+                eprintln!();
             }
             None => {
                 anyhow::bail!("upload event not found: {}", id);
@@ -1159,7 +1197,10 @@ fn run_uploads(uploads_command: UploadsCommand) -> Result<()> {
 }
 
 fn run_reset() -> Result<()> {
-    eprintln!("[ai-session-commit-linker] Resetting configuration/state...");
+    eprintln!();
+    eprintln!("{}", ui::title("AI Session Commit Linker Reset"));
+    eprintln!();
+    eprintln!("{}", ui::info("Resetting configuration/state..."));
 
     // Global keys set/used by this tool.
     let global_keys = [
@@ -1174,8 +1215,8 @@ fn run_reset() -> Result<()> {
     for key in global_keys {
         if let Err(e) = git::config_unset_global(key) {
             eprintln!(
-                "[ai-session-commit-linker] warning: failed to unset global {}: {}",
-                key, e
+                "{}",
+                ui::warn(&format!("failed to unset global {}: {}", key, e))
             );
         }
     }
@@ -1189,8 +1230,8 @@ fn run_reset() -> Result<()> {
         for key in local_keys {
             if let Err(e) = git::config_unset(key) {
                 eprintln!(
-                    "[ai-session-commit-linker] warning: failed to unset local {}: {}",
-                    key, e
+                    "{}",
+                    ui::warn(&format!("failed to unset local {}: {}", key, e))
                 );
             }
         }
@@ -1205,18 +1246,19 @@ fn run_reset() -> Result<()> {
                 && let Err(e) = std::fs::remove_dir_all(&dir)
             {
                 eprintln!(
-                    "[ai-session-commit-linker] warning: failed to remove {}: {}",
-                    dir.display(),
-                    e
+                    "{}",
+                    ui::warn(&format!("failed to remove {}: {}", dir.display(), e))
                 );
             }
         }
     }
 
-    eprintln!("[ai-session-commit-linker] Reset complete.");
+    eprintln!("{}", ui::ok("Reset complete."));
     eprintln!(
-        "[ai-session-commit-linker] To remove binary: cargo uninstall ai-session-commit-linker"
+        "{}",
+        ui::info("To remove binary: cargo uninstall ai-session-commit-linker")
     );
+    eprintln!();
     Ok(())
 }
 
@@ -1233,6 +1275,9 @@ fn run_reset() -> Result<()> {
 /// All output uses the `[ai-session-commit-linker]` prefix on stderr.
 /// Handles being called outside a git repo gracefully.
 fn run_status() -> Result<()> {
+    eprintln!();
+    eprintln!("{}", ui::title("AI Session Commit Linker Status"));
+    eprintln!();
     run_status_inner(&mut std::io::stderr())
 }
 
