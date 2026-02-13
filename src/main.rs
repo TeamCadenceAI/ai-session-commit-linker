@@ -2341,6 +2341,35 @@ fn run_auth_logout() -> Result<()> {
 }
 
 fn run_auth_status() -> Result<()> {
+    let is_tty = output::is_stderr_tty();
+    run_auth_status_inner(&mut std::io::stderr(), is_tty)
+}
+
+/// Inner implementation of `auth status` that writes to the provided writer.
+///
+/// This is purely local — it reads from `CliConfig::load()` only and never
+/// constructs API clients or makes network requests.
+fn run_auth_status_inner(w: &mut dyn std::io::Write, is_tty: bool) -> Result<()> {
+    let cfg = config::CliConfig::load()?;
+
+    if cfg.token.is_some() {
+        let api_url = cfg.api_url.as_deref().unwrap_or(config::DEFAULT_API_URL);
+        let login = cfg.github_login.as_deref().unwrap_or("(unknown)");
+        let expires = cfg.expires_at.as_deref().unwrap_or("(unknown)");
+
+        output::success_to_with_tty(w, "Authenticated", "", is_tty);
+        output::detail_to_with_tty(w, &format!("API URL: {api_url}"), is_tty);
+        output::detail_to_with_tty(w, &format!("GitHub login: {login}"), is_tty);
+        output::detail_to_with_tty(w, &format!("Token expires: {expires}"), is_tty);
+    } else {
+        output::action_to_with_tty(
+            w,
+            "Not authenticated.",
+            "Run 'auth login' to connect.",
+            is_tty,
+        );
+    }
+
     Ok(())
 }
 
@@ -2986,9 +3015,244 @@ mod tests {
         assert!(run_auth_logout().is_ok());
     }
 
+    // -----------------------------------------------------------------------
+    // Auth status handler tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: write a CliConfig to a temp home and run auth status against it.
+    /// Returns the output as a String. Sets HOME to the temp dir so
+    /// CliConfig::load() reads from it.
+    fn run_auth_status_with_config(cfg: &config::CliConfig) -> Result<String> {
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let config_path = fake_home
+            .path()
+            .join(".config")
+            .join("ai-session-commit-linker")
+            .join("config.toml");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        let toml_str = toml::to_string_pretty(cfg).expect("failed to serialize config");
+        std::fs::write(&config_path, &toml_str).unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
+
+        let mut buf = Vec::new();
+        let result = run_auth_status_inner(&mut buf, false);
+
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        result?;
+        Ok(String::from_utf8(buf).expect("output should be valid UTF-8"))
+    }
+
     #[test]
-    fn run_auth_status_stub_returns_ok() {
-        assert!(run_auth_status().is_ok());
+    #[serial]
+    fn run_auth_status_no_token() {
+        let cfg = config::CliConfig::default();
+        let output = run_auth_status_with_config(&cfg).unwrap();
+        assert!(
+            output.contains("Not authenticated."),
+            "should show unauthenticated message, got: {}",
+            output
+        );
+        assert!(
+            output.contains("Run 'auth login' to connect."),
+            "should show login hint, got: {}",
+            output
+        );
+        // Should NOT contain authenticated-path labels
+        assert!(
+            !output.contains("API URL:"),
+            "unauthenticated output should not contain API URL, got: {}",
+            output
+        );
+        assert!(
+            !output.contains("GitHub login:"),
+            "unauthenticated output should not contain GitHub login, got: {}",
+            output
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn run_auth_status_with_token() {
+        let cfg = config::CliConfig {
+            api_url: Some("https://custom.example.com".to_string()),
+            token: Some("tok_abc123".to_string()),
+            github_login: Some("octocat".to_string()),
+            expires_at: Some("2026-12-31T23:59:59Z".to_string()),
+        };
+        let output = run_auth_status_with_config(&cfg).unwrap();
+        assert!(
+            output.contains("Authenticated"),
+            "should show authenticated label, got: {}",
+            output
+        );
+        assert!(
+            output.contains("API URL: https://custom.example.com"),
+            "should show API URL from config, got: {}",
+            output
+        );
+        assert!(
+            output.contains("GitHub login: octocat"),
+            "should show GitHub login, got: {}",
+            output
+        );
+        assert!(
+            output.contains("Token expires: 2026-12-31T23:59:59Z"),
+            "should show token expiry, got: {}",
+            output
+        );
+        // Should NOT contain the raw token value
+        assert!(
+            !output.contains("tok_abc123"),
+            "should not expose raw token, got: {}",
+            output
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn run_auth_status_partial_fields_token_only() {
+        let cfg = config::CliConfig {
+            token: Some("tok_partial".to_string()),
+            ..Default::default()
+        };
+        let output = run_auth_status_with_config(&cfg).unwrap();
+        assert!(
+            output.contains("Authenticated"),
+            "token presence means authenticated, got: {}",
+            output
+        );
+        assert!(
+            output.contains(&format!("API URL: {}", config::DEFAULT_API_URL)),
+            "should fall back to default API URL, got: {}",
+            output
+        );
+        assert!(
+            output.contains("GitHub login: (unknown)"),
+            "missing login should show (unknown), got: {}",
+            output
+        );
+        assert!(
+            output.contains("Token expires: (unknown)"),
+            "missing expiry should show (unknown), got: {}",
+            output
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn run_auth_status_token_with_login_no_expiry() {
+        let cfg = config::CliConfig {
+            token: Some("tok_x".to_string()),
+            github_login: Some("testuser".to_string()),
+            ..Default::default()
+        };
+        let output = run_auth_status_with_config(&cfg).unwrap();
+        assert!(output.contains("GitHub login: testuser"));
+        assert!(output.contains("Token expires: (unknown)"));
+    }
+
+    #[test]
+    #[serial]
+    fn run_auth_status_corrupt_config_returns_error() {
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let config_path = fake_home
+            .path()
+            .join(".config")
+            .join("ai-session-commit-linker")
+            .join("config.toml");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(&config_path, "this is not valid toml {{{").unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
+
+        let mut buf = Vec::new();
+        let result = run_auth_status_inner(&mut buf, false);
+
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        assert!(result.is_err(), "corrupt config should return error");
+        let err_msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            err_msg.contains("failed to parse config file"),
+            "error should mention parse failure, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn run_auth_status_missing_home_returns_not_authenticated() {
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::remove_var("HOME");
+        }
+
+        let mut buf = Vec::new();
+        let result = run_auth_status_inner(&mut buf, false);
+
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        // When HOME is missing, CliConfig::load() returns defaults (no token)
+        assert!(result.is_ok(), "missing HOME should not be a hard error");
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("Not authenticated."),
+            "missing HOME should show unauthenticated, got: {}",
+            output
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn run_auth_status_no_config_file_shows_unauthenticated() {
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        // Don't create any config file — directory is empty
+
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
+
+        let mut buf = Vec::new();
+        let result = run_auth_status_inner(&mut buf, false);
+
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        assert!(result.is_ok());
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("Not authenticated."),
+            "missing config file should show unauthenticated, got: {}",
+            output
+        );
     }
 
     #[test]
