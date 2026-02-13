@@ -686,10 +686,12 @@ fn hook_pre_push_inner(remote: &str, _url: &str) -> Result<()> {
     if push::should_push_remote(remote) {
         let sync_start = std::time::Instant::now();
         push::sync_notes_for_remote(remote);
-        output::detail(&format!(
-            "Pre-push sync in {} ms",
-            sync_start.elapsed().as_millis()
-        ));
+        if output::is_verbose() {
+            output::detail(&format!(
+                "Pre-push sync in {} ms",
+                sync_start.elapsed().as_millis()
+            ));
+        }
     }
 
     Ok(())

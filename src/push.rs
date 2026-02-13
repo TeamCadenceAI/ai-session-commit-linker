@@ -63,13 +63,13 @@ pub fn attempt_push_remote(remote: &str) {
 /// fetch notes, merge into local notes ref, then push notes to the remote.
 pub fn sync_notes_for_remote(remote: &str) {
     let start = std::time::Instant::now();
-    output::action("Syncing", &format!("notes with {}", remote));
+    output::action("Cadence", &format!("Syncing notes with {}", remote));
     if let Err(e) = sync_notes_for_remote_inner(remote) {
         output::note(&format!("Could not sync notes with {}: {}", remote, e));
     }
     output::success(
-        "Sync",
-        &format!("done in {} ms", start.elapsed().as_millis()),
+        "Cadence",
+        &format!("Notes sync done in {} ms", start.elapsed().as_millis()),
     );
 }
 
@@ -81,20 +81,26 @@ fn sync_notes_for_remote_inner(remote: &str) -> Result<()> {
     let phase = std::time::Instant::now();
     let local_hash = local_notes_hash().context("failed to read local notes ref")?;
     let remote_hash = remote_notes_hash(remote).context("failed to read remote notes ref")?;
-    output::detail(&format!(
-        "Hashes local={:?} remote={:?} ({} ms)",
-        local_hash,
-        remote_hash,
-        phase.elapsed().as_millis()
-    ));
+    if output::is_verbose() {
+        output::detail(&format!(
+            "Hashes local={:?} remote={:?} ({} ms)",
+            local_hash,
+            remote_hash,
+            phase.elapsed().as_millis()
+        ));
+    }
 
     match (&local_hash, &remote_hash) {
         (None, None) => {
-            output::detail("Sync skipped (no local/remote notes)");
+            if output::is_verbose() {
+                output::detail("Sync skipped (no local/remote notes)");
+            }
             return Ok(());
         }
         (Some(l), Some(r)) if l == r => {
-            output::detail("Sync skipped (hashes match)");
+            if output::is_verbose() {
+                output::detail("Sync skipped (hashes match)");
+            }
             return Ok(());
         }
         _ => {}
@@ -106,10 +112,12 @@ fn sync_notes_for_remote_inner(remote: &str) -> Result<()> {
     let fetch_start = std::time::Instant::now();
     let fetch_status = git::run_git_output_at(None, &["fetch", remote, &fetch_spec], &[])
         .context("failed to execute git fetch for notes")?;
-    output::detail(&format!(
-        "Fetch in {} ms",
-        fetch_start.elapsed().as_millis()
-    ));
+    if output::is_verbose() {
+        output::detail(&format!(
+            "Fetch in {} ms",
+            fetch_start.elapsed().as_millis()
+        ));
+    }
 
     let fetched = fetch_status.status.success();
     if !fetched {
@@ -129,10 +137,12 @@ fn sync_notes_for_remote_inner(remote: &str) -> Result<()> {
             &[],
         )
         .context("failed to execute git notes merge")?;
-        output::detail(&format!(
-            "Merge in {} ms",
-            merge_start.elapsed().as_millis()
-        ));
+        if output::is_verbose() {
+            output::detail(&format!(
+                "Merge in {} ms",
+                merge_start.elapsed().as_millis()
+            ));
+        }
 
         if !merge_status.status.success() {
             let stderr = String::from_utf8_lossy(&merge_status.stderr);
@@ -148,27 +158,35 @@ fn sync_notes_for_remote_inner(remote: &str) -> Result<()> {
 
     let post_hash_start = std::time::Instant::now();
     let post_merge_hash = local_notes_hash().context("failed to read local notes ref")?;
-    output::detail(&format!(
-        "Post-merge hash={:?} ({} ms)",
-        post_merge_hash,
-        post_hash_start.elapsed().as_millis()
-    ));
+    if output::is_verbose() {
+        output::detail(&format!(
+            "Post-merge hash={:?} ({} ms)",
+            post_merge_hash,
+            post_hash_start.elapsed().as_millis()
+        ));
+    }
     if let (Some(local), Some(remote)) = (&post_merge_hash, &remote_hash)
         && local == remote
     {
-        output::detail("Sync push skipped (hash unchanged)");
+        if output::is_verbose() {
+            output::detail("Sync push skipped (hash unchanged)");
+        }
         return Ok(());
     }
 
     let push_start = std::time::Instant::now();
-    output::detail("Pushing notes");
+    if output::is_verbose() {
+        output::detail("Pushing notes");
+    }
     let push_status = git::run_git_output_at(
         None,
         &["push", "--no-verify", remote, git::NOTES_REF],
         &[("GIT_TERMINAL_PROMPT", "0")],
     )
     .context("failed to execute git push for notes")?;
-    output::detail(&format!("Push in {} ms", push_start.elapsed().as_millis()));
+    if output::is_verbose() {
+        output::detail(&format!("Push in {} ms", push_start.elapsed().as_millis()));
+    }
 
     if !push_status.status.success() {
         let stderr = String::from_utf8_lossy(&push_status.stderr);
