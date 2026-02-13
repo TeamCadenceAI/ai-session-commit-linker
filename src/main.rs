@@ -2686,7 +2686,75 @@ fn check_post_login_key_status(
 // ---------------------------------------------------------------------------
 
 fn run_auth_logout() -> Result<()> {
+    let is_tty = output::is_stderr_tty();
+    run_auth_logout_inner(&mut std::io::stderr(), is_tty)
+}
+
+/// Inner implementation of `auth logout` that writes to the provided writer.
+///
+/// Flow:
+/// 1. Load config and check for existing token.
+/// 2. If no token, print "Not currently authenticated." and return.
+/// 3. Attempt server-side token revocation (best-effort).
+/// 4. Always clear local credentials regardless of revocation outcome.
+/// 5. Print success or warning message.
+fn run_auth_logout_inner(w: &mut dyn std::io::Write, is_tty: bool) -> Result<()> {
+    let mut cfg = config::CliConfig::load()?;
+
+    // No token → not authenticated
+    if cfg.token.is_none() {
+        output::action_to_with_tty(w, "Not currently authenticated.", "", is_tty);
+        return Ok(());
+    }
+
+    // Resolve API URL and attempt server-side revocation
+    let resolved = cfg.resolve_api_url(None);
+    let token = cfg.token.clone().unwrap(); // safe: checked above
+    let client = api_client::ApiClient::new(&resolved.url, Some(token));
+
+    let revoke_result = client.revoke_token();
+
+    // Always clear local credentials, regardless of revocation outcome
+    cfg.clear_token()?;
+
+    // Classify the revocation result and print appropriate message
+    match revoke_result {
+        Ok(()) => {
+            output::success_to_with_tty(w, "Logged out and token revoked.", "", is_tty);
+        }
+        Err(ref err) => {
+            let err_msg = format!("{err:#}");
+            if is_connection_error(&err_msg) {
+                output::action_to_with_tty(
+                    w,
+                    "Logged out.",
+                    "Warning: could not reach server to revoke token.",
+                    is_tty,
+                );
+            } else {
+                // Non-transport API error (e.g. 401, 500) — still cleaned up locally
+                output::success_to_with_tty(w, "Logged out.", "", is_tty);
+                output::note_to_with_tty(
+                    w,
+                    &format!("Server-side revocation failed: {err_msg}"),
+                    is_tty,
+                );
+            }
+        }
+    }
+
     Ok(())
+}
+
+/// Classify whether an error message indicates a transport/connectivity failure
+/// (DNS resolution, connection refused, timeout) vs an application-level HTTP error.
+fn is_connection_error(err_msg: &str) -> bool {
+    let lower = err_msg.to_lowercase();
+    lower.contains("failed to connect")
+        || lower.contains("connection refused")
+        || lower.contains("dns error")
+        || lower.contains("timed out")
+        || lower.contains("no route to host")
 }
 
 fn run_auth_status() -> Result<()> {
@@ -2723,7 +2791,80 @@ fn run_auth_status_inner(w: &mut dyn std::io::Write, is_tty: bool) -> Result<()>
 }
 
 fn run_keys_status() -> Result<()> {
+    let is_tty = output::is_stderr_tty();
+    run_keys_status_inner(&mut std::io::stderr(), is_tty)
+}
+
+/// Inner implementation of `keys status` that writes to the provided writer.
+///
+/// Flow:
+/// 1. Load config and check for existing token (FR-7).
+/// 2. If no token, print helpful error and return.
+/// 3. Resolve API URL and call `GET /api/keys`.
+/// 4. Print key fingerprint + upload date, or "no key" message.
+fn run_keys_status_inner(w: &mut dyn std::io::Write, is_tty: bool) -> Result<()> {
+    let cfg = config::CliConfig::load()?;
+
+    let token = match &cfg.token {
+        Some(t) if !t.trim().is_empty() => t.clone(),
+        _ => {
+            output::action_to_with_tty(
+                w,
+                "Not currently authenticated.",
+                "Run `cadence auth login` first.",
+                is_tty,
+            );
+            return Ok(());
+        }
+    };
+
+    let resolved = cfg.resolve_api_url(None);
+    let client = api_client::ApiClient::new(&resolved.url, Some(token));
+
+    match client.get_key_status() {
+        Ok(Some(key)) => {
+            let date_display = match &key.created_at {
+                Some(ts) => format_api_date(ts),
+                None => "(unknown date)".to_string(),
+            };
+            output::success_to_with_tty(
+                w,
+                &format!(
+                    "Key uploaded: {} (uploaded {})",
+                    key.fingerprint, date_display
+                ),
+                "",
+                is_tty,
+            );
+        }
+        Ok(None) => {
+            output::action_to_with_tty(
+                w,
+                "No encryption key uploaded.",
+                "Run 'keys push' to upload one.",
+                is_tty,
+            );
+        }
+        Err(e) => {
+            output::fail_to_with_tty(w, "Failed to check key status", &format!("{e:#}"), is_tty);
+        }
+    }
+
     Ok(())
+}
+
+/// Format an API date string (expected RFC 3339) to a user-friendly `YYYY-MM-DD` form.
+///
+/// Falls back to the raw trimmed input if parsing fails.
+fn format_api_date(raw: &str) -> String {
+    use time::format_description::well_known::Rfc3339;
+    match time::OffsetDateTime::parse(raw, &Rfc3339) {
+        Ok(dt) => {
+            let (year, month, day) = (dt.year(), dt.month() as u8, dt.day());
+            format!("{year:04}-{month:02}-{day:02}")
+        }
+        Err(_) => raw.trim().to_string(),
+    }
 }
 
 fn run_keys_push(_key: Option<String>, _yes: bool) -> Result<()> {
@@ -4101,9 +4242,350 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Auth logout handler tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: write a CliConfig to a temp home, run auth logout, and return
+    /// the output. Caller provides the fake home so it can inspect the config
+    /// after logout.
+    fn run_auth_logout_with_home(fake_home: &TempDir, cfg: &config::CliConfig) -> Result<String> {
+        let config_path = fake_home
+            .path()
+            .join(".config")
+            .join("ai-session-commit-linker")
+            .join("config.toml");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        let toml_str = toml::to_string_pretty(cfg).expect("failed to serialize config");
+        std::fs::write(&config_path, &toml_str).unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+        let mut buf = Vec::new();
+        let result = run_auth_logout_inner(&mut buf, false);
+
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        result?;
+        Ok(String::from_utf8(buf).expect("output should be valid UTF-8"))
+    }
+
     #[test]
-    fn run_auth_logout_stub_returns_ok() {
-        assert!(run_auth_logout().is_ok());
+    #[serial]
+    fn auth_logout_not_authenticated() {
+        let fake_home = TempDir::new().unwrap();
+        let cfg = config::CliConfig::default();
+        let output = run_auth_logout_with_home(&fake_home, &cfg).unwrap();
+        assert!(
+            output.contains("Not currently authenticated."),
+            "should show not-authenticated message, got: {output}"
+        );
+        // Should NOT contain logout success or warning messages
+        assert!(
+            !output.contains("Logged out"),
+            "should not mention logout when not authenticated, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn auth_logout_clears_local_credentials() {
+        use std::io::{BufRead, BufReader, Write};
+
+        // Set up a mock server that accepts the revocation
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mock_url = format!("http://127.0.0.1:{port}");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            // Read request line and headers
+            let mut req_line = String::new();
+            reader.read_line(&mut req_line).unwrap();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim().is_empty() {
+                    break;
+                }
+            }
+            let resp = "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n";
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            req_line
+        });
+
+        let fake_home = TempDir::new().unwrap();
+        let cfg = config::CliConfig {
+            api_url: Some(mock_url),
+            token: Some("tok_to_revoke".to_string()),
+            github_login: Some("testuser".to_string()),
+            expires_at: Some("2027-01-01T00:00:00Z".to_string()),
+        };
+        let output = run_auth_logout_with_home(&fake_home, &cfg).unwrap();
+
+        let req_line = handle.join().unwrap();
+
+        // Verify success message
+        assert!(
+            output.contains("Logged out and token revoked."),
+            "should show success message, got: {output}"
+        );
+
+        // Verify local credentials are cleared
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+        let loaded = config::CliConfig::load().unwrap();
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        assert!(loaded.token.is_none(), "token should be cleared");
+        assert!(
+            loaded.github_login.is_none(),
+            "github_login should be cleared"
+        );
+        assert!(loaded.expires_at.is_none(), "expires_at should be cleared");
+        // api_url must be preserved
+        assert!(
+            loaded.api_url.is_some(),
+            "api_url should be preserved after logout"
+        );
+
+        // Verify the revocation request was a DELETE to /api/auth
+        assert!(
+            req_line.contains("DELETE"),
+            "should send DELETE request, got: {req_line}"
+        );
+        assert!(
+            req_line.contains("/api/auth"),
+            "should target /api/auth, got: {req_line}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn auth_logout_revoke_called_with_bearer_token() {
+        use std::io::{BufRead, BufReader, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mock_url = format!("http://127.0.0.1:{port}");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            reader.read_line(&mut req_line).unwrap();
+
+            // Capture Authorization header
+            let mut auth_header = None;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim().is_empty() {
+                    break;
+                }
+                if let Some((key, value)) = line.split_once(':') {
+                    if key.trim().to_lowercase() == "authorization" {
+                        auth_header = Some(value.trim().to_string());
+                    }
+                }
+            }
+
+            let resp = "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n";
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            auth_header
+        });
+
+        let fake_home = TempDir::new().unwrap();
+        let cfg = config::CliConfig {
+            api_url: Some(mock_url),
+            token: Some("tok_verify_header".to_string()),
+            github_login: Some("testuser".to_string()),
+            ..Default::default()
+        };
+        let _output = run_auth_logout_with_home(&fake_home, &cfg).unwrap();
+
+        let auth_header = handle.join().unwrap();
+        assert_eq!(
+            auth_header.as_deref(),
+            Some("Bearer tok_verify_header"),
+            "should send Bearer token in Authorization header"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn auth_logout_warning_on_unreachable_server() {
+        let fake_home = TempDir::new().unwrap();
+        // Use a port that is almost certainly not listening
+        let cfg = config::CliConfig {
+            api_url: Some("http://127.0.0.1:1".to_string()),
+            token: Some("tok_unreachable".to_string()),
+            github_login: Some("testuser".to_string()),
+            expires_at: Some("2027-01-01T00:00:00Z".to_string()),
+        };
+        let output = run_auth_logout_with_home(&fake_home, &cfg).unwrap();
+
+        // Should show warning about unreachable server
+        assert!(
+            output.contains("Logged out."),
+            "should confirm local logout, got: {output}"
+        );
+        assert!(
+            output.contains("Warning: could not reach server to revoke token."),
+            "should warn about unreachable server, got: {output}"
+        );
+
+        // Verify local credentials are still cleared despite server failure
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+        let loaded = config::CliConfig::load().unwrap();
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        assert!(
+            loaded.token.is_none(),
+            "token should be cleared even when server unreachable"
+        );
+        assert!(
+            loaded.github_login.is_none(),
+            "login should be cleared even when server unreachable"
+        );
+        assert!(
+            loaded.expires_at.is_none(),
+            "expires_at should be cleared even when server unreachable"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn auth_logout_api_error_still_clears_locally() {
+        use std::io::{BufRead, BufReader, Write};
+
+        // Mock server returns 401 (token already expired/revoked)
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mock_url = format!("http://127.0.0.1:{port}");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            reader.read_line(&mut req_line).unwrap();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim().is_empty() {
+                    break;
+                }
+            }
+            let body = r#"{"message":"Unauthorized"}"#;
+            let resp = format!(
+                "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let fake_home = TempDir::new().unwrap();
+        let cfg = config::CliConfig {
+            api_url: Some(mock_url),
+            token: Some("tok_expired".to_string()),
+            github_login: Some("testuser".to_string()),
+            expires_at: Some("2027-01-01T00:00:00Z".to_string()),
+        };
+        let output = run_auth_logout_with_home(&fake_home, &cfg).unwrap();
+
+        handle.join().unwrap();
+
+        // Should still confirm local logout
+        assert!(
+            output.contains("Logged out."),
+            "should confirm local logout, got: {output}"
+        );
+        // Should show the server error as a note, not the unreachable warning
+        assert!(
+            output.contains("Server-side revocation failed:"),
+            "should note the API error, got: {output}"
+        );
+        assert!(
+            !output.contains("could not reach server"),
+            "should NOT show unreachable warning for 401, got: {output}"
+        );
+
+        // Verify local credentials are cleared
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+        let loaded = config::CliConfig::load().unwrap();
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        assert!(loaded.token.is_none(), "token should be cleared after 401");
+    }
+
+    #[test]
+    #[serial]
+    fn auth_logout_no_config_file_shows_not_authenticated() {
+        let fake_home = TempDir::new().unwrap();
+        // Don't create any config file — load() returns defaults
+
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+        let mut buf = Vec::new();
+        let result = run_auth_logout_inner(&mut buf, false);
+
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        assert!(result.is_ok());
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("Not currently authenticated."),
+            "should show not-authenticated for missing config, got: {output}"
+        );
+    }
+
+    #[test]
+    fn is_connection_error_classifies_transport_errors() {
+        assert!(is_connection_error(
+            "failed to connect to API at http://localhost:1234"
+        ));
+        assert!(is_connection_error("connection refused"));
+        assert!(is_connection_error("DNS error: name resolution failed"));
+        assert!(is_connection_error("request timed out"));
+        assert!(is_connection_error("no route to host"));
+
+        // Should NOT classify HTTP errors as connection errors
+        assert!(!is_connection_error(
+            "Not authenticated. Run `cadence auth login` to sign in."
+        ));
+        assert!(!is_connection_error("Server error: Internal error"));
+        assert!(!is_connection_error("Bad request: invalid token"));
     }
 
     // -----------------------------------------------------------------------
@@ -4347,11 +4829,6 @@ mod tests {
     }
 
     #[test]
-    fn run_keys_status_stub_returns_ok() {
-        assert!(run_keys_status().is_ok());
-    }
-
-    #[test]
     fn run_keys_push_stub_returns_ok() {
         assert!(run_keys_push(None, false).is_ok());
     }
@@ -4359,6 +4836,516 @@ mod tests {
     #[test]
     fn run_keys_test_stub_returns_ok() {
         assert!(run_keys_test().is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Keys status handler tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: write a CliConfig to a temp home and run keys status against it.
+    /// Returns the output as a String. Does NOT start a mock server — use
+    /// for unauthenticated tests only (no API call expected).
+    fn run_keys_status_with_config(cfg: &config::CliConfig) -> Result<String> {
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let config_path = fake_home
+            .path()
+            .join(".config")
+            .join("ai-session-commit-linker")
+            .join("config.toml");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        let toml_str = toml::to_string_pretty(cfg).expect("failed to serialize config");
+        std::fs::write(&config_path, &toml_str).unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+        let mut buf = Vec::new();
+        let result = run_keys_status_inner(&mut buf, false);
+
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        result?;
+        Ok(String::from_utf8(buf).expect("output should be valid UTF-8"))
+    }
+
+    /// Helper: write a CliConfig to a temp home with a token pointing at a mock
+    /// server, run keys status, and return the output.
+    fn run_keys_status_with_server(cfg: &config::CliConfig) -> Result<String> {
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let config_path = fake_home
+            .path()
+            .join(".config")
+            .join("ai-session-commit-linker")
+            .join("config.toml");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        let toml_str = toml::to_string_pretty(cfg).expect("failed to serialize config");
+        std::fs::write(&config_path, &toml_str).unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+        let mut buf = Vec::new();
+        let result = run_keys_status_inner(&mut buf, false);
+
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        result?;
+        Ok(String::from_utf8(buf).expect("output should be valid UTF-8"))
+    }
+
+    #[test]
+    #[serial]
+    fn keys_status_not_authenticated() {
+        let cfg = config::CliConfig::default();
+        let output = run_keys_status_with_config(&cfg).unwrap();
+        assert!(
+            output.contains("Not currently authenticated."),
+            "should show not-authenticated message, got: {output}"
+        );
+        assert!(
+            output.contains("Run `cadence auth login` first."),
+            "should show login hint, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_status_empty_token_treated_as_unauthenticated() {
+        let cfg = config::CliConfig {
+            token: Some("".to_string()),
+            ..Default::default()
+        };
+        let output = run_keys_status_with_config(&cfg).unwrap();
+        assert!(
+            output.contains("Not currently authenticated."),
+            "empty token should be treated as unauthenticated, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_status_whitespace_token_treated_as_unauthenticated() {
+        let cfg = config::CliConfig {
+            token: Some("   ".to_string()),
+            ..Default::default()
+        };
+        let output = run_keys_status_with_config(&cfg).unwrap();
+        assert!(
+            output.contains("Not currently authenticated."),
+            "whitespace-only token should be treated as unauthenticated, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_status_no_config_file_shows_unauthenticated() {
+        let fake_home = TempDir::new().unwrap();
+        // Don't create any config file
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+        let mut buf = Vec::new();
+        let result = run_keys_status_inner(&mut buf, false);
+
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        assert!(result.is_ok());
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("Not currently authenticated."),
+            "missing config should show unauthenticated, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_status_with_key() {
+        use std::io::{BufRead, BufReader, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mock_url = format!("http://127.0.0.1:{port}");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            reader.read_line(&mut req_line).unwrap();
+            // Drain headers
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim().is_empty() {
+                    break;
+                }
+            }
+            let body = r#"{"fingerprint":"ABCD1234EF56","created_at":"2026-02-10T14:30:00Z"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            req_line
+        });
+
+        let cfg = config::CliConfig {
+            api_url: Some(mock_url),
+            token: Some("tok_keys_test".to_string()),
+            ..Default::default()
+        };
+        let output = run_keys_status_with_server(&cfg).unwrap();
+        let req_line = handle.join().unwrap();
+
+        // Verify correct endpoint was called
+        assert!(
+            req_line.contains("GET /api/keys"),
+            "should call GET /api/keys, got: {req_line}"
+        );
+
+        // Verify output format
+        assert!(
+            output.contains("Key uploaded: ABCD1234EF56 (uploaded 2026-02-10)"),
+            "should show fingerprint and formatted date, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_status_no_key() {
+        use std::io::{BufRead, BufReader, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mock_url = format!("http://127.0.0.1:{port}");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            reader.read_line(&mut req_line).unwrap();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim().is_empty() {
+                    break;
+                }
+            }
+            let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let cfg = config::CliConfig {
+            api_url: Some(mock_url),
+            token: Some("tok_keys_test".to_string()),
+            ..Default::default()
+        };
+        let output = run_keys_status_with_server(&cfg).unwrap();
+        handle.join().unwrap();
+
+        assert!(
+            output.contains("No encryption key uploaded."),
+            "should show no-key message, got: {output}"
+        );
+        assert!(
+            output.contains("Run 'keys push' to upload one."),
+            "should show push hint, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_status_no_key_empty_body_200() {
+        use std::io::{BufRead, BufReader, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mock_url = format!("http://127.0.0.1:{port}");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            reader.read_line(&mut req_line).unwrap();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim().is_empty() {
+                    break;
+                }
+            }
+            let resp = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let cfg = config::CliConfig {
+            api_url: Some(mock_url),
+            token: Some("tok_keys_test".to_string()),
+            ..Default::default()
+        };
+        let output = run_keys_status_with_server(&cfg).unwrap();
+        handle.join().unwrap();
+
+        assert!(
+            output.contains("No encryption key uploaded."),
+            "empty 200 should show no-key message, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_status_api_http_error() {
+        use std::io::{BufRead, BufReader, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mock_url = format!("http://127.0.0.1:{port}");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            reader.read_line(&mut req_line).unwrap();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim().is_empty() {
+                    break;
+                }
+            }
+            let body = r#"{"message":"Internal failure"}"#;
+            let resp = format!(
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let cfg = config::CliConfig {
+            api_url: Some(mock_url),
+            token: Some("tok_keys_test".to_string()),
+            ..Default::default()
+        };
+        let output = run_keys_status_with_server(&cfg).unwrap();
+        handle.join().unwrap();
+
+        assert!(
+            output.contains("Failed to check key status"),
+            "should show failure label, got: {output}"
+        );
+        assert!(
+            output.contains("Server error") || output.contains("Internal failure"),
+            "should include server error details, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_status_network_error() {
+        // Point at a port that is not listening
+        let cfg = config::CliConfig {
+            api_url: Some("http://127.0.0.1:1".to_string()),
+            token: Some("tok_keys_test".to_string()),
+            ..Default::default()
+        };
+        let output = run_keys_status_with_server(&cfg).unwrap();
+
+        assert!(
+            output.contains("Failed to check key status"),
+            "should show failure label on transport error, got: {output}"
+        );
+        assert!(
+            output.contains("failed to connect"),
+            "should include connection error context, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_status_with_key_no_created_at() {
+        use std::io::{BufRead, BufReader, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mock_url = format!("http://127.0.0.1:{port}");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            reader.read_line(&mut req_line).unwrap();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim().is_empty() {
+                    break;
+                }
+            }
+            let body = r#"{"fingerprint":"DEADBEEF"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let cfg = config::CliConfig {
+            api_url: Some(mock_url),
+            token: Some("tok_keys_test".to_string()),
+            ..Default::default()
+        };
+        let output = run_keys_status_with_server(&cfg).unwrap();
+        handle.join().unwrap();
+
+        assert!(
+            output.contains("Key uploaded: DEADBEEF (uploaded (unknown date))"),
+            "missing created_at should show unknown date, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_status_with_key_invalid_created_at() {
+        use std::io::{BufRead, BufReader, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mock_url = format!("http://127.0.0.1:{port}");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            reader.read_line(&mut req_line).unwrap();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim().is_empty() {
+                    break;
+                }
+            }
+            let body = r#"{"fingerprint":"CAFE9876","created_at":"not-a-date"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let cfg = config::CliConfig {
+            api_url: Some(mock_url),
+            token: Some("tok_keys_test".to_string()),
+            ..Default::default()
+        };
+        let output = run_keys_status_with_server(&cfg).unwrap();
+        handle.join().unwrap();
+
+        // Should fall back to raw string, not crash
+        assert!(
+            output.contains("Key uploaded: CAFE9876 (uploaded not-a-date)"),
+            "invalid date should fall back to raw string, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_status_sends_bearer_token() {
+        use std::io::{BufRead, BufReader, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mock_url = format!("http://127.0.0.1:{port}");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            reader.read_line(&mut req_line).unwrap();
+            let mut headers = Vec::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let trimmed = line.trim().to_string();
+                if trimmed.is_empty() {
+                    break;
+                }
+                headers.push(trimmed);
+            }
+            let body = r#"{"fingerprint":"FP1234"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            headers
+        });
+
+        let cfg = config::CliConfig {
+            api_url: Some(mock_url),
+            token: Some("tok_verify_bearer".to_string()),
+            ..Default::default()
+        };
+        let _output = run_keys_status_with_server(&cfg).unwrap();
+        let headers = handle.join().unwrap();
+
+        let auth_header = headers
+            .iter()
+            .find(|h| h.to_lowercase().starts_with("authorization:"))
+            .expect("should send Authorization header");
+        assert!(
+            auth_header.contains("Bearer tok_verify_bearer"),
+            "should send correct Bearer token, got: {auth_header}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // format_api_date helper tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn format_api_date_valid_rfc3339() {
+        assert_eq!(format_api_date("2026-02-10T14:30:00Z"), "2026-02-10");
+    }
+
+    #[test]
+    fn format_api_date_valid_with_offset() {
+        assert_eq!(format_api_date("2025-12-31T23:59:59+10:00"), "2025-12-31");
+    }
+
+    #[test]
+    fn format_api_date_invalid_falls_back_to_raw() {
+        assert_eq!(format_api_date("not-a-date"), "not-a-date");
+    }
+
+    #[test]
+    fn format_api_date_empty_falls_back_to_empty() {
+        assert_eq!(format_api_date(""), "");
+    }
+
+    #[test]
+    fn format_api_date_trims_whitespace_on_fallback() {
+        assert_eq!(format_api_date("  something  "), "something");
     }
 
     // -----------------------------------------------------------------------
