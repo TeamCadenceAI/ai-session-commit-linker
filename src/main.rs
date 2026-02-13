@@ -58,9 +58,9 @@ enum Command {
     /// Retry attaching notes for pending (unresolved) commits.
     Retry,
 
-    /// Run onboarding to capture user email for note attribution.
+    /// Set user email for note attribution (auto-detects from git config user.email).
     Onboard {
-        /// Email to set non-interactively.
+        /// Email to set manually (overrides auto-detection from git config).
         #[arg(long)]
         email: Option<String>,
     },
@@ -1233,7 +1233,7 @@ fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
         None => {
             writeln!(
                 w,
-                "[ai-session-commit-linker]   User email: (not set; run `ai-session-commit-linker onboard`)"
+                "[ai-session-commit-linker]   User email: (not set; run `ai-session-commit-linker onboard` or set git user.email)"
             )
             .ok();
         }
