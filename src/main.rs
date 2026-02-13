@@ -9,7 +9,7 @@ mod pending;
 mod push;
 mod scanner;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use dialoguer::{Confirm, Input, theme::ColorfulTheme};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
@@ -2329,12 +2329,361 @@ fn persist_setup_config_with(
 }
 
 // ---------------------------------------------------------------------------
-// Auth & Keys stub handlers
+// Auth login helpers
 // ---------------------------------------------------------------------------
 
-fn run_auth_login(_api_url: Option<String>) -> Result<()> {
+/// Generate a random 16-byte CSRF nonce as a 32-character lowercase hex string.
+fn generate_auth_nonce() -> String {
+    let mut bytes = [0u8; 16];
+    rand::fill(&mut bytes);
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Build the OAuth browser URL: `{api_url}/auth/token?port={port}&state={nonce}`.
+fn build_auth_browser_url(api_url: &str, port: u16, state: &str) -> String {
+    let base = api_url.trim_end_matches('/');
+    format!("{base}/auth/token?port={port}&state={state}")
+}
+
+/// Parsed callback request from the localhost listener.
+#[derive(Debug)]
+struct CallbackParams {
+    code: String,
+    state: String,
+}
+
+/// Parse an HTTP request line from the callback listener.
+///
+/// Enforces the strict callback contract: only `GET /callback?code=<...>&state=<...>`
+/// is accepted. Returns an error describing the rejection reason for any
+/// non-conforming request.
+fn parse_callback_request(request_line: &str) -> Result<CallbackParams> {
+    let parts: Vec<&str> = request_line.split_whitespace().collect();
+    if parts.len() < 2 {
+        anyhow::bail!("malformed request line");
+    }
+
+    let method = parts[0];
+    if method != "GET" {
+        anyhow::bail!("unexpected method: {method}");
+    }
+
+    // Parse the path + query using the url crate with a dummy base
+    let full_url = format!("http://localhost{}", parts[1]);
+    let parsed = url::Url::parse(&full_url).map_err(|e| anyhow::anyhow!("malformed URL: {e}"))?;
+
+    if parsed.path() != "/callback" {
+        anyhow::bail!("unexpected path: {}", parsed.path());
+    }
+
+    let mut code: Option<String> = None;
+    let mut state: Option<String> = None;
+
+    for (key, value) in parsed.query_pairs() {
+        match key.as_ref() {
+            "code" => code = Some(value.into_owned()),
+            "state" => state = Some(value.into_owned()),
+            _ => {} // Ignore extra params
+        }
+    }
+
+    let code = code.ok_or_else(|| anyhow::anyhow!("missing 'code' parameter"))?;
+    let state = state.ok_or_else(|| anyhow::anyhow!("missing 'state' parameter"))?;
+
+    if code.is_empty() {
+        anyhow::bail!("empty 'code' parameter");
+    }
+    if state.is_empty() {
+        anyhow::bail!("empty 'state' parameter");
+    }
+
+    Ok(CallbackParams { code, state })
+}
+
+/// HTTP response for a successful callback.
+const CALLBACK_SUCCESS_HTML: &str = "Authentication successful. You can close this tab.";
+
+/// Write an HTTP response to a TCP stream.
+fn write_http_response(
+    stream: &mut std::net::TcpStream,
+    status: u16,
+    status_text: &str,
+    body: &str,
+) {
+    use std::io::Write;
+    let response = format!(
+        "HTTP/1.1 {status} {status_text}\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
+}
+
+/// Run the localhost callback listener.
+///
+/// Binds to `127.0.0.1:0` (OS-assigned port), listens for up to `timeout`
+/// duration, and enforces the strict callback contract. Returns the OAuth
+/// authorization code on success.
+///
+/// - Malformed requests are rejected and the listener keeps serving.
+/// - State mismatches are rejected and the listener keeps serving.
+/// - Only a valid `GET /callback?code=<...>&state=<expected>` stops the listener.
+fn run_callback_listener(
+    listener: &std::net::TcpListener,
+    expected_state: &str,
+    timeout: std::time::Duration,
+) -> Result<String> {
+    use std::io::{BufRead, BufReader};
+
+    let deadline = std::time::Instant::now() + timeout;
+
+    // Set a short accept timeout for polling
+    listener.set_nonblocking(false)?;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!("Authentication timed out. Please try again.");
+        }
+
+        // Use a poll interval: accept with a short timeout then check deadline
+        let poll_interval = remaining.min(std::time::Duration::from_millis(500));
+        listener.set_nonblocking(false)?;
+        // We simulate timeout by setting SO_RCVTIMEO-like behavior via
+        // set_nonblocking + sleep to avoid platform-specific socket options.
+        listener.set_nonblocking(true)?;
+
+        let accept_result = listener.accept();
+        match accept_result {
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                std::thread::sleep(poll_interval);
+                continue;
+            }
+            Err(e) => {
+                // Transient accept error — log and keep listening
+                eprintln!("listener accept error: {e}");
+                continue;
+            }
+            Ok((mut stream, _addr)) => {
+                // Set a read timeout on the connection to avoid hanging on slow clients
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+
+                let mut reader = BufReader::new(stream.try_clone().unwrap_or_else(|_| {
+                    // If clone fails, we still have the original stream reference
+                    // This path is unlikely but handle gracefully
+                    stream.try_clone().expect("TCP stream clone failed")
+                }));
+
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() || request_line.is_empty() {
+                    write_http_response(&mut stream, 400, "Bad Request", "Bad request");
+                    continue;
+                }
+
+                match parse_callback_request(request_line.trim()) {
+                    Err(_) => {
+                        write_http_response(
+                            &mut stream,
+                            400,
+                            "Bad Request",
+                            "Invalid callback request",
+                        );
+                        continue;
+                    }
+                    Ok(params) => {
+                        if params.state != expected_state {
+                            write_http_response(&mut stream, 403, "Forbidden", "State mismatch");
+                            continue;
+                        }
+
+                        // Valid callback — send success response and return the code
+                        write_http_response(&mut stream, 200, "OK", CALLBACK_SUCCESS_HTML);
+                        return Ok(params.code);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Auth login command
+// ---------------------------------------------------------------------------
+
+/// Outer entry point for `auth login` — uses real stderr and TTY detection.
+fn run_auth_login(api_url: Option<String>) -> Result<()> {
+    let is_tty = output::is_stderr_tty();
+    run_auth_login_inner(
+        api_url,
+        &mut std::io::stderr(),
+        is_tty,
+        None, // real stdin for confirmation prompts
+    )
+}
+
+/// Inner implementation of `auth login` for testability.
+///
+/// `confirm_override`: if `Some(bool)`, skips interactive prompt and uses
+/// the provided value for the already-authenticated confirmation. If `None`,
+/// uses interactive prompt (or fails in non-TTY mode).
+fn run_auth_login_inner(
+    api_url: Option<String>,
+    w: &mut dyn std::io::Write,
+    is_tty: bool,
+    confirm_override: Option<bool>,
+) -> Result<()> {
+    // Step 1: Load config
+    let mut cfg = config::CliConfig::load()?;
+
+    // Step 2: Resolve API URL
+    let resolved = cfg.resolve_api_url(api_url.as_deref());
+    if resolved.is_non_https {
+        output::note_to_with_tty(
+            w,
+            &format!("Using non-HTTPS API URL: {}", resolved.url),
+            is_tty,
+        );
+    }
+
+    // Persist API URL if CLI override was provided
+    if api_url.is_some() {
+        cfg.api_url = Some(resolved.url.clone());
+        cfg.save()?;
+    }
+
+    // Step 3: Already-authenticated guard
+    if cfg.token.is_some() {
+        let login_display = cfg.github_login.as_deref().unwrap_or("(unknown)");
+        output::note_to_with_tty(
+            w,
+            &format!("Already authenticated as @{login_display}."),
+            is_tty,
+        );
+
+        let confirmed = match confirm_override {
+            Some(v) => v,
+            None => {
+                if !is_tty {
+                    anyhow::bail!(
+                        "Already authenticated. Use --api-url or re-run interactively to overwrite."
+                    );
+                }
+                let result =
+                    dialoguer::Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default())
+                        .with_prompt("Overwrite existing credentials?")
+                        .default(false)
+                        .interact();
+                match result {
+                    Ok(v) => v,
+                    Err(dialoguer::Error::IO(err))
+                        if err.kind() == std::io::ErrorKind::UnexpectedEof =>
+                    {
+                        false
+                    }
+                    Err(err) => return Err(err.into()),
+                }
+            }
+        };
+
+        if !confirmed {
+            output::action_to_with_tty(w, "Login cancelled.", "", is_tty);
+            return Ok(());
+        }
+    }
+
+    // Step 4: Bind localhost listener
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .context("failed to bind localhost listener for OAuth callback")?;
+    let port = listener.local_addr()?.port();
+
+    // Step 5: Generate nonce and build browser URL
+    let nonce = generate_auth_nonce();
+    let browser_url = build_auth_browser_url(&resolved.url, port, &nonce);
+
+    // Step 6: Open browser
+    output::action_to_with_tty(
+        w,
+        "Opening browser",
+        &format!("for authentication on port {port}..."),
+        is_tty,
+    );
+    if let Err(e) = open::that(&browser_url) {
+        output::fail_to_with_tty(
+            w,
+            "Failed to open browser.",
+            &format!("Please open this URL manually:\n  {browser_url}"),
+            is_tty,
+        );
+        // Log the underlying error but don't fail — user can still open manually
+        let _ = writeln!(w, "  (error: {e})");
+    }
+
+    // Step 7: Wait for callback
+    output::detail_to_with_tty(w, "Waiting for authentication callback...", is_tty);
+    let code = run_callback_listener(
+        &listener,
+        &nonce,
+        std::time::Duration::from_secs(300), // 5 minutes
+    )?;
+
+    // Step 8: Exchange code for token
+    let api_client = api_client::ApiClient::new(&resolved.url, None);
+    let exchange_result = api_client.exchange_code(&code)?;
+
+    // Step 9: Persist credentials
+    cfg.token = Some(exchange_result.token);
+    cfg.github_login = exchange_result.login.clone();
+    cfg.expires_at = exchange_result.expires_at.clone();
+    cfg.save()?;
+
+    let login_display = exchange_result.login.as_deref().unwrap_or("(unknown)");
+    output::success_to_with_tty(w, &format!("Authenticated as @{login_display}"), "", is_tty);
+
+    // Step 10: Check for existing keys (non-fatal)
+    check_post_login_key_status(&resolved.url, &cfg, w, is_tty);
+
     Ok(())
 }
+
+/// Check for existing encryption keys after login and emit a suggestion if none found.
+///
+/// This is a best-effort check — network failures are warned but do not fail the login.
+fn check_post_login_key_status(
+    api_url: &str,
+    cfg: &config::CliConfig,
+    w: &mut dyn std::io::Write,
+    is_tty: bool,
+) {
+    let token = match &cfg.token {
+        Some(t) => t.clone(),
+        None => return, // Should not happen after successful login
+    };
+
+    let client = api_client::ApiClient::new(api_url, Some(token));
+    match client.get_key_status() {
+        Ok(Some(_key)) => {
+            // Active key exists — no suggestion needed
+        }
+        Ok(None) => {
+            output::action_to_with_tty(
+                w,
+                "No encryption keys found.",
+                "Run 'keys push' to upload your private key.",
+                is_tty,
+            );
+        }
+        Err(e) => {
+            output::note_to_with_tty(w, &format!("Could not check key status: {e}"), is_tty);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Auth & Keys stub handlers
+// ---------------------------------------------------------------------------
 
 fn run_auth_logout() -> Result<()> {
     Ok(())
@@ -2997,17 +3346,759 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Auth & Keys stub handler tests
+    // Auth login: nonce generation tests
     // -----------------------------------------------------------------------
 
     #[test]
-    fn run_auth_login_stub_returns_ok() {
-        assert!(run_auth_login(None).is_ok());
+    fn nonce_is_32_char_hex() {
+        let nonce = generate_auth_nonce();
+        assert_eq!(
+            nonce.len(),
+            32,
+            "nonce should be 32 chars, got {}",
+            nonce.len()
+        );
+        assert!(
+            nonce.chars().all(|c| c.is_ascii_hexdigit()),
+            "nonce should be hex only, got: {}",
+            nonce
+        );
+        // Should be lowercase
+        assert_eq!(nonce, nonce.to_lowercase(), "nonce should be lowercase hex");
     }
 
     #[test]
-    fn run_auth_login_stub_with_url_returns_ok() {
-        assert!(run_auth_login(Some("https://example.com".to_string())).is_ok());
+    fn nonce_is_unique_across_invocations() {
+        let a = generate_auth_nonce();
+        let b = generate_auth_nonce();
+        assert_ne!(a, b, "two nonces should differ");
+    }
+
+    // -----------------------------------------------------------------------
+    // Auth login: browser URL builder tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_auth_browser_url_basic() {
+        let url = build_auth_browser_url("https://app.example.com", 12345, "abc123");
+        assert_eq!(
+            url,
+            "https://app.example.com/auth/token?port=12345&state=abc123"
+        );
+    }
+
+    #[test]
+    fn build_auth_browser_url_strips_trailing_slash() {
+        let url = build_auth_browser_url("https://app.example.com/", 8080, "nonce");
+        assert_eq!(
+            url,
+            "https://app.example.com/auth/token?port=8080&state=nonce"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Auth login: callback parser tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_callback_valid() {
+        let result = parse_callback_request("GET /callback?code=abc123&state=xyz789 HTTP/1.1");
+        assert!(result.is_ok());
+        let params = result.unwrap();
+        assert_eq!(params.code, "abc123");
+        assert_eq!(params.state, "xyz789");
+    }
+
+    #[test]
+    fn parse_callback_rejects_post_method() {
+        let result = parse_callback_request("POST /callback?code=abc&state=xyz HTTP/1.1");
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("unexpected method"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_callback_rejects_wrong_path() {
+        let result = parse_callback_request("GET /other?code=abc&state=xyz HTTP/1.1");
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("unexpected path"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_callback_rejects_missing_code() {
+        let result = parse_callback_request("GET /callback?state=xyz HTTP/1.1");
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("missing 'code'"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_callback_rejects_missing_state() {
+        let result = parse_callback_request("GET /callback?code=abc HTTP/1.1");
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("missing 'state'"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_callback_rejects_no_query() {
+        let result = parse_callback_request("GET /callback HTTP/1.1");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_callback_rejects_empty_code() {
+        let result = parse_callback_request("GET /callback?code=&state=xyz HTTP/1.1");
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("empty 'code'"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_callback_rejects_empty_state() {
+        let result = parse_callback_request("GET /callback?code=abc&state= HTTP/1.1");
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("empty 'state'"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_callback_rejects_malformed_line() {
+        let result = parse_callback_request("GARBAGE");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_callback_rejects_empty_line() {
+        let result = parse_callback_request("");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_callback_handles_url_encoded_values() {
+        let result =
+            parse_callback_request("GET /callback?code=abc%20def&state=xyz%3D123 HTTP/1.1");
+        assert!(result.is_ok());
+        let params = result.unwrap();
+        assert_eq!(params.code, "abc def");
+        assert_eq!(params.state, "xyz=123");
+    }
+
+    #[test]
+    fn parse_callback_ignores_extra_params() {
+        let result =
+            parse_callback_request("GET /callback?code=abc&state=xyz&extra=ignored HTTP/1.1");
+        assert!(result.is_ok());
+        let params = result.unwrap();
+        assert_eq!(params.code, "abc");
+        assert_eq!(params.state, "xyz");
+    }
+
+    // -----------------------------------------------------------------------
+    // Auth login: callback listener tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn callback_listener_timeout() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let result = run_callback_listener(
+            &listener,
+            "test_state",
+            std::time::Duration::from_millis(100),
+        );
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("Authentication timed out. Please try again."),
+            "expected timeout message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn callback_listener_valid_callback() {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let state = "test_nonce_abc";
+
+        let handle = std::thread::spawn(move || {
+            run_callback_listener(&listener, state, std::time::Duration::from_secs(5))
+        });
+
+        // Give listener a moment to start
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Send a valid callback request
+        let mut stream = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+        write!(
+            stream,
+            "GET /callback?code=auth_code_123&state={state} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        )
+        .unwrap();
+
+        // Read response
+        let mut response = String::new();
+        use std::io::Read;
+        stream.read_to_string(&mut response).unwrap();
+        assert!(
+            response.contains("Authentication successful"),
+            "expected success HTML, got: {response}"
+        );
+
+        let result = handle.join().unwrap();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "auth_code_123");
+    }
+
+    #[test]
+    fn callback_listener_rejects_state_mismatch_then_accepts_valid() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let expected_state = "correct_state";
+
+        let handle = std::thread::spawn(move || {
+            run_callback_listener(&listener, expected_state, std::time::Duration::from_secs(5))
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Send a request with wrong state
+        {
+            let mut stream = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+            write!(
+                stream,
+                "GET /callback?code=code1&state=wrong_state HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            )
+            .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            assert!(
+                response.contains("403") || response.contains("State mismatch"),
+                "wrong state should be rejected, got: {response}"
+            );
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Now send the correct request
+        {
+            let mut stream = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+            write!(
+                stream,
+                "GET /callback?code=valid_code&state=correct_state HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            )
+            .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            assert!(response.contains("Authentication successful"));
+        }
+
+        let result = handle.join().unwrap();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "valid_code");
+    }
+
+    #[test]
+    fn callback_listener_rejects_malformed_then_accepts_valid() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let expected_state = "my_state";
+
+        let handle = std::thread::spawn(move || {
+            run_callback_listener(&listener, expected_state, std::time::Duration::from_secs(5))
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Send a malformed request
+        {
+            let mut stream = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+            write!(stream, "GARBAGE\r\n\r\n").unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            assert!(
+                response.contains("400") || response.contains("Invalid"),
+                "malformed should be rejected, got: {response}"
+            );
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Now send the correct request
+        {
+            let mut stream = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+            write!(
+                stream,
+                "GET /callback?code=good_code&state=my_state HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            )
+            .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            assert!(response.contains("Authentication successful"));
+        }
+
+        let result = handle.join().unwrap();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "good_code");
+    }
+
+    // -----------------------------------------------------------------------
+    // Auth login: inner function tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: set up a mock exchange server that returns specified auth tokens.
+    /// Returns (base_url, join_handle).
+    /// The mock server handles two sequential requests:
+    /// 1. POST /api/auth/exchange -> returns exchange response
+    /// 2. GET /api/keys -> returns key status
+    fn setup_mock_auth_server(
+        exchange_response: &str,
+        keys_response: Option<(u16, &str)>,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}");
+        let exchange_body = exchange_response.to_string();
+        let keys_resp = keys_response.map(|(s, b)| (s, b.to_string()));
+
+        let handle = std::thread::spawn(move || {
+            // Handle exchange request
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+            // Read request
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+
+            // Read headers to get content length
+            let mut content_length: usize = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim().is_empty() {
+                    break;
+                }
+                if let Some((key, value)) = line.split_once(':') {
+                    if key.trim().to_lowercase() == "content-length" {
+                        content_length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+            }
+            // Read body
+            let mut body_buf = vec![0u8; content_length];
+            if content_length > 0 {
+                reader.read_exact(&mut body_buf).unwrap();
+            }
+
+            // Send exchange response
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                exchange_body.len(),
+                exchange_body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            drop(stream);
+
+            // Handle keys request if expected
+            if let Some((status, body)) = keys_resp {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+                // Read request line and headers
+                let mut req_line = String::new();
+                reader.read_line(&mut req_line).unwrap();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                }
+
+                let status_text = if status == 200 {
+                    "OK"
+                } else if status == 404 {
+                    "Not Found"
+                } else {
+                    "Error"
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        (url, handle)
+    }
+
+    #[test]
+    #[serial]
+    fn auth_login_inner_already_authenticated_cancelled() {
+        let fake_home = TempDir::new().unwrap();
+        let config_path = fake_home
+            .path()
+            .join(".config")
+            .join("ai-session-commit-linker")
+            .join("config.toml");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        let existing_cfg = config::CliConfig {
+            token: Some("existing_token".to_string()),
+            github_login: Some("olduser".to_string()),
+            ..Default::default()
+        };
+        let toml_str = toml::to_string_pretty(&existing_cfg).unwrap();
+        std::fs::write(&config_path, &toml_str).unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+        let mut buf = Vec::new();
+        let result = run_auth_login_inner(
+            None,
+            &mut buf,
+            false,
+            Some(false), // Deny overwrite
+        );
+
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        assert!(result.is_ok());
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("Already authenticated as @olduser"),
+            "should show existing login, got: {output}"
+        );
+        assert!(
+            output.contains("Login cancelled."),
+            "should show cancellation, got: {output}"
+        );
+    }
+
+    /// Component integration test: listener + callback + exchange + persist + key check.
+    #[test]
+    #[serial]
+    fn auth_login_component_integration() {
+        use std::io::{Read, Write};
+
+        let fake_home = TempDir::new().unwrap();
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+        // Set up mock API server for exchange + key status
+        let (mock_url, server_handle) = setup_mock_auth_server(
+            r#"{"token":"tok_fresh","login":"newuser","expires_at":"2027-06-15T12:00:00Z"}"#,
+            Some((404, "")), // No active keys
+        );
+
+        // Bind a listener like the real flow does
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let nonce = generate_auth_nonce();
+        let nonce_clone = nonce.clone();
+
+        // Run listener in a background thread
+        let listener_handle = std::thread::spawn(move || {
+            run_callback_listener(&listener, &nonce_clone, std::time::Duration::from_secs(5))
+        });
+
+        // Simulate the browser callback
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        {
+            let mut stream = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+            write!(
+                stream,
+                "GET /callback?code=test_code_abc&state={nonce} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            )
+            .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            assert!(response.contains("Authentication successful"));
+        }
+
+        let code = listener_handle.join().unwrap().unwrap();
+        assert_eq!(code, "test_code_abc");
+
+        // Exchange the code and persist
+        let api_client = api_client::ApiClient::new(&mock_url, None);
+        let exchange_result = api_client.exchange_code(&code).unwrap();
+        assert_eq!(exchange_result.token, "tok_fresh");
+        assert_eq!(exchange_result.login, Some("newuser".to_string()));
+
+        let mut cfg = config::CliConfig::load().unwrap();
+        cfg.api_url = Some(mock_url.clone());
+        cfg.token = Some(exchange_result.token);
+        cfg.github_login = exchange_result.login;
+        cfg.expires_at = exchange_result.expires_at;
+        cfg.save().unwrap();
+
+        // Verify persisted config
+        let loaded = config::CliConfig::load().unwrap();
+        assert_eq!(loaded.token, Some("tok_fresh".to_string()));
+        assert_eq!(loaded.github_login, Some("newuser".to_string()));
+        assert_eq!(loaded.expires_at, Some("2027-06-15T12:00:00Z".to_string()));
+
+        // Check key status (no keys -> should suggest)
+        let mut buf = Vec::new();
+        check_post_login_key_status(&mock_url, &loaded, &mut buf, false);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("No encryption keys found."),
+            "should suggest key push, got: {output}"
+        );
+        assert!(
+            output.contains("Run 'keys push' to upload your private key."),
+            "should include push hint, got: {output}"
+        );
+
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        server_handle.join().ok();
+    }
+
+    #[test]
+    fn check_post_login_key_status_with_active_key() {
+        use std::io::{BufRead, BufReader, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            reader.read_line(&mut req_line).unwrap();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim().is_empty() {
+                    break;
+                }
+            }
+            let body = r#"{"fingerprint":"ABCD1234","created_at":"2025-01-01T00:00:00Z"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let cfg = config::CliConfig {
+            token: Some("tok_abc".to_string()),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        check_post_login_key_status(&url, &cfg, &mut buf, false);
+
+        handle.join().unwrap();
+
+        let output = String::from_utf8(buf).unwrap();
+        // Active key exists — should not show suggestion
+        assert!(
+            !output.contains("No encryption keys found"),
+            "should not suggest key push when key exists, got: {output}"
+        );
+    }
+
+    #[test]
+    fn check_post_login_key_status_server_error() {
+        use std::io::{BufRead, BufReader, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            reader.read_line(&mut req_line).unwrap();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim().is_empty() {
+                    break;
+                }
+            }
+            let body = r#"{"message":"Internal error"}"#;
+            let resp = format!(
+                "HTTP/1.1 500 Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let cfg = config::CliConfig {
+            token: Some("tok_abc".to_string()),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        check_post_login_key_status(&url, &cfg, &mut buf, false);
+
+        handle.join().unwrap();
+
+        let output = String::from_utf8(buf).unwrap();
+        // Server error — should warn but not crash
+        assert!(
+            output.contains("Could not check key status"),
+            "should warn about key check failure, got: {output}"
+        );
+    }
+
+    /// Test non-HTTPS warning by using an existing token + cancel path
+    /// to avoid reaching the listener/browser steps.
+    #[test]
+    #[serial]
+    fn auth_login_inner_non_https_warning() {
+        let fake_home = TempDir::new().unwrap();
+        let config_path = fake_home
+            .path()
+            .join(".config")
+            .join("ai-session-commit-linker")
+            .join("config.toml");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        let existing_cfg = config::CliConfig {
+            token: Some("tok".to_string()),
+            ..Default::default()
+        };
+        let toml_str = toml::to_string_pretty(&existing_cfg).unwrap();
+        std::fs::write(&config_path, &toml_str).unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+        let mut buf = Vec::new();
+        let _result = run_auth_login_inner(
+            Some("http://localhost:9999".to_string()),
+            &mut buf,
+            false,
+            Some(false), // Cancel to avoid listener
+        );
+
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("Using non-HTTPS API URL"),
+            "should warn about non-HTTPS, got: {output}"
+        );
+    }
+
+    /// Test that --api-url is persisted to config even when login is cancelled.
+    /// Uses already-authenticated + cancel to avoid the listener/browser steps.
+    #[test]
+    #[serial]
+    fn auth_login_inner_persists_api_url_override() {
+        let fake_home = TempDir::new().unwrap();
+        let config_path = fake_home
+            .path()
+            .join(".config")
+            .join("ai-session-commit-linker")
+            .join("config.toml");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        // Pre-populate with an existing token so we hit the confirmation path
+        let existing_cfg = config::CliConfig {
+            token: Some("existing_token".to_string()),
+            ..Default::default()
+        };
+        let toml_str = toml::to_string_pretty(&existing_cfg).unwrap();
+        std::fs::write(&config_path, &toml_str).unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+        let mut buf = Vec::new();
+        // Pass --api-url override and cancel the overwrite prompt
+        let _result = run_auth_login_inner(
+            Some("https://custom-api.example.com".to_string()),
+            &mut buf,
+            false,
+            Some(false), // Cancel
+        );
+
+        // Config should have the api_url persisted even though login was cancelled
+        let loaded = config::CliConfig::load().unwrap();
+
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        assert_eq!(
+            loaded.api_url,
+            Some("https://custom-api.example.com".to_string()),
+            "api_url should be persisted to config"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn auth_login_inner_already_authenticated_non_tty_fails() {
+        let fake_home = TempDir::new().unwrap();
+        let config_path = fake_home
+            .path()
+            .join(".config")
+            .join("ai-session-commit-linker")
+            .join("config.toml");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        let existing_cfg = config::CliConfig {
+            token: Some("existing_token".to_string()),
+            ..Default::default()
+        };
+        let toml_str = toml::to_string_pretty(&existing_cfg).unwrap();
+        std::fs::write(&config_path, &toml_str).unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+        let mut buf = Vec::new();
+        // is_tty=false and confirm_override=None should bail with error
+        let result = run_auth_login_inner(None, &mut buf, false, None);
+
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("Already authenticated"),
+            "should explain already authenticated, got: {msg}"
+        );
     }
 
     #[test]
