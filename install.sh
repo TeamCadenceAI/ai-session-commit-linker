@@ -5,8 +5,8 @@ REPO="TeamCadenceAI/cadence-cli"
 INSTALL_DIR="${HOME}/.local/bin"
 
 # Git config key constants for GPG encryption
-GPG_RECIPIENT_KEY="ai.session-commit-linker.gpg.recipient"
-GPG_KEY_SOURCE_KEY="ai.session-commit-linker.gpg.publicKeySource"
+GPG_RECIPIENT_KEY="ai.cadence.gpg.recipient"
+GPG_KEY_SOURCE_KEY="ai.cadence.gpg.publicKeySource"
 
 # --- Helper functions ---
 
@@ -100,7 +100,7 @@ print_gpg_manual_steps() {
         echo "  2. Import your public key: gpg --import <key-file>"
     fi
     if [ "$_recipient_done" = false ]; then
-        echo "  3. Run: ai-session-commit-linker gpg setup"
+        echo "  3. Run: cadence gpg setup"
     else
         echo "  GPG encryption is configured."
     fi
@@ -210,7 +210,7 @@ setup_gpg_encryption() {
     if [ "$PROMPT_RESULT" != "yes" ]; then
         echo ""
         echo "WARNING: Session logs will be stored as plaintext in git notes."
-        echo "Run 'ai-session-commit-linker gpg setup' to enable encryption later."
+        echo "Run 'cadence gpg setup' to enable encryption later."
         return 0
     fi
 
@@ -231,7 +231,7 @@ setup_gpg_encryption() {
         print_gpg_manual_steps "$_phases"
         echo ""
         echo "WARNING: Session logs will be stored as plaintext in git notes."
-        echo "Run 'ai-session-commit-linker gpg setup' to enable encryption later."
+        echo "Run 'cadence gpg setup' to enable encryption later."
         return 0
     fi
 
@@ -284,7 +284,7 @@ setup_gpg_encryption() {
     else
         echo ""
         echo "No recipient set. Session logs will be stored as plaintext."
-        echo "Run 'ai-session-commit-linker gpg setup' to configure later."
+        echo "Run 'cadence gpg setup' to configure later."
     fi
 }
 

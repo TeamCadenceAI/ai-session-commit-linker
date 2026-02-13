@@ -67,10 +67,10 @@ struct LspProcess {
 }
 
 fn api_log_dir(home: &Path) -> Option<PathBuf> {
-    if std::env::var("AI_SESSION_COMMIT_LINKER_DISABLE_ANTIGRAVITY_API").is_ok() {
+    if std::env::var("CADENCE_DISABLE_ANTIGRAVITY_API").is_ok() {
         return None;
     }
-    let debug = std::env::var("AI_SESSION_COMMIT_LINKER_ANTIGRAVITY_DEBUG").is_ok();
+    let debug = std::env::var("CADENCE_ANTIGRAVITY_DEBUG").is_ok();
 
     let cache_dir = api_cache_dir(home);
     if ensure_dir(&cache_dir).is_err() {
