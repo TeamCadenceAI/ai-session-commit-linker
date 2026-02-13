@@ -6209,11 +6209,7 @@ mod tests {
         std::fs::write(&pre_push_path, pre_push_hook_content()).unwrap();
 
         let global_config = fake_home.path().join("fake-global-gitconfig");
-        std::fs::write(
-            &global_config,
-            format!("[core]\n    hooksPath = {}\n", hooks_dir_str),
-        )
-        .unwrap();
+        std::fs::write(&global_config, "").unwrap();
 
         unsafe {
             std::env::set_var("HOME", fake_home.path());
@@ -6222,8 +6218,19 @@ mod tests {
 
         std::env::set_current_dir(repo_path).expect("failed to chdir");
 
+        // Configure hooksPath using git so Windows path escaping is handled.
+        std::process::Command::new("git")
+            .args(["config", "--global", "core.hooksPath", &hooks_dir_str])
+            .output()
+            .unwrap();
+
         let mut buf = Vec::new();
-        let result = run_status_inner(&mut buf);
+        let git_dir = repo_path.join(".git");
+        let result = with_env("GIT_DIR", git_dir.to_str().unwrap(), || {
+            with_env("GIT_WORK_TREE", repo_path.to_str().unwrap(), || {
+                run_status_inner(&mut buf)
+            })
+        });
         assert!(result.is_ok());
 
         let output = String::from_utf8(buf).unwrap();
