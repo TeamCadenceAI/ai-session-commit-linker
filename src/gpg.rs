@@ -866,8 +866,13 @@ mod tests {
 
         assert!(result.is_err(), "export of unknown key should fail");
         let msg = result.unwrap_err().to_string();
+        // On Windows the gpg-agent in an empty temp GNUPGHOME may emit
+        // passphrase/pinentry errors before reporting the key as missing,
+        // so we accept that error variant too.
         assert!(
-            msg.contains("Key not found") || msg.contains("gpg --export-secret-keys failed"),
+            msg.contains("Key not found")
+                || msg.contains("gpg --export-secret-keys failed")
+                || msg.contains("Key requires a passphrase"),
             "expected key-not-found error, got: {msg}"
         );
     }
