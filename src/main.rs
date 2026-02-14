@@ -1,4 +1,6 @@
 mod agents;
+mod api_client;
+mod config;
 mod git;
 mod gpg;
 mod note;
@@ -7,7 +9,7 @@ mod pending;
 mod push;
 mod scanner;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use dialoguer::{Confirm, Input, theme::ColorfulTheme};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
@@ -71,6 +73,18 @@ enum Command {
         #[command(subcommand)]
         gpg_command: GpgCommands,
     },
+
+    /// Authenticate with the AI Barometer API.
+    Auth {
+        #[command(subcommand)]
+        auth_command: AuthCommands,
+    },
+
+    /// Manage encryption keys on the AI Barometer API.
+    Keys {
+        #[command(subcommand)]
+        keys_command: Option<KeysCommands>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -112,6 +126,41 @@ enum GpgCommands {
     Status,
     /// Set up GPG encryption.
     Setup,
+}
+
+#[derive(Subcommand, Debug)]
+enum AuthCommands {
+    /// Authenticate with the AI Barometer API via browser-based GitHub OAuth.
+    Login {
+        /// Override the API base URL (default: production).
+        #[arg(long)]
+        api_url: Option<String>,
+    },
+    /// Remove stored API credentials.
+    Logout,
+    /// Show current authentication status.
+    Status,
+}
+
+#[derive(Subcommand, Debug)]
+enum KeysCommands {
+    /// Show encryption key status on the server.
+    Status,
+    /// Export and upload a GPG private key to the API.
+    Push {
+        /// GPG key ID or email to export (default: reads from git config).
+        #[arg(long)]
+        key: Option<String>,
+        /// Skip confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Test server-side decryption of an encrypted note.
+    Test {
+        /// GPG key ID or email to use for encryption (default: reads from git config).
+        #[arg(long)]
+        key: Option<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -2245,6 +2294,767 @@ fn persist_setup_config_with(
 }
 
 // ---------------------------------------------------------------------------
+// Auth login helpers
+// ---------------------------------------------------------------------------
+
+/// Generate a random 16-byte CSRF nonce as a 32-character lowercase hex string.
+fn generate_auth_nonce() -> String {
+    let mut bytes = [0u8; 16];
+    rand::fill(&mut bytes);
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Build the OAuth browser URL: `{api_url}/auth/token?port={port}&state={nonce}`.
+fn build_auth_browser_url(api_url: &str, port: u16, state: &str) -> String {
+    let base = api_url.trim_end_matches('/');
+    format!("{base}/auth/token?port={port}&state={state}")
+}
+
+/// Parsed callback request from the localhost listener.
+#[derive(Debug)]
+struct CallbackParams {
+    code: String,
+    state: String,
+}
+
+/// Parse an HTTP request line from the callback listener.
+///
+/// Enforces the strict callback contract: only `GET /callback?code=<...>&state=<...>`
+/// is accepted. Returns an error describing the rejection reason for any
+/// non-conforming request.
+fn parse_callback_request(request_line: &str) -> Result<CallbackParams> {
+    let parts: Vec<&str> = request_line.split_whitespace().collect();
+    if parts.len() < 2 {
+        anyhow::bail!("malformed request line");
+    }
+
+    let method = parts[0];
+    if method != "GET" {
+        anyhow::bail!("unexpected method: {method}");
+    }
+
+    // Parse the path + query using the url crate with a dummy base
+    let full_url = format!("http://localhost{}", parts[1]);
+    let parsed = url::Url::parse(&full_url).map_err(|e| anyhow::anyhow!("malformed URL: {e}"))?;
+
+    if parsed.path() != "/callback" {
+        anyhow::bail!("unexpected path: {}", parsed.path());
+    }
+
+    let mut code: Option<String> = None;
+    let mut state: Option<String> = None;
+
+    for (key, value) in parsed.query_pairs() {
+        match key.as_ref() {
+            "code" => code = Some(value.into_owned()),
+            "state" => state = Some(value.into_owned()),
+            _ => {} // Ignore extra params
+        }
+    }
+
+    let code = code.ok_or_else(|| anyhow::anyhow!("missing 'code' parameter"))?;
+    let state = state.ok_or_else(|| anyhow::anyhow!("missing 'state' parameter"))?;
+
+    if code.is_empty() {
+        anyhow::bail!("empty 'code' parameter");
+    }
+    if state.is_empty() {
+        anyhow::bail!("empty 'state' parameter");
+    }
+
+    Ok(CallbackParams { code, state })
+}
+
+/// HTTP response for a successful callback.
+const CALLBACK_SUCCESS_HTML: &str = "Authentication successful. You can close this tab.";
+
+/// Write an HTTP response to a TCP stream.
+fn write_http_response(
+    stream: &mut std::net::TcpStream,
+    status: u16,
+    status_text: &str,
+    body: &str,
+) {
+    use std::io::Write;
+    let response = format!(
+        "HTTP/1.1 {status} {status_text}\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
+}
+
+/// Run the localhost callback listener.
+///
+/// Binds to `127.0.0.1:0` (OS-assigned port), listens for up to `timeout`
+/// duration, and enforces the strict callback contract. Returns the OAuth
+/// authorization code on success.
+///
+/// - Malformed requests are rejected and the listener keeps serving.
+/// - State mismatches are rejected and the listener keeps serving.
+/// - Only a valid `GET /callback?code=<...>&state=<expected>` stops the listener.
+fn run_callback_listener(
+    listener: &std::net::TcpListener,
+    expected_state: &str,
+    timeout: std::time::Duration,
+) -> Result<String> {
+    use std::io::{BufRead, BufReader};
+
+    let deadline = std::time::Instant::now() + timeout;
+
+    // Set a short accept timeout for polling
+    listener.set_nonblocking(false)?;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!("Authentication timed out. Please try again.");
+        }
+
+        // Use a poll interval: accept with a short timeout then check deadline
+        let poll_interval = remaining.min(std::time::Duration::from_millis(500));
+        listener.set_nonblocking(false)?;
+        // We simulate timeout by setting SO_RCVTIMEO-like behavior via
+        // set_nonblocking + sleep to avoid platform-specific socket options.
+        listener.set_nonblocking(true)?;
+
+        let accept_result = listener.accept();
+        match accept_result {
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                std::thread::sleep(poll_interval);
+                continue;
+            }
+            Err(e) => {
+                // Transient accept error — log and keep listening
+                eprintln!("listener accept error: {e}");
+                continue;
+            }
+            Ok((mut stream, _addr)) => {
+                // Set a read timeout on the connection to avoid hanging on slow clients
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+
+                let mut reader = BufReader::new(stream.try_clone().unwrap_or_else(|_| {
+                    // If clone fails, we still have the original stream reference
+                    // This path is unlikely but handle gracefully
+                    stream.try_clone().expect("TCP stream clone failed")
+                }));
+
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() || request_line.is_empty() {
+                    write_http_response(&mut stream, 400, "Bad Request", "Bad request");
+                    continue;
+                }
+
+                match parse_callback_request(request_line.trim()) {
+                    Err(_) => {
+                        write_http_response(
+                            &mut stream,
+                            400,
+                            "Bad Request",
+                            "Invalid callback request",
+                        );
+                        continue;
+                    }
+                    Ok(params) => {
+                        if params.state != expected_state {
+                            write_http_response(&mut stream, 403, "Forbidden", "State mismatch");
+                            continue;
+                        }
+
+                        // Valid callback — send success response and return the code
+                        write_http_response(&mut stream, 200, "OK", CALLBACK_SUCCESS_HTML);
+                        return Ok(params.code);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Auth login command
+// ---------------------------------------------------------------------------
+
+/// Outer entry point for `auth login` — uses real stderr and TTY detection.
+fn run_auth_login(api_url: Option<String>) -> Result<()> {
+    let is_tty = output::is_stderr_tty();
+    run_auth_login_inner(
+        api_url,
+        &mut std::io::stderr(),
+        is_tty,
+        None, // real stdin for confirmation prompts
+    )
+}
+
+/// Inner implementation of `auth login` for testability.
+///
+/// `confirm_override`: if `Some(bool)`, skips interactive prompt and uses
+/// the provided value for the already-authenticated confirmation. If `None`,
+/// uses interactive prompt (or fails in non-TTY mode).
+fn run_auth_login_inner(
+    api_url: Option<String>,
+    w: &mut dyn std::io::Write,
+    is_tty: bool,
+    confirm_override: Option<bool>,
+) -> Result<()> {
+    // Step 1: Load config
+    let mut cfg = config::CliConfig::load()?;
+
+    // Step 2: Resolve API URL
+    let resolved = cfg.resolve_api_url(api_url.as_deref());
+    if resolved.is_non_https {
+        output::note_to_with_tty(
+            w,
+            &format!("Using non-HTTPS API URL: {}", resolved.url),
+            is_tty,
+        );
+    }
+
+    // Persist API URL if CLI override was provided
+    if api_url.is_some() {
+        cfg.api_url = Some(resolved.url.clone());
+        cfg.save()?;
+    }
+
+    // Step 3: Already-authenticated guard
+    if cfg.token.is_some() {
+        let login_display = cfg.github_login.as_deref().unwrap_or("(unknown)");
+        output::note_to_with_tty(
+            w,
+            &format!("Already authenticated as @{login_display}."),
+            is_tty,
+        );
+
+        let confirmed = match confirm_override {
+            Some(v) => v,
+            None => {
+                if !is_tty {
+                    anyhow::bail!(
+                        "Already authenticated. Use --api-url or re-run interactively to overwrite."
+                    );
+                }
+                let result =
+                    dialoguer::Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default())
+                        .with_prompt("Overwrite existing credentials?")
+                        .default(false)
+                        .interact();
+                match result {
+                    Ok(v) => v,
+                    Err(dialoguer::Error::IO(err))
+                        if err.kind() == std::io::ErrorKind::UnexpectedEof =>
+                    {
+                        false
+                    }
+                    Err(err) => return Err(err.into()),
+                }
+            }
+        };
+
+        if !confirmed {
+            output::action_to_with_tty(w, "Login cancelled.", "", is_tty);
+            return Ok(());
+        }
+    }
+
+    // Step 4: Bind localhost listener
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .context("failed to bind localhost listener for OAuth callback")?;
+    let port = listener.local_addr()?.port();
+
+    // Step 5: Generate nonce and build browser URL
+    let nonce = generate_auth_nonce();
+    let browser_url = build_auth_browser_url(&resolved.url, port, &nonce);
+
+    // Step 6: Open browser
+    output::action_to_with_tty(
+        w,
+        "Opening browser",
+        &format!("for authentication on port {port}..."),
+        is_tty,
+    );
+    if let Err(e) = open::that(&browser_url) {
+        output::fail_to_with_tty(
+            w,
+            "Failed to open browser.",
+            &format!("Please open this URL manually:\n  {browser_url}"),
+            is_tty,
+        );
+        // Log the underlying error but don't fail — user can still open manually
+        let _ = writeln!(w, "  (error: {e})");
+    }
+
+    // Step 7: Wait for callback
+    output::detail_to_with_tty(w, "Waiting for authentication callback...", is_tty);
+    let code = run_callback_listener(
+        &listener,
+        &nonce,
+        std::time::Duration::from_secs(300), // 5 minutes
+    )?;
+
+    // Step 8: Exchange code for token
+    let api_client = api_client::ApiClient::new(&resolved.url, None);
+    let exchange_result = api_client.exchange_code(&code)?;
+
+    // Step 9: Persist credentials
+    cfg.token = Some(exchange_result.token);
+    cfg.github_login = exchange_result.login.clone();
+    cfg.expires_at = exchange_result.expires_at.clone();
+    cfg.save()?;
+
+    let login_display = exchange_result.login.as_deref().unwrap_or("(unknown)");
+    output::success_to_with_tty(w, &format!("Authenticated as @{login_display}"), "", is_tty);
+
+    // Step 10: Check for existing keys (non-fatal)
+    check_post_login_key_status(&resolved.url, &cfg, w, is_tty);
+
+    Ok(())
+}
+
+/// Check for existing encryption keys after login and emit a suggestion if none found.
+///
+/// This is a best-effort check — network failures are warned but do not fail the login.
+fn check_post_login_key_status(
+    api_url: &str,
+    cfg: &config::CliConfig,
+    w: &mut dyn std::io::Write,
+    is_tty: bool,
+) {
+    let token = match &cfg.token {
+        Some(t) => t.clone(),
+        None => return, // Should not happen after successful login
+    };
+
+    let client = api_client::ApiClient::new(api_url, Some(token));
+    match client.get_key_status() {
+        Ok(Some(_key)) => {
+            // Active key exists — no suggestion needed
+        }
+        Ok(None) => {
+            output::action_to_with_tty(
+                w,
+                "No encryption keys found.",
+                "Run 'keys push' to upload your private key.",
+                is_tty,
+            );
+        }
+        Err(e) => {
+            output::note_to_with_tty(w, &format!("Could not check key status: {e}"), is_tty);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Auth & Keys stub handlers
+// ---------------------------------------------------------------------------
+
+fn run_auth_logout() -> Result<()> {
+    let is_tty = output::is_stderr_tty();
+    run_auth_logout_inner(&mut std::io::stderr(), is_tty)
+}
+
+/// Inner implementation of `auth logout` that writes to the provided writer.
+///
+/// Flow:
+/// 1. Load config and check for existing token.
+/// 2. If no token, print "Not currently authenticated." and return.
+/// 3. Attempt server-side token revocation (best-effort).
+/// 4. Always clear local credentials regardless of revocation outcome.
+/// 5. Print success or warning message.
+fn run_auth_logout_inner(w: &mut dyn std::io::Write, is_tty: bool) -> Result<()> {
+    let mut cfg = config::CliConfig::load()?;
+
+    // No token → not authenticated
+    if cfg.token.is_none() {
+        output::action_to_with_tty(w, "Not currently authenticated.", "", is_tty);
+        return Ok(());
+    }
+
+    // Resolve API URL and attempt server-side revocation
+    let resolved = cfg.resolve_api_url(None);
+    let token = cfg.token.clone().unwrap(); // safe: checked above
+    let client = api_client::ApiClient::new(&resolved.url, Some(token));
+
+    let revoke_result = client.revoke_token();
+
+    // Always clear local credentials, regardless of revocation outcome
+    cfg.clear_token()?;
+
+    // Classify the revocation result and print appropriate message
+    match revoke_result {
+        Ok(()) => {
+            output::success_to_with_tty(w, "Logged out and token revoked.", "", is_tty);
+        }
+        Err(ref err) => {
+            let err_msg = format!("{err:#}");
+            if is_connection_error(&err_msg) {
+                output::action_to_with_tty(
+                    w,
+                    "Logged out.",
+                    "Warning: could not reach server to revoke token.",
+                    is_tty,
+                );
+            } else {
+                // Non-transport API error (e.g. 401, 500) — still cleaned up locally
+                output::success_to_with_tty(w, "Logged out.", "", is_tty);
+                output::note_to_with_tty(
+                    w,
+                    &format!("Server-side revocation failed: {err_msg}"),
+                    is_tty,
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Classify whether an error message indicates a transport/connectivity failure
+/// (DNS resolution, connection refused, timeout) vs an application-level HTTP error.
+fn is_connection_error(err_msg: &str) -> bool {
+    let lower = err_msg.to_lowercase();
+    lower.contains("failed to connect")
+        || lower.contains("connection refused")
+        || lower.contains("dns error")
+        || lower.contains("timed out")
+        || lower.contains("no route to host")
+}
+
+fn run_auth_status() -> Result<()> {
+    let is_tty = output::is_stderr_tty();
+    run_auth_status_inner(&mut std::io::stderr(), is_tty)
+}
+
+/// Inner implementation of `auth status` that writes to the provided writer.
+///
+/// This is purely local — it reads from `CliConfig::load()` only and never
+/// constructs API clients or makes network requests.
+fn run_auth_status_inner(w: &mut dyn std::io::Write, is_tty: bool) -> Result<()> {
+    let cfg = config::CliConfig::load()?;
+
+    if cfg.token.is_some() {
+        let api_url = cfg.api_url.as_deref().unwrap_or(config::DEFAULT_API_URL);
+        let login = cfg.github_login.as_deref().unwrap_or("(unknown)");
+        let expires = cfg.expires_at.as_deref().unwrap_or("(unknown)");
+
+        output::success_to_with_tty(w, "Authenticated", "", is_tty);
+        output::detail_to_with_tty(w, &format!("API URL: {api_url}"), is_tty);
+        output::detail_to_with_tty(w, &format!("GitHub login: {login}"), is_tty);
+        output::detail_to_with_tty(w, &format!("Token expires: {expires}"), is_tty);
+    } else {
+        output::action_to_with_tty(
+            w,
+            "Not authenticated.",
+            "Run 'auth login' to connect.",
+            is_tty,
+        );
+    }
+
+    Ok(())
+}
+
+fn run_keys_status() -> Result<()> {
+    let is_tty = output::is_stderr_tty();
+    run_keys_status_inner(&mut std::io::stderr(), is_tty)
+}
+
+/// Inner implementation of `keys status` that writes to the provided writer.
+///
+/// Flow:
+/// 1. Load config and check for existing token (FR-7).
+/// 2. If no token, print helpful error and return.
+/// 3. Resolve API URL and call `GET /api/keys`.
+/// 4. Print key fingerprint + upload date, or "no key" message.
+fn run_keys_status_inner(w: &mut dyn std::io::Write, is_tty: bool) -> Result<()> {
+    let cfg = config::CliConfig::load()?;
+
+    let token = match &cfg.token {
+        Some(t) if !t.trim().is_empty() => t.clone(),
+        _ => {
+            output::action_to_with_tty(
+                w,
+                "Not currently authenticated.",
+                "Run `cadence auth login` first.",
+                is_tty,
+            );
+            return Ok(());
+        }
+    };
+
+    let resolved = cfg.resolve_api_url(None);
+    let client = api_client::ApiClient::new(&resolved.url, Some(token));
+
+    match client.get_key_status() {
+        Ok(Some(key)) => {
+            let date_display = match &key.created_at {
+                Some(ts) => format_api_date(ts),
+                None => "(unknown date)".to_string(),
+            };
+            output::success_to_with_tty(
+                w,
+                &format!(
+                    "Key uploaded: {} (uploaded {})",
+                    key.fingerprint, date_display
+                ),
+                "",
+                is_tty,
+            );
+        }
+        Ok(None) => {
+            output::action_to_with_tty(
+                w,
+                "No encryption key uploaded.",
+                "Run 'keys push' to upload one.",
+                is_tty,
+            );
+        }
+        Err(e) => {
+            output::fail_to_with_tty(w, "Failed to check key status", &format!("{e:#}"), is_tty);
+        }
+    }
+
+    Ok(())
+}
+
+/// Format an API date string (expected RFC 3339) to a user-friendly `YYYY-MM-DD` form.
+///
+/// Falls back to the raw trimmed input if parsing fails.
+fn format_api_date(raw: &str) -> String {
+    use time::format_description::well_known::Rfc3339;
+    match time::OffsetDateTime::parse(raw, &Rfc3339) {
+        Ok(dt) => {
+            let (year, month, day) = (dt.year(), dt.month() as u8, dt.day());
+            format!("{year:04}-{month:02}-{day:02}")
+        }
+        Err(_) => raw.trim().to_string(),
+    }
+}
+
+fn run_keys_push(key: Option<String>, yes: bool) -> Result<()> {
+    let is_tty = output::is_stderr_tty();
+    run_keys_push_inner(key, yes, &mut std::io::stderr(), is_tty, None)
+}
+
+/// Inner implementation of `keys push` that writes to the provided writer.
+///
+/// Flow:
+/// 1. Load config and check for existing token (FR-7).
+/// 2. Resolve key identifier (--key flag or git config fallback).
+/// 3. Export armored private key from GPG keyring.
+/// 4. Extract key fingerprint.
+/// 5. Generate encrypted test message for server-side validation.
+/// 6. Prompt for confirmation (unless --yes).
+/// 7. Push key to API.
+///
+/// `confirm_override` allows tests to inject a confirmation answer without TTY input.
+fn run_keys_push_inner(
+    key: Option<String>,
+    yes: bool,
+    w: &mut dyn std::io::Write,
+    is_tty: bool,
+    confirm_override: Option<bool>,
+) -> Result<()> {
+    // 1. Auth gate: load config, verify token
+    let cfg = config::CliConfig::load()?;
+    let token = match &cfg.token {
+        Some(t) if !t.trim().is_empty() => t.clone(),
+        _ => {
+            output::action_to_with_tty(
+                w,
+                "Not currently authenticated.",
+                "Run `cadence auth login` first.",
+                is_tty,
+            );
+            return Ok(());
+        }
+    };
+    let resolved = cfg.resolve_api_url(None);
+
+    // 2. Resolve key identifier: --key flag, else git config recipient
+    let key_id = resolve_local_key_id(key)?;
+
+    // 3. Export armored private key
+    let armored_private_key =
+        gpg::export_secret_key(&key_id).context("Failed to export private key from GPG keyring")?;
+
+    // 4. Extract fingerprint
+    let fingerprint = gpg::get_fingerprint(&key_id).context("Failed to extract key fingerprint")?;
+
+    // 5. Generate encrypted test message
+    let challenge: String = {
+        use rand::Rng;
+        rand::rng()
+            .sample_iter(&rand::distr::Alphanumeric)
+            .take(32)
+            .map(char::from)
+            .collect()
+    };
+    let test_encrypted_message = gpg::encrypt_to_recipient(&challenge, &fingerprint)
+        .context("Unable to encrypt test message with selected key")?;
+
+    // 6. Confirmation prompt
+    let confirmed = if yes {
+        true
+    } else if let Some(override_val) = confirm_override {
+        override_val
+    } else {
+        output::action_to_with_tty(
+            w,
+            &format!(
+                "About to upload private key {} to {}. Continue? [y/N]",
+                fingerprint, resolved.url
+            ),
+            "",
+            is_tty,
+        );
+        if is_tty {
+            Confirm::with_theme(&ColorfulTheme::default())
+                .with_prompt("Continue?")
+                .default(false)
+                .interact()
+                .unwrap_or(false)
+        } else {
+            false
+        }
+    };
+
+    if !confirmed {
+        output::action_to_with_tty(w, "Upload cancelled.", "", is_tty);
+        return Ok(());
+    }
+
+    // 7. Push key to API
+    let client = api_client::ApiClient::new(&resolved.url, Some(token));
+    match client.push_key(&fingerprint, &armored_private_key, &test_encrypted_message) {
+        Ok(_resp) => {
+            output::success_to_with_tty(
+                w,
+                &format!(
+                    "Key {} uploaded successfully. Previous active keys have been superseded.",
+                    fingerprint
+                ),
+                "",
+                is_tty,
+            );
+        }
+        Err(e) => {
+            let err_msg = format!("{e:#}");
+            output::fail_to_with_tty(w, "Failed to push key", &err_msg, is_tty);
+        }
+    }
+
+    Ok(())
+}
+
+/// Resolve a GPG key identifier from a CLI `--key` override or git config fallback.
+///
+/// Precedence:
+/// 1. `--key` flag value (trimmed; blank is rejected).
+/// 2. `gpg::get_recipient()` from git config.
+/// 3. Error with remediation message.
+///
+/// Used by both `keys push` and `keys test` to ensure identical behavior.
+fn resolve_local_key_id(key_override: Option<String>) -> Result<String> {
+    match key_override {
+        Some(k) => {
+            let trimmed = k.trim().to_string();
+            if trimmed.is_empty() {
+                anyhow::bail!(
+                    "No key specified. Use --key <ID> or set git config ai.cadence.gpg.recipient."
+                );
+            }
+            Ok(trimmed)
+        }
+        None => match gpg::get_recipient()? {
+            Some(r) => Ok(r),
+            None => {
+                anyhow::bail!(
+                    "No key specified. Use --key <ID> or set git config ai.cadence.gpg.recipient."
+                );
+            }
+        },
+    }
+}
+
+fn run_keys_test(key: Option<String>) -> Result<()> {
+    let is_tty = output::is_stderr_tty();
+    run_keys_test_inner(&mut std::io::stderr(), is_tty, key)
+}
+
+/// Inner implementation of `keys test` that writes to the provided writer.
+///
+/// Flow:
+/// 1. Load config and check for existing token (FR-7).
+/// 2. Resolve key identifier (--key flag or git config fallback).
+/// 3. Generate random challenge and encrypt locally.
+/// 4. Send encrypted message to API for server-side decryption test.
+/// 5. Print success or failure message.
+fn run_keys_test_inner(
+    w: &mut dyn std::io::Write,
+    is_tty: bool,
+    key_override: Option<String>,
+) -> Result<()> {
+    // 1. Auth gate: load config, verify token
+    let cfg = config::CliConfig::load()?;
+    let token = match &cfg.token {
+        Some(t) if !t.trim().is_empty() => t.clone(),
+        _ => {
+            output::action_to_with_tty(
+                w,
+                "Not currently authenticated.",
+                "Run `cadence auth login` first.",
+                is_tty,
+            );
+            return Ok(());
+        }
+    };
+    let resolved = cfg.resolve_api_url(None);
+
+    // 2. Resolve key identifier
+    let key_id = resolve_local_key_id(key_override)?;
+
+    // 3. Generate random challenge and encrypt locally
+    let challenge: String = {
+        use rand::Rng;
+        rand::rng()
+            .sample_iter(&rand::distr::Alphanumeric)
+            .take(32)
+            .map(char::from)
+            .collect()
+    };
+    let encrypted_message = gpg::encrypt_to_recipient(&challenge, &key_id)
+        .context("Unable to encrypt test message with selected key")?;
+
+    // 4. Send to API
+    let client = api_client::ApiClient::new(&resolved.url, Some(token));
+    match client.test_key(&encrypted_message) {
+        Ok(resp) => {
+            if resp.success {
+                output::success_to_with_tty(
+                    w,
+                    "Key verification passed. The server can decrypt notes encrypted with this key.",
+                    "",
+                    is_tty,
+                );
+            } else {
+                let reason = resp
+                    .message
+                    .unwrap_or_else(|| "Unknown failure reason".to_string());
+                output::fail_to_with_tty(w, "Key verification failed", &reason, is_tty);
+            }
+        }
+        Err(e) => {
+            let err_msg = format!("{e:#}");
+            output::fail_to_with_tty(w, "Failed to verify key decryption", &err_msg, is_tty);
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -2273,6 +3083,16 @@ fn main() {
             GpgCommands::Status => run_gpg_status(),
             GpgCommands::Setup => run_gpg_setup(),
         },
+        Command::Auth { auth_command } => match auth_command {
+            AuthCommands::Login { api_url } => run_auth_login(api_url),
+            AuthCommands::Logout => run_auth_logout(),
+            AuthCommands::Status => run_auth_status(),
+        },
+        Command::Keys { keys_command } => match keys_command.unwrap_or(KeysCommands::Status) {
+            KeysCommands::Status => run_keys_status(),
+            KeysCommands::Push { key, yes } => run_keys_push(key, yes),
+            KeysCommands::Test { key } => run_keys_test(key),
+        },
     };
 
     if let Err(e) = result {
@@ -2289,6 +3109,7 @@ fn main() {
 mod tests {
     use super::*;
     use crate::agents::app_config_dir_in;
+    use clap::CommandFactory;
     use std::path::PathBuf;
     use time::OffsetDateTime;
     use time::format_description::well_known::Rfc3339;
@@ -2679,6 +3500,3417 @@ mod tests {
     fn cli_rejects_no_subcommand() {
         let result = Cli::try_parse_from(["cadence"]);
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Auth & Keys CLI parsing tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cli_parses_auth_login() {
+        let cli = Cli::parse_from(["cadence", "auth", "login"]);
+        match cli.command {
+            Command::Auth { auth_command } => match auth_command {
+                AuthCommands::Login { api_url } => assert!(api_url.is_none()),
+                _ => panic!("expected Login command"),
+            },
+            _ => panic!("expected Auth command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_auth_login_with_api_url() {
+        let cli = Cli::parse_from([
+            "cadence",
+            "auth",
+            "login",
+            "--api-url",
+            "https://example.com",
+        ]);
+        match cli.command {
+            Command::Auth { auth_command } => match auth_command {
+                AuthCommands::Login { api_url } => {
+                    assert_eq!(api_url.as_deref(), Some("https://example.com"));
+                }
+                _ => panic!("expected Login command"),
+            },
+            _ => panic!("expected Auth command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_auth_logout() {
+        let cli = Cli::parse_from(["cadence", "auth", "logout"]);
+        assert!(matches!(
+            cli.command,
+            Command::Auth {
+                auth_command: AuthCommands::Logout
+            }
+        ));
+    }
+
+    #[test]
+    fn cli_parses_auth_status() {
+        let cli = Cli::parse_from(["cadence", "auth", "status"]);
+        assert!(matches!(
+            cli.command,
+            Command::Auth {
+                auth_command: AuthCommands::Status
+            }
+        ));
+    }
+
+    #[test]
+    fn cli_rejects_auth_without_subcommand() {
+        let result = Cli::try_parse_from(["cadence", "auth"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cli_parses_keys_status() {
+        let cli = Cli::parse_from(["cadence", "keys", "status"]);
+        assert!(matches!(
+            cli.command,
+            Command::Keys {
+                keys_command: Some(KeysCommands::Status)
+            }
+        ));
+    }
+
+    #[test]
+    fn cli_parses_keys_push_no_flags() {
+        let cli = Cli::parse_from(["cadence", "keys", "push"]);
+        match cli.command {
+            Command::Keys {
+                keys_command: Some(KeysCommands::Push { key, yes }),
+            } => {
+                assert!(key.is_none());
+                assert!(!yes);
+            }
+            _ => panic!("expected Keys Push command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_keys_push_with_key() {
+        let cli = Cli::parse_from(["cadence", "keys", "push", "--key", "/tmp/private.key"]);
+        match cli.command {
+            Command::Keys {
+                keys_command: Some(KeysCommands::Push { key, yes }),
+            } => {
+                assert_eq!(key.as_deref(), Some("/tmp/private.key"));
+                assert!(!yes);
+            }
+            _ => panic!("expected Keys Push command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_keys_push_with_yes() {
+        let cli = Cli::parse_from(["cadence", "keys", "push", "--yes"]);
+        match cli.command {
+            Command::Keys {
+                keys_command: Some(KeysCommands::Push { key, yes }),
+            } => {
+                assert!(key.is_none());
+                assert!(yes);
+            }
+            _ => panic!("expected Keys Push command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_keys_push_with_all_flags() {
+        let cli = Cli::parse_from([
+            "cadence",
+            "keys",
+            "push",
+            "--key",
+            "/tmp/private.key",
+            "--yes",
+        ]);
+        match cli.command {
+            Command::Keys {
+                keys_command: Some(KeysCommands::Push { key, yes }),
+            } => {
+                assert_eq!(key.as_deref(), Some("/tmp/private.key"));
+                assert!(yes);
+            }
+            _ => panic!("expected Keys Push command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_keys_test() {
+        let cli = Cli::parse_from(["cadence", "keys", "test"]);
+        assert!(matches!(
+            cli.command,
+            Command::Keys {
+                keys_command: Some(KeysCommands::Test { key: None })
+            }
+        ));
+    }
+
+    #[test]
+    fn cli_parses_keys_test_with_key() {
+        let cli = Cli::parse_from(["cadence", "keys", "test", "--key", "test@example.com"]);
+        match cli.command {
+            Command::Keys {
+                keys_command: Some(KeysCommands::Test { key }),
+            } => assert_eq!(key.as_deref(), Some("test@example.com")),
+            _ => panic!("expected Keys Test with key"),
+        }
+    }
+
+    #[test]
+    fn cli_keys_defaults_to_status() {
+        let cli = Cli::parse_from(["cadence", "keys"]);
+        assert!(
+            matches!(cli.command, Command::Keys { keys_command: None }),
+            "bare 'cadence keys' should parse successfully with no subcommand"
+        );
+        // Dispatch will default None to KeysCommands::Status via unwrap_or.
+    }
+
+    // -----------------------------------------------------------------------
+    // Auth login: nonce generation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn nonce_is_32_char_hex() {
+        let nonce = generate_auth_nonce();
+        assert_eq!(
+            nonce.len(),
+            32,
+            "nonce should be 32 chars, got {}",
+            nonce.len()
+        );
+        assert!(
+            nonce.chars().all(|c| c.is_ascii_hexdigit()),
+            "nonce should be hex only, got: {}",
+            nonce
+        );
+        // Should be lowercase
+        assert_eq!(nonce, nonce.to_lowercase(), "nonce should be lowercase hex");
+    }
+
+    #[test]
+    fn nonce_is_unique_across_invocations() {
+        let a = generate_auth_nonce();
+        let b = generate_auth_nonce();
+        assert_ne!(a, b, "two nonces should differ");
+    }
+
+    // -----------------------------------------------------------------------
+    // Auth login: browser URL builder tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_auth_browser_url_basic() {
+        let url = build_auth_browser_url("https://app.example.com", 12345, "abc123");
+        assert_eq!(
+            url,
+            "https://app.example.com/auth/token?port=12345&state=abc123"
+        );
+    }
+
+    #[test]
+    fn build_auth_browser_url_strips_trailing_slash() {
+        let url = build_auth_browser_url("https://app.example.com/", 8080, "nonce");
+        assert_eq!(
+            url,
+            "https://app.example.com/auth/token?port=8080&state=nonce"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Auth login: callback parser tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_callback_valid() {
+        let result = parse_callback_request("GET /callback?code=abc123&state=xyz789 HTTP/1.1");
+        assert!(result.is_ok());
+        let params = result.unwrap();
+        assert_eq!(params.code, "abc123");
+        assert_eq!(params.state, "xyz789");
+    }
+
+    #[test]
+    fn parse_callback_rejects_post_method() {
+        let result = parse_callback_request("POST /callback?code=abc&state=xyz HTTP/1.1");
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("unexpected method"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_callback_rejects_wrong_path() {
+        let result = parse_callback_request("GET /other?code=abc&state=xyz HTTP/1.1");
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("unexpected path"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_callback_rejects_missing_code() {
+        let result = parse_callback_request("GET /callback?state=xyz HTTP/1.1");
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("missing 'code'"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_callback_rejects_missing_state() {
+        let result = parse_callback_request("GET /callback?code=abc HTTP/1.1");
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("missing 'state'"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_callback_rejects_no_query() {
+        let result = parse_callback_request("GET /callback HTTP/1.1");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_callback_rejects_empty_code() {
+        let result = parse_callback_request("GET /callback?code=&state=xyz HTTP/1.1");
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("empty 'code'"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_callback_rejects_empty_state() {
+        let result = parse_callback_request("GET /callback?code=abc&state= HTTP/1.1");
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("empty 'state'"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_callback_rejects_malformed_line() {
+        let result = parse_callback_request("GARBAGE");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_callback_rejects_empty_line() {
+        let result = parse_callback_request("");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_callback_handles_url_encoded_values() {
+        let result =
+            parse_callback_request("GET /callback?code=abc%20def&state=xyz%3D123 HTTP/1.1");
+        assert!(result.is_ok());
+        let params = result.unwrap();
+        assert_eq!(params.code, "abc def");
+        assert_eq!(params.state, "xyz=123");
+    }
+
+    #[test]
+    fn parse_callback_ignores_extra_params() {
+        let result =
+            parse_callback_request("GET /callback?code=abc&state=xyz&extra=ignored HTTP/1.1");
+        assert!(result.is_ok());
+        let params = result.unwrap();
+        assert_eq!(params.code, "abc");
+        assert_eq!(params.state, "xyz");
+    }
+
+    // -----------------------------------------------------------------------
+    // Auth login: callback listener tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn callback_listener_timeout() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let result = run_callback_listener(
+            &listener,
+            "test_state",
+            std::time::Duration::from_millis(100),
+        );
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("Authentication timed out. Please try again."),
+            "expected timeout message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn callback_listener_valid_callback() {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let state = "test_nonce_abc";
+
+        let handle = std::thread::spawn(move || {
+            run_callback_listener(&listener, state, std::time::Duration::from_secs(5))
+        });
+
+        // Give listener a moment to start
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Send a valid callback request
+        let mut stream = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+        write!(
+            stream,
+            "GET /callback?code=auth_code_123&state={state} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        )
+        .unwrap();
+
+        // Read response
+        let mut response = String::new();
+        use std::io::Read;
+        stream.read_to_string(&mut response).unwrap();
+        assert!(
+            response.contains("Authentication successful"),
+            "expected success HTML, got: {response}"
+        );
+
+        let result = handle.join().unwrap();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "auth_code_123");
+    }
+
+    #[test]
+    fn callback_listener_rejects_state_mismatch_then_accepts_valid() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let expected_state = "correct_state";
+
+        let handle = std::thread::spawn(move || {
+            run_callback_listener(&listener, expected_state, std::time::Duration::from_secs(5))
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Send a request with wrong state
+        {
+            let mut stream = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+            write!(
+                stream,
+                "GET /callback?code=code1&state=wrong_state HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            )
+            .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            assert!(
+                response.contains("403") || response.contains("State mismatch"),
+                "wrong state should be rejected, got: {response}"
+            );
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Now send the correct request
+        {
+            let mut stream = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+            write!(
+                stream,
+                "GET /callback?code=valid_code&state=correct_state HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            )
+            .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            assert!(response.contains("Authentication successful"));
+        }
+
+        let result = handle.join().unwrap();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "valid_code");
+    }
+
+    #[test]
+    fn callback_listener_rejects_malformed_then_accepts_valid() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let expected_state = "my_state";
+
+        let handle = std::thread::spawn(move || {
+            run_callback_listener(&listener, expected_state, std::time::Duration::from_secs(5))
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Send a malformed request
+        {
+            let mut stream = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+            write!(stream, "GARBAGE\r\n\r\n").unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            assert!(
+                response.contains("400") || response.contains("Invalid"),
+                "malformed should be rejected, got: {response}"
+            );
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Now send the correct request
+        {
+            let mut stream = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+            write!(
+                stream,
+                "GET /callback?code=good_code&state=my_state HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            )
+            .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            assert!(response.contains("Authentication successful"));
+        }
+
+        let result = handle.join().unwrap();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "good_code");
+    }
+
+    // -----------------------------------------------------------------------
+    // Auth login: inner function tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: set up a mock exchange server that returns specified auth tokens.
+    /// Returns (base_url, join_handle).
+    /// The mock server handles two sequential requests:
+    /// 1. POST /api/auth/exchange -> returns exchange response
+    /// 2. GET /api/keys -> returns key status
+    fn setup_mock_auth_server(
+        exchange_response: &str,
+        keys_response: Option<(u16, &str)>,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}");
+        let exchange_body = exchange_response.to_string();
+        let keys_resp = keys_response.map(|(s, b)| (s, b.to_string()));
+
+        let handle = std::thread::spawn(move || {
+            // Handle exchange request
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+            // Read request
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+
+            // Read headers to get content length
+            let mut content_length: usize = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim().is_empty() {
+                    break;
+                }
+                if let Some((key, value)) = line.split_once(':') {
+                    if key.trim().to_lowercase() == "content-length" {
+                        content_length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+            }
+            // Read body
+            let mut body_buf = vec![0u8; content_length];
+            if content_length > 0 {
+                reader.read_exact(&mut body_buf).unwrap();
+            }
+
+            // Send exchange response
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                exchange_body.len(),
+                exchange_body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            drop(stream);
+
+            // Handle keys request if expected
+            if let Some((status, body)) = keys_resp {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+                // Read request line and headers
+                let mut req_line = String::new();
+                reader.read_line(&mut req_line).unwrap();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                }
+
+                let status_text = if status == 200 {
+                    "OK"
+                } else if status == 404 {
+                    "Not Found"
+                } else {
+                    "Error"
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        (url, handle)
+    }
+
+    #[test]
+    #[serial]
+    fn auth_login_inner_already_authenticated_cancelled() {
+        let fake_home = TempDir::new().unwrap();
+        let config_path = fake_home
+            .path()
+            .join(".config")
+            .join("ai-session-commit-linker")
+            .join("config.toml");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        let existing_cfg = config::CliConfig {
+            token: Some("existing_token".to_string()),
+            github_login: Some("olduser".to_string()),
+            ..Default::default()
+        };
+        let toml_str = toml::to_string_pretty(&existing_cfg).unwrap();
+        std::fs::write(&config_path, &toml_str).unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+        let mut buf = Vec::new();
+        let result = run_auth_login_inner(
+            None,
+            &mut buf,
+            false,
+            Some(false), // Deny overwrite
+        );
+
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        assert!(result.is_ok());
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("Already authenticated as @olduser"),
+            "should show existing login, got: {output}"
+        );
+        assert!(
+            output.contains("Login cancelled."),
+            "should show cancellation, got: {output}"
+        );
+    }
+
+    /// Component integration test: listener + callback + exchange + persist + key check.
+    #[test]
+    #[serial]
+    fn auth_login_component_integration() {
+        use std::io::{Read, Write};
+
+        let fake_home = TempDir::new().unwrap();
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+        // Set up mock API server for exchange + key status
+        let (mock_url, server_handle) = setup_mock_auth_server(
+            r#"{"token":"tok_fresh","login":"newuser","expires_at":"2027-06-15T12:00:00Z"}"#,
+            Some((404, "")), // No active keys
+        );
+
+        // Bind a listener like the real flow does
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let nonce = generate_auth_nonce();
+        let nonce_clone = nonce.clone();
+
+        // Run listener in a background thread
+        let listener_handle = std::thread::spawn(move || {
+            run_callback_listener(&listener, &nonce_clone, std::time::Duration::from_secs(5))
+        });
+
+        // Simulate the browser callback
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        {
+            let mut stream = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+            write!(
+                stream,
+                "GET /callback?code=test_code_abc&state={nonce} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            )
+            .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            assert!(response.contains("Authentication successful"));
+        }
+
+        let code = listener_handle.join().unwrap().unwrap();
+        assert_eq!(code, "test_code_abc");
+
+        // Exchange the code and persist
+        let api_client = api_client::ApiClient::new(&mock_url, None);
+        let exchange_result = api_client.exchange_code(&code).unwrap();
+        assert_eq!(exchange_result.token, "tok_fresh");
+        assert_eq!(exchange_result.login, Some("newuser".to_string()));
+
+        let mut cfg = config::CliConfig::load().unwrap();
+        cfg.api_url = Some(mock_url.clone());
+        cfg.token = Some(exchange_result.token);
+        cfg.github_login = exchange_result.login;
+        cfg.expires_at = exchange_result.expires_at;
+        cfg.save().unwrap();
+
+        // Verify persisted config
+        let loaded = config::CliConfig::load().unwrap();
+        assert_eq!(loaded.token, Some("tok_fresh".to_string()));
+        assert_eq!(loaded.github_login, Some("newuser".to_string()));
+        assert_eq!(loaded.expires_at, Some("2027-06-15T12:00:00Z".to_string()));
+
+        // Check key status (no keys -> should suggest)
+        let mut buf = Vec::new();
+        check_post_login_key_status(&mock_url, &loaded, &mut buf, false);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("No encryption keys found."),
+            "should suggest key push, got: {output}"
+        );
+        assert!(
+            output.contains("Run 'keys push' to upload your private key."),
+            "should include push hint, got: {output}"
+        );
+
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        server_handle.join().ok();
+    }
+
+    #[test]
+    fn check_post_login_key_status_with_active_key() {
+        use std::io::{BufRead, BufReader, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            reader.read_line(&mut req_line).unwrap();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim().is_empty() {
+                    break;
+                }
+            }
+            let body = r#"{"fingerprint":"ABCD1234","created_at":"2025-01-01T00:00:00Z"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let cfg = config::CliConfig {
+            token: Some("tok_abc".to_string()),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        check_post_login_key_status(&url, &cfg, &mut buf, false);
+
+        handle.join().unwrap();
+
+        let output = String::from_utf8(buf).unwrap();
+        // Active key exists — should not show suggestion
+        assert!(
+            !output.contains("No encryption keys found"),
+            "should not suggest key push when key exists, got: {output}"
+        );
+    }
+
+    #[test]
+    fn check_post_login_key_status_server_error() {
+        use std::io::{BufRead, BufReader, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            reader.read_line(&mut req_line).unwrap();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim().is_empty() {
+                    break;
+                }
+            }
+            let body = r#"{"message":"Internal error"}"#;
+            let resp = format!(
+                "HTTP/1.1 500 Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let cfg = config::CliConfig {
+            token: Some("tok_abc".to_string()),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        check_post_login_key_status(&url, &cfg, &mut buf, false);
+
+        handle.join().unwrap();
+
+        let output = String::from_utf8(buf).unwrap();
+        // Server error — should warn but not crash
+        assert!(
+            output.contains("Could not check key status"),
+            "should warn about key check failure, got: {output}"
+        );
+    }
+
+    /// Test non-HTTPS warning by using an existing token + cancel path
+    /// to avoid reaching the listener/browser steps.
+    #[test]
+    #[serial]
+    fn auth_login_inner_non_https_warning() {
+        let fake_home = TempDir::new().unwrap();
+        let config_path = fake_home
+            .path()
+            .join(".config")
+            .join("ai-session-commit-linker")
+            .join("config.toml");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        let existing_cfg = config::CliConfig {
+            token: Some("tok".to_string()),
+            ..Default::default()
+        };
+        let toml_str = toml::to_string_pretty(&existing_cfg).unwrap();
+        std::fs::write(&config_path, &toml_str).unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+        let mut buf = Vec::new();
+        let _result = run_auth_login_inner(
+            Some("http://localhost:9999".to_string()),
+            &mut buf,
+            false,
+            Some(false), // Cancel to avoid listener
+        );
+
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("Using non-HTTPS API URL"),
+            "should warn about non-HTTPS, got: {output}"
+        );
+    }
+
+    /// Test that --api-url is persisted to config even when login is cancelled.
+    /// Uses already-authenticated + cancel to avoid the listener/browser steps.
+    #[test]
+    #[serial]
+    fn auth_login_inner_persists_api_url_override() {
+        let fake_home = TempDir::new().unwrap();
+        let config_path = fake_home
+            .path()
+            .join(".config")
+            .join("ai-session-commit-linker")
+            .join("config.toml");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        // Pre-populate with an existing token so we hit the confirmation path
+        let existing_cfg = config::CliConfig {
+            token: Some("existing_token".to_string()),
+            ..Default::default()
+        };
+        let toml_str = toml::to_string_pretty(&existing_cfg).unwrap();
+        std::fs::write(&config_path, &toml_str).unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+        let mut buf = Vec::new();
+        // Pass --api-url override and cancel the overwrite prompt
+        let _result = run_auth_login_inner(
+            Some("https://custom-api.example.com".to_string()),
+            &mut buf,
+            false,
+            Some(false), // Cancel
+        );
+
+        // Config should have the api_url persisted even though login was cancelled
+        let loaded = config::CliConfig::load().unwrap();
+
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        assert_eq!(
+            loaded.api_url,
+            Some("https://custom-api.example.com".to_string()),
+            "api_url should be persisted to config"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn auth_login_inner_already_authenticated_non_tty_fails() {
+        let fake_home = TempDir::new().unwrap();
+        let config_path = fake_home
+            .path()
+            .join(".config")
+            .join("ai-session-commit-linker")
+            .join("config.toml");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        let existing_cfg = config::CliConfig {
+            token: Some("existing_token".to_string()),
+            ..Default::default()
+        };
+        let toml_str = toml::to_string_pretty(&existing_cfg).unwrap();
+        std::fs::write(&config_path, &toml_str).unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+        let mut buf = Vec::new();
+        // is_tty=false and confirm_override=None should bail with error
+        let result = run_auth_login_inner(None, &mut buf, false, None);
+
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("Already authenticated"),
+            "should explain already authenticated, got: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Auth logout handler tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: write a CliConfig to a temp home, run auth logout, and return
+    /// the output. Caller provides the fake home so it can inspect the config
+    /// after logout.
+    fn run_auth_logout_with_home(fake_home: &TempDir, cfg: &config::CliConfig) -> Result<String> {
+        let config_path = fake_home
+            .path()
+            .join(".config")
+            .join("ai-session-commit-linker")
+            .join("config.toml");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        let toml_str = toml::to_string_pretty(cfg).expect("failed to serialize config");
+        std::fs::write(&config_path, &toml_str).unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+        let mut buf = Vec::new();
+        let result = run_auth_logout_inner(&mut buf, false);
+
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        result?;
+        Ok(String::from_utf8(buf).expect("output should be valid UTF-8"))
+    }
+
+    #[test]
+    #[serial]
+    fn auth_logout_not_authenticated() {
+        let fake_home = TempDir::new().unwrap();
+        let cfg = config::CliConfig::default();
+        let output = run_auth_logout_with_home(&fake_home, &cfg).unwrap();
+        assert!(
+            output.contains("Not currently authenticated."),
+            "should show not-authenticated message, got: {output}"
+        );
+        // Should NOT contain logout success or warning messages
+        assert!(
+            !output.contains("Logged out"),
+            "should not mention logout when not authenticated, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn auth_logout_clears_local_credentials() {
+        use std::io::{BufRead, BufReader, Write};
+
+        // Set up a mock server that accepts the revocation
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mock_url = format!("http://127.0.0.1:{port}");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            // Read request line and headers
+            let mut req_line = String::new();
+            reader.read_line(&mut req_line).unwrap();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim().is_empty() {
+                    break;
+                }
+            }
+            let resp = "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n";
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            req_line
+        });
+
+        let fake_home = TempDir::new().unwrap();
+        let cfg = config::CliConfig {
+            api_url: Some(mock_url),
+            token: Some("tok_to_revoke".to_string()),
+            github_login: Some("testuser".to_string()),
+            expires_at: Some("2027-01-01T00:00:00Z".to_string()),
+        };
+        let output = run_auth_logout_with_home(&fake_home, &cfg).unwrap();
+
+        let req_line = handle.join().unwrap();
+
+        // Verify success message
+        assert!(
+            output.contains("Logged out and token revoked."),
+            "should show success message, got: {output}"
+        );
+
+        // Verify local credentials are cleared
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+        let loaded = config::CliConfig::load().unwrap();
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        assert!(loaded.token.is_none(), "token should be cleared");
+        assert!(
+            loaded.github_login.is_none(),
+            "github_login should be cleared"
+        );
+        assert!(loaded.expires_at.is_none(), "expires_at should be cleared");
+        // api_url must be preserved
+        assert!(
+            loaded.api_url.is_some(),
+            "api_url should be preserved after logout"
+        );
+
+        // Verify the revocation request was a DELETE to /api/auth
+        assert!(
+            req_line.contains("DELETE"),
+            "should send DELETE request, got: {req_line}"
+        );
+        assert!(
+            req_line.contains("/api/auth"),
+            "should target /api/auth, got: {req_line}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn auth_logout_revoke_called_with_bearer_token() {
+        use std::io::{BufRead, BufReader, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mock_url = format!("http://127.0.0.1:{port}");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            reader.read_line(&mut req_line).unwrap();
+
+            // Capture Authorization header
+            let mut auth_header = None;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim().is_empty() {
+                    break;
+                }
+                if let Some((key, value)) = line.split_once(':') {
+                    if key.trim().to_lowercase() == "authorization" {
+                        auth_header = Some(value.trim().to_string());
+                    }
+                }
+            }
+
+            let resp = "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n";
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            auth_header
+        });
+
+        let fake_home = TempDir::new().unwrap();
+        let cfg = config::CliConfig {
+            api_url: Some(mock_url),
+            token: Some("tok_verify_header".to_string()),
+            github_login: Some("testuser".to_string()),
+            ..Default::default()
+        };
+        let _output = run_auth_logout_with_home(&fake_home, &cfg).unwrap();
+
+        let auth_header = handle.join().unwrap();
+        assert_eq!(
+            auth_header.as_deref(),
+            Some("Bearer tok_verify_header"),
+            "should send Bearer token in Authorization header"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn auth_logout_warning_on_unreachable_server() {
+        let fake_home = TempDir::new().unwrap();
+        // Use a port that is almost certainly not listening
+        let cfg = config::CliConfig {
+            api_url: Some("http://127.0.0.1:1".to_string()),
+            token: Some("tok_unreachable".to_string()),
+            github_login: Some("testuser".to_string()),
+            expires_at: Some("2027-01-01T00:00:00Z".to_string()),
+        };
+        let output = run_auth_logout_with_home(&fake_home, &cfg).unwrap();
+
+        // Should show warning about unreachable server
+        assert!(
+            output.contains("Logged out."),
+            "should confirm local logout, got: {output}"
+        );
+        assert!(
+            output.contains("Warning: could not reach server to revoke token."),
+            "should warn about unreachable server, got: {output}"
+        );
+
+        // Verify local credentials are still cleared despite server failure
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+        let loaded = config::CliConfig::load().unwrap();
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        assert!(
+            loaded.token.is_none(),
+            "token should be cleared even when server unreachable"
+        );
+        assert!(
+            loaded.github_login.is_none(),
+            "login should be cleared even when server unreachable"
+        );
+        assert!(
+            loaded.expires_at.is_none(),
+            "expires_at should be cleared even when server unreachable"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn auth_logout_api_error_still_clears_locally() {
+        use std::io::{BufRead, BufReader, Write};
+
+        // Mock server returns 401 (token already expired/revoked)
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mock_url = format!("http://127.0.0.1:{port}");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            reader.read_line(&mut req_line).unwrap();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim().is_empty() {
+                    break;
+                }
+            }
+            let body = r#"{"message":"Unauthorized"}"#;
+            let resp = format!(
+                "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let fake_home = TempDir::new().unwrap();
+        let cfg = config::CliConfig {
+            api_url: Some(mock_url),
+            token: Some("tok_expired".to_string()),
+            github_login: Some("testuser".to_string()),
+            expires_at: Some("2027-01-01T00:00:00Z".to_string()),
+        };
+        let output = run_auth_logout_with_home(&fake_home, &cfg).unwrap();
+
+        handle.join().unwrap();
+
+        // Should still confirm local logout
+        assert!(
+            output.contains("Logged out."),
+            "should confirm local logout, got: {output}"
+        );
+        // Should show the server error as a note, not the unreachable warning
+        assert!(
+            output.contains("Server-side revocation failed:"),
+            "should note the API error, got: {output}"
+        );
+        assert!(
+            !output.contains("could not reach server"),
+            "should NOT show unreachable warning for 401, got: {output}"
+        );
+
+        // Verify local credentials are cleared
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+        let loaded = config::CliConfig::load().unwrap();
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        assert!(loaded.token.is_none(), "token should be cleared after 401");
+    }
+
+    #[test]
+    #[serial]
+    fn auth_logout_no_config_file_shows_not_authenticated() {
+        let fake_home = TempDir::new().unwrap();
+        // Don't create any config file — load() returns defaults
+
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+        let mut buf = Vec::new();
+        let result = run_auth_logout_inner(&mut buf, false);
+
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        assert!(result.is_ok());
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("Not currently authenticated."),
+            "should show not-authenticated for missing config, got: {output}"
+        );
+    }
+
+    #[test]
+    fn is_connection_error_classifies_transport_errors() {
+        assert!(is_connection_error(
+            "failed to connect to API at http://localhost:1234"
+        ));
+        assert!(is_connection_error("connection refused"));
+        assert!(is_connection_error("DNS error: name resolution failed"));
+        assert!(is_connection_error("request timed out"));
+        assert!(is_connection_error("no route to host"));
+
+        // Should NOT classify HTTP errors as connection errors
+        assert!(!is_connection_error(
+            "Not authenticated. Run `cadence auth login` to sign in."
+        ));
+        assert!(!is_connection_error("Server error: Internal error"));
+        assert!(!is_connection_error("Bad request: invalid token"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Auth status handler tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: write a CliConfig to a temp home and run auth status against it.
+    /// Returns the output as a String. Sets HOME to the temp dir so
+    /// CliConfig::load() reads from it.
+    fn run_auth_status_with_config(cfg: &config::CliConfig) -> Result<String> {
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let config_path = fake_home
+            .path()
+            .join(".config")
+            .join("ai-session-commit-linker")
+            .join("config.toml");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        let toml_str = toml::to_string_pretty(cfg).expect("failed to serialize config");
+        std::fs::write(&config_path, &toml_str).unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
+
+        let mut buf = Vec::new();
+        let result = run_auth_status_inner(&mut buf, false);
+
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        result?;
+        Ok(String::from_utf8(buf).expect("output should be valid UTF-8"))
+    }
+
+    #[test]
+    #[serial]
+    fn run_auth_status_no_token() {
+        let cfg = config::CliConfig::default();
+        let output = run_auth_status_with_config(&cfg).unwrap();
+        assert!(
+            output.contains("Not authenticated."),
+            "should show unauthenticated message, got: {}",
+            output
+        );
+        assert!(
+            output.contains("Run 'auth login' to connect."),
+            "should show login hint, got: {}",
+            output
+        );
+        // Should NOT contain authenticated-path labels
+        assert!(
+            !output.contains("API URL:"),
+            "unauthenticated output should not contain API URL, got: {}",
+            output
+        );
+        assert!(
+            !output.contains("GitHub login:"),
+            "unauthenticated output should not contain GitHub login, got: {}",
+            output
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn run_auth_status_with_token() {
+        let cfg = config::CliConfig {
+            api_url: Some("https://custom.example.com".to_string()),
+            token: Some("tok_abc123".to_string()),
+            github_login: Some("octocat".to_string()),
+            expires_at: Some("2026-12-31T23:59:59Z".to_string()),
+        };
+        let output = run_auth_status_with_config(&cfg).unwrap();
+        assert!(
+            output.contains("Authenticated"),
+            "should show authenticated label, got: {}",
+            output
+        );
+        assert!(
+            output.contains("API URL: https://custom.example.com"),
+            "should show API URL from config, got: {}",
+            output
+        );
+        assert!(
+            output.contains("GitHub login: octocat"),
+            "should show GitHub login, got: {}",
+            output
+        );
+        assert!(
+            output.contains("Token expires: 2026-12-31T23:59:59Z"),
+            "should show token expiry, got: {}",
+            output
+        );
+        // Should NOT contain the raw token value
+        assert!(
+            !output.contains("tok_abc123"),
+            "should not expose raw token, got: {}",
+            output
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn run_auth_status_partial_fields_token_only() {
+        let cfg = config::CliConfig {
+            token: Some("tok_partial".to_string()),
+            ..Default::default()
+        };
+        let output = run_auth_status_with_config(&cfg).unwrap();
+        assert!(
+            output.contains("Authenticated"),
+            "token presence means authenticated, got: {}",
+            output
+        );
+        assert!(
+            output.contains(&format!("API URL: {}", config::DEFAULT_API_URL)),
+            "should fall back to default API URL, got: {}",
+            output
+        );
+        assert!(
+            output.contains("GitHub login: (unknown)"),
+            "missing login should show (unknown), got: {}",
+            output
+        );
+        assert!(
+            output.contains("Token expires: (unknown)"),
+            "missing expiry should show (unknown), got: {}",
+            output
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn run_auth_status_token_with_login_no_expiry() {
+        let cfg = config::CliConfig {
+            token: Some("tok_x".to_string()),
+            github_login: Some("testuser".to_string()),
+            ..Default::default()
+        };
+        let output = run_auth_status_with_config(&cfg).unwrap();
+        assert!(output.contains("GitHub login: testuser"));
+        assert!(output.contains("Token expires: (unknown)"));
+    }
+
+    #[test]
+    #[serial]
+    fn run_auth_status_corrupt_config_returns_error() {
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let config_path = fake_home
+            .path()
+            .join(".config")
+            .join("ai-session-commit-linker")
+            .join("config.toml");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(&config_path, "this is not valid toml {{{").unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
+
+        let mut buf = Vec::new();
+        let result = run_auth_status_inner(&mut buf, false);
+
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        assert!(result.is_err(), "corrupt config should return error");
+        let err_msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            err_msg.contains("failed to parse config file"),
+            "error should mention parse failure, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn run_auth_status_missing_home_returns_not_authenticated() {
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::remove_var("HOME");
+        }
+
+        let mut buf = Vec::new();
+        let result = run_auth_status_inner(&mut buf, false);
+
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        // When HOME is missing, CliConfig::load() returns defaults (no token)
+        assert!(result.is_ok(), "missing HOME should not be a hard error");
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("Not authenticated."),
+            "missing HOME should show unauthenticated, got: {}",
+            output
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn run_auth_status_no_config_file_shows_unauthenticated() {
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        // Don't create any config file — directory is empty
+
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
+
+        let mut buf = Vec::new();
+        let result = run_auth_status_inner(&mut buf, false);
+
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        assert!(result.is_ok());
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("Not authenticated."),
+            "missing config file should show unauthenticated, got: {}",
+            output
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Keys push handler tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: write a CliConfig to a temp home and run keys push inner against it.
+    /// Returns (output, result). Uses `confirm_override` to avoid TTY prompts.
+    fn run_keys_push_with_config(
+        cfg: &config::CliConfig,
+        key: Option<String>,
+        yes: bool,
+        confirm_override: Option<bool>,
+    ) -> (String, Result<()>) {
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let config_path = fake_home
+            .path()
+            .join(".config")
+            .join("ai-session-commit-linker")
+            .join("config.toml");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        let toml_str = toml::to_string_pretty(cfg).expect("failed to serialize config");
+        std::fs::write(&config_path, &toml_str).unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+        let mut buf = Vec::new();
+        let result = run_keys_push_inner(key, yes, &mut buf, false, confirm_override);
+
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        let output = String::from_utf8(buf).expect("output should be valid UTF-8");
+        (output, result)
+    }
+
+    /// Create a temporary GPG keyring with a no-passphrase test keypair.
+    /// Returns `(TempDir, email)` or `None` if GPG is unavailable or keygen fails.
+    /// The TempDir must be kept alive for the duration of the test.
+    fn setup_push_test_gpg_keyring(email: &str) -> Option<TempDir> {
+        use std::io::Write;
+
+        if !gpg::gpg_available() {
+            return None;
+        }
+
+        let gpg_home = TempDir::new().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(gpg_home.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+
+        let key_params = format!(
+            "%no-protection\nKey-Type: RSA\nKey-Length: 2048\nSubkey-Type: RSA\nSubkey-Length: 2048\nName-Real: Test User\nName-Email: {}\nExpire-Date: 0\n%commit\n",
+            email
+        );
+
+        let output = std::process::Command::new("gpg")
+            .args(["--batch", "--gen-key"])
+            .env("GNUPGHOME", gpg_home.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                child
+                    .stdin
+                    .as_mut()
+                    .unwrap()
+                    .write_all(key_params.as_bytes())
+                    .unwrap();
+                child.wait_with_output()
+            });
+
+        match output {
+            Ok(o) if o.status.success() => Some(gpg_home),
+            _ => None,
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn keys_push_not_authenticated() {
+        let cfg = config::CliConfig::default();
+        let (output, result) = run_keys_push_with_config(&cfg, None, false, None);
+        assert!(result.is_ok());
+        assert!(
+            output.contains("Not currently authenticated."),
+            "should show not-authenticated message, got: {output}"
+        );
+        assert!(
+            output.contains("Run `cadence auth login` first."),
+            "should show login hint, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_push_empty_token_treated_as_unauthenticated() {
+        let cfg = config::CliConfig {
+            token: Some("".to_string()),
+            ..Default::default()
+        };
+        let (output, result) = run_keys_push_with_config(&cfg, None, false, None);
+        assert!(result.is_ok());
+        assert!(
+            output.contains("Not currently authenticated."),
+            "empty token should be treated as unauthenticated, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_push_whitespace_token_treated_as_unauthenticated() {
+        let cfg = config::CliConfig {
+            token: Some("   ".to_string()),
+            ..Default::default()
+        };
+        let (output, result) = run_keys_push_with_config(&cfg, None, false, None);
+        assert!(result.is_ok());
+        assert!(
+            output.contains("Not currently authenticated."),
+            "whitespace-only token should be treated as unauthenticated, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_push_no_key_no_recipient_errors() {
+        // Isolate git config so get_recipient returns None
+        let fake_home = TempDir::new().unwrap();
+        let (git_config_path, original_git_config) = set_isolated_global_git_config(&fake_home);
+        let _ = git_config_path; // suppress unused warning
+
+        let cfg = config::CliConfig {
+            token: Some("tok_test".to_string()),
+            ..Default::default()
+        };
+        let (output, result) = run_keys_push_with_config(&cfg, None, false, None);
+
+        restore_global_git_config(original_git_config);
+
+        assert!(result.is_err(), "should error when no key can be resolved");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("No key specified"),
+            "should mention no key specified, got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("--key") && err_msg.contains("ai.cadence.gpg.recipient"),
+            "should suggest both --key and git config, got: {err_msg}"
+        );
+        let _ = output;
+    }
+
+    #[test]
+    #[serial]
+    fn keys_push_empty_key_flag_errors() {
+        let cfg = config::CliConfig {
+            token: Some("tok_test".to_string()),
+            ..Default::default()
+        };
+        let (_output, result) =
+            run_keys_push_with_config(&cfg, Some("   ".to_string()), false, None);
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("No key specified"),
+            "empty --key should error, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_push_unknown_key_errors() {
+        if !gpg::gpg_available() {
+            eprintln!("skipping test: gpg not available");
+            return;
+        }
+
+        let gpg_home = TempDir::new().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(gpg_home.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+
+        let original_gnupghome = std::env::var("GNUPGHOME").ok();
+        unsafe { std::env::set_var("GNUPGHOME", gpg_home.path()) };
+
+        let cfg = config::CliConfig {
+            token: Some("tok_test".to_string()),
+            ..Default::default()
+        };
+        let (_output, result) = run_keys_push_with_config(
+            &cfg,
+            Some("nonexistent-key@invalid.test".to_string()),
+            true,
+            None,
+        );
+
+        unsafe {
+            match original_gnupghome {
+                Some(v) => std::env::set_var("GNUPGHOME", v),
+                None => std::env::remove_var("GNUPGHOME"),
+            }
+        }
+
+        assert!(result.is_err(), "unknown key should fail");
+        let err_msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            err_msg.contains("Key not found") || err_msg.contains("export"),
+            "should mention key not found, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_push_confirm_no_cancels() {
+        let email = "test-push-cancel@cadence.test";
+        let Some(gpg_home) = setup_push_test_gpg_keyring(email) else {
+            eprintln!("skipping test: gpg not available or key generation failed");
+            return;
+        };
+
+        let original_gnupghome = std::env::var("GNUPGHOME").ok();
+        unsafe { std::env::set_var("GNUPGHOME", gpg_home.path()) };
+
+        let cfg = config::CliConfig {
+            token: Some("tok_test".to_string()),
+            ..Default::default()
+        };
+        // confirm_override=Some(false) simulates user saying "no"
+        let (output, result) =
+            run_keys_push_with_config(&cfg, Some(email.to_string()), false, Some(false));
+
+        unsafe {
+            match original_gnupghome {
+                Some(v) => std::env::set_var("GNUPGHOME", v),
+                None => std::env::remove_var("GNUPGHOME"),
+            }
+        }
+
+        assert!(result.is_ok());
+        assert!(
+            output.contains("Upload cancelled."),
+            "should show cancellation message, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_push_success_with_mock_server() {
+        use std::io::{BufRead, BufReader, Read, Write};
+
+        let email = "test-push-success@cadence.test";
+        let Some(gpg_home) = setup_push_test_gpg_keyring(email) else {
+            eprintln!("skipping test: gpg not available or key generation failed");
+            return;
+        };
+
+        // Start mock server
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mock_url = format!("http://127.0.0.1:{port}");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            reader.read_line(&mut req_line).unwrap();
+
+            let mut headers = Vec::new();
+            let mut content_length: usize = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let trimmed = line.trim().to_string();
+                if trimmed.is_empty() {
+                    break;
+                }
+                if let Some((key, value)) = trimmed.split_once(':') {
+                    if key.trim().to_lowercase() == "content-length" {
+                        content_length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+                headers.push(trimmed);
+            }
+
+            let mut body_buf = vec![0u8; content_length];
+            if content_length > 0 {
+                reader.read_exact(&mut body_buf).unwrap();
+            }
+            let request_body = String::from_utf8_lossy(&body_buf).to_string();
+
+            let resp_body = r#"{"message":"Key stored","superseded":"OLD_FP"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                resp_body.len()
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            (req_line, headers, request_body)
+        });
+
+        let original_gnupghome = std::env::var("GNUPGHOME").ok();
+        unsafe { std::env::set_var("GNUPGHOME", gpg_home.path()) };
+
+        let cfg = config::CliConfig {
+            api_url: Some(mock_url),
+            token: Some("tok_push_test".to_string()),
+            ..Default::default()
+        };
+        let (output, result) = run_keys_push_with_config(
+            &cfg,
+            Some(email.to_string()),
+            true, // skip confirmation
+            None,
+        );
+
+        unsafe {
+            match original_gnupghome {
+                Some(v) => std::env::set_var("GNUPGHOME", v),
+                None => std::env::remove_var("GNUPGHOME"),
+            }
+        }
+
+        assert!(result.is_ok(), "push should succeed: {:?}", result.err());
+        let (req_line, headers, request_body) = handle.join().unwrap();
+
+        // Verify correct endpoint
+        assert!(
+            req_line.contains("POST /api/keys"),
+            "should call POST /api/keys, got: {req_line}"
+        );
+
+        // Verify auth header
+        let auth_header = headers
+            .iter()
+            .find(|h| h.to_lowercase().starts_with("authorization:"))
+            .expect("should send Authorization header");
+        assert!(
+            auth_header.contains("Bearer tok_push_test"),
+            "should send correct Bearer token, got: {auth_header}"
+        );
+
+        // Verify request body fields
+        let sent: serde_json::Value =
+            serde_json::from_str(&request_body).expect("request body should be valid JSON");
+        assert!(
+            sent["fingerprint"].is_string() && !sent["fingerprint"].as_str().unwrap().is_empty(),
+            "should send fingerprint"
+        );
+        assert!(
+            sent["armored_private_key"]
+                .as_str()
+                .unwrap_or("")
+                .contains("PGP PRIVATE KEY"),
+            "should send armored private key"
+        );
+        assert!(
+            sent["test_encrypted_message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("PGP MESSAGE"),
+            "should send encrypted test message"
+        );
+
+        // Verify success output
+        assert!(
+            output.contains("uploaded successfully"),
+            "should show success message, got: {output}"
+        );
+        assert!(
+            output.contains("Previous active keys have been superseded"),
+            "should mention supersedence, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_push_api_401_error() {
+        use std::io::{BufRead, BufReader, Read, Write};
+
+        let email = "test-push-401@cadence.test";
+        let Some(gpg_home) = setup_push_test_gpg_keyring(email) else {
+            eprintln!("skipping test: gpg not available or key generation failed");
+            return;
+        };
+
+        // Start mock server that returns 401
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mock_url = format!("http://127.0.0.1:{port}");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            reader.read_line(&mut req_line).unwrap();
+
+            let mut content_length: usize = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let trimmed = line.trim().to_string();
+                if trimmed.is_empty() {
+                    break;
+                }
+                if let Some((key, value)) = trimmed.split_once(':') {
+                    if key.trim().to_lowercase() == "content-length" {
+                        content_length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+            }
+            if content_length > 0 {
+                let mut body_buf = vec![0u8; content_length];
+                reader.read_exact(&mut body_buf).unwrap();
+            }
+
+            let resp_body = r#"{"message":"Unauthorized"}"#;
+            let resp = format!(
+                "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                resp_body.len()
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let original_gnupghome = std::env::var("GNUPGHOME").ok();
+        unsafe { std::env::set_var("GNUPGHOME", gpg_home.path()) };
+
+        let cfg = config::CliConfig {
+            api_url: Some(mock_url),
+            token: Some("tok_expired".to_string()),
+            ..Default::default()
+        };
+        let (output, result) = run_keys_push_with_config(&cfg, Some(email.to_string()), true, None);
+
+        unsafe {
+            match original_gnupghome {
+                Some(v) => std::env::set_var("GNUPGHOME", v),
+                None => std::env::remove_var("GNUPGHOME"),
+            }
+        }
+
+        handle.join().unwrap();
+
+        assert!(
+            result.is_ok(),
+            "handler should not return Err for API errors"
+        );
+        assert!(
+            output.contains("Failed to push key"),
+            "should show failure label, got: {output}"
+        );
+        assert!(
+            output.contains("Not authenticated") || output.contains("auth login"),
+            "should mention auth error, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_push_api_500_error() {
+        use std::io::{BufRead, BufReader, Read, Write};
+
+        let email = "test-push-500@cadence.test";
+        let Some(gpg_home) = setup_push_test_gpg_keyring(email) else {
+            eprintln!("skipping test: gpg not available or key generation failed");
+            return;
+        };
+
+        // Start mock server that returns 500
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mock_url = format!("http://127.0.0.1:{port}");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            reader.read_line(&mut req_line).unwrap();
+
+            let mut content_length: usize = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let trimmed = line.trim().to_string();
+                if trimmed.is_empty() {
+                    break;
+                }
+                if let Some((key, value)) = trimmed.split_once(':') {
+                    if key.trim().to_lowercase() == "content-length" {
+                        content_length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+            }
+            if content_length > 0 {
+                let mut body_buf = vec![0u8; content_length];
+                reader.read_exact(&mut body_buf).unwrap();
+            }
+
+            let resp_body = r#"{"message":"Internal server error"}"#;
+            let resp = format!(
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                resp_body.len()
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let original_gnupghome = std::env::var("GNUPGHOME").ok();
+        unsafe { std::env::set_var("GNUPGHOME", gpg_home.path()) };
+
+        let cfg = config::CliConfig {
+            api_url: Some(mock_url),
+            token: Some("tok_test".to_string()),
+            ..Default::default()
+        };
+        let (output, result) = run_keys_push_with_config(&cfg, Some(email.to_string()), true, None);
+
+        unsafe {
+            match original_gnupghome {
+                Some(v) => std::env::set_var("GNUPGHOME", v),
+                None => std::env::remove_var("GNUPGHOME"),
+            }
+        }
+
+        handle.join().unwrap();
+
+        assert!(result.is_ok());
+        assert!(
+            output.contains("Failed to push key"),
+            "should show failure label, got: {output}"
+        );
+        assert!(
+            output.contains("Server error") || output.contains("Internal server error"),
+            "should include server error details, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_push_yes_flag_skips_confirmation() {
+        use std::io::{BufRead, BufReader, Read, Write};
+
+        let email = "test-push-yes@cadence.test";
+        let Some(gpg_home) = setup_push_test_gpg_keyring(email) else {
+            eprintln!("skipping test: gpg not available or key generation failed");
+            return;
+        };
+
+        // Start mock server
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mock_url = format!("http://127.0.0.1:{port}");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            reader.read_line(&mut req_line).unwrap();
+
+            let mut content_length: usize = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let trimmed = line.trim().to_string();
+                if trimmed.is_empty() {
+                    break;
+                }
+                if let Some((key, value)) = trimmed.split_once(':') {
+                    if key.trim().to_lowercase() == "content-length" {
+                        content_length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+            }
+            if content_length > 0 {
+                let mut body_buf = vec![0u8; content_length];
+                reader.read_exact(&mut body_buf).unwrap();
+            }
+
+            let resp_body = r#"{"message":"Key stored"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                resp_body.len()
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let original_gnupghome = std::env::var("GNUPGHOME").ok();
+        unsafe { std::env::set_var("GNUPGHOME", gpg_home.path()) };
+
+        let cfg = config::CliConfig {
+            api_url: Some(mock_url),
+            token: Some("tok_test".to_string()),
+            ..Default::default()
+        };
+        // yes=true should skip confirmation — no confirm_override needed
+        let (output, result) = run_keys_push_with_config(&cfg, Some(email.to_string()), true, None);
+
+        unsafe {
+            match original_gnupghome {
+                Some(v) => std::env::set_var("GNUPGHOME", v),
+                None => std::env::remove_var("GNUPGHOME"),
+            }
+        }
+
+        handle.join().unwrap();
+
+        assert!(
+            result.is_ok(),
+            "should succeed with --yes: {:?}",
+            result.err()
+        );
+        // The output should NOT contain any confirmation prompt text
+        assert!(
+            !output.contains("Upload cancelled"),
+            "should not show cancel message with --yes, got: {output}"
+        );
+        assert!(
+            output.contains("uploaded successfully"),
+            "should show success, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_push_no_config_file_shows_unauthenticated() {
+        let fake_home = TempDir::new().unwrap();
+        // Don't create any config file
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+        let mut buf = Vec::new();
+        let result = run_keys_push_inner(None, false, &mut buf, false, None);
+
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        assert!(result.is_ok());
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("Not currently authenticated."),
+            "missing config should show unauthenticated, got: {output}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Keys test handler tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: write a CliConfig to a temp home and run keys test inner against it.
+    /// Returns (output, result).
+    fn run_keys_test_with_config(
+        cfg: &config::CliConfig,
+        key: Option<String>,
+    ) -> (String, Result<()>) {
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let config_path = fake_home
+            .path()
+            .join(".config")
+            .join("ai-session-commit-linker")
+            .join("config.toml");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        let toml_str = toml::to_string_pretty(cfg).expect("failed to serialize config");
+        std::fs::write(&config_path, &toml_str).unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+        let mut buf = Vec::new();
+        let result = run_keys_test_inner(&mut buf, false, key);
+
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        let output = String::from_utf8(buf).expect("output should be valid UTF-8");
+        (output, result)
+    }
+
+    #[test]
+    #[serial]
+    fn keys_test_not_authenticated() {
+        let cfg = config::CliConfig::default();
+        let (output, result) = run_keys_test_with_config(&cfg, None);
+        assert!(result.is_ok());
+        assert!(
+            output.contains("Not currently authenticated."),
+            "should show not-authenticated message, got: {output}"
+        );
+        assert!(
+            output.contains("Run `cadence auth login` first."),
+            "should show login hint, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_test_empty_token_treated_as_unauthenticated() {
+        let cfg = config::CliConfig {
+            token: Some("".to_string()),
+            ..Default::default()
+        };
+        let (output, result) = run_keys_test_with_config(&cfg, None);
+        assert!(result.is_ok());
+        assert!(
+            output.contains("Not currently authenticated."),
+            "empty token should be treated as unauthenticated, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_test_whitespace_token_treated_as_unauthenticated() {
+        let cfg = config::CliConfig {
+            token: Some("   ".to_string()),
+            ..Default::default()
+        };
+        let (output, result) = run_keys_test_with_config(&cfg, None);
+        assert!(result.is_ok());
+        assert!(
+            output.contains("Not currently authenticated."),
+            "whitespace-only token should be treated as unauthenticated, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_test_no_key_no_recipient_errors() {
+        let fake_home = TempDir::new().unwrap();
+        let (git_config_path, original_git_config) = set_isolated_global_git_config(&fake_home);
+        let _ = git_config_path;
+
+        let cfg = config::CliConfig {
+            token: Some("tok_test".to_string()),
+            ..Default::default()
+        };
+        let (_output, result) = run_keys_test_with_config(&cfg, None);
+
+        restore_global_git_config(original_git_config);
+
+        assert!(result.is_err(), "should error when no key can be resolved");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("No key specified"),
+            "should mention no key specified, got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("--key") && err_msg.contains("ai.cadence.gpg.recipient"),
+            "should suggest both --key and git config, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_test_empty_key_flag_errors() {
+        let cfg = config::CliConfig {
+            token: Some("tok_test".to_string()),
+            ..Default::default()
+        };
+        let (_output, result) = run_keys_test_with_config(&cfg, Some("   ".to_string()));
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("No key specified"),
+            "empty --key should error, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_test_no_config_file_shows_unauthenticated() {
+        let fake_home = TempDir::new().unwrap();
+        // Don't create any config file
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+        let mut buf = Vec::new();
+        let result = run_keys_test_inner(&mut buf, false, None);
+
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        assert!(result.is_ok());
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("Not currently authenticated."),
+            "missing config should show unauthenticated, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_test_success_with_mock_server() {
+        use std::io::{BufRead, BufReader, Read, Write};
+
+        let email = "test-keys-test-success@cadence.test";
+        let Some(gpg_home) = setup_push_test_gpg_keyring(email) else {
+            eprintln!("skipping test: gpg not available or key generation failed");
+            return;
+        };
+
+        // Start mock server
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mock_url = format!("http://127.0.0.1:{port}");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            reader.read_line(&mut req_line).unwrap();
+
+            let mut headers = Vec::new();
+            let mut content_length: usize = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let trimmed = line.trim().to_string();
+                if trimmed.is_empty() {
+                    break;
+                }
+                if let Some((key, value)) = trimmed.split_once(':') {
+                    if key.trim().to_lowercase() == "content-length" {
+                        content_length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+                headers.push(trimmed);
+            }
+
+            let mut body_buf = vec![0u8; content_length];
+            if content_length > 0 {
+                reader.read_exact(&mut body_buf).unwrap();
+            }
+            let request_body = String::from_utf8_lossy(&body_buf).to_string();
+
+            let resp_body = r#"{"success":true,"message":"Decryption verified"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                resp_body.len()
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            (req_line, headers, request_body)
+        });
+
+        let original_gnupghome = std::env::var("GNUPGHOME").ok();
+        unsafe { std::env::set_var("GNUPGHOME", gpg_home.path()) };
+
+        let cfg = config::CliConfig {
+            api_url: Some(mock_url),
+            token: Some("tok_test_verify".to_string()),
+            ..Default::default()
+        };
+        let (output, result) = run_keys_test_with_config(&cfg, Some(email.to_string()));
+
+        unsafe {
+            match original_gnupghome {
+                Some(v) => std::env::set_var("GNUPGHOME", v),
+                None => std::env::remove_var("GNUPGHOME"),
+            }
+        }
+
+        assert!(
+            result.is_ok(),
+            "keys test should succeed: {:?}",
+            result.err()
+        );
+        let (req_line, headers, request_body) = handle.join().unwrap();
+
+        // Verify correct endpoint
+        assert!(
+            req_line.contains("POST /api/keys/test"),
+            "should call POST /api/keys/test, got: {req_line}"
+        );
+
+        // Verify auth header
+        let auth_header = headers
+            .iter()
+            .find(|h| h.to_lowercase().starts_with("authorization:"))
+            .expect("should send Authorization header");
+        assert!(
+            auth_header.contains("Bearer tok_test_verify"),
+            "should send correct Bearer token, got: {auth_header}"
+        );
+
+        // Verify request body has encrypted_message field
+        let sent: serde_json::Value =
+            serde_json::from_str(&request_body).expect("request body should be valid JSON");
+        assert!(
+            sent["encrypted_message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("PGP MESSAGE"),
+            "should send encrypted PGP message"
+        );
+
+        // Verify success output
+        assert!(
+            output.contains(
+                "Key verification passed. The server can decrypt notes encrypted with this key."
+            ),
+            "should show exact success message, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_test_api_success_false_shows_reason() {
+        use std::io::{BufRead, BufReader, Read, Write};
+
+        let email = "test-keys-test-fail@cadence.test";
+        let Some(gpg_home) = setup_push_test_gpg_keyring(email) else {
+            eprintln!("skipping test: gpg not available or key generation failed");
+            return;
+        };
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mock_url = format!("http://127.0.0.1:{port}");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            reader.read_line(&mut req_line).unwrap();
+
+            let mut content_length: usize = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let trimmed = line.trim().to_string();
+                if trimmed.is_empty() {
+                    break;
+                }
+                if let Some((key, value)) = trimmed.split_once(':') {
+                    if key.trim().to_lowercase() == "content-length" {
+                        content_length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+            }
+            if content_length > 0 {
+                let mut body_buf = vec![0u8; content_length];
+                reader.read_exact(&mut body_buf).unwrap();
+            }
+
+            let resp_body = r#"{"success":false,"message":"Decryption failed: key mismatch"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                resp_body.len()
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let original_gnupghome = std::env::var("GNUPGHOME").ok();
+        unsafe { std::env::set_var("GNUPGHOME", gpg_home.path()) };
+
+        let cfg = config::CliConfig {
+            api_url: Some(mock_url),
+            token: Some("tok_test_verify".to_string()),
+            ..Default::default()
+        };
+        let (output, result) = run_keys_test_with_config(&cfg, Some(email.to_string()));
+
+        unsafe {
+            match original_gnupghome {
+                Some(v) => std::env::set_var("GNUPGHOME", v),
+                None => std::env::remove_var("GNUPGHOME"),
+            }
+        }
+
+        handle.join().unwrap();
+
+        assert!(
+            result.is_ok(),
+            "handler should not return Err for API failures"
+        );
+        assert!(
+            output.contains("Key verification failed"),
+            "should show failure label, got: {output}"
+        );
+        assert!(
+            output.contains("Decryption failed: key mismatch"),
+            "should include server reason, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_test_api_401_error() {
+        use std::io::{BufRead, BufReader, Read, Write};
+
+        let email = "test-keys-test-401@cadence.test";
+        let Some(gpg_home) = setup_push_test_gpg_keyring(email) else {
+            eprintln!("skipping test: gpg not available or key generation failed");
+            return;
+        };
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mock_url = format!("http://127.0.0.1:{port}");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            reader.read_line(&mut req_line).unwrap();
+
+            let mut content_length: usize = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let trimmed = line.trim().to_string();
+                if trimmed.is_empty() {
+                    break;
+                }
+                if let Some((key, value)) = trimmed.split_once(':') {
+                    if key.trim().to_lowercase() == "content-length" {
+                        content_length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+            }
+            if content_length > 0 {
+                let mut body_buf = vec![0u8; content_length];
+                reader.read_exact(&mut body_buf).unwrap();
+            }
+
+            let resp_body = r#"{"message":"Unauthorized"}"#;
+            let resp = format!(
+                "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                resp_body.len()
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let original_gnupghome = std::env::var("GNUPGHOME").ok();
+        unsafe { std::env::set_var("GNUPGHOME", gpg_home.path()) };
+
+        let cfg = config::CliConfig {
+            api_url: Some(mock_url),
+            token: Some("tok_expired".to_string()),
+            ..Default::default()
+        };
+        let (output, result) = run_keys_test_with_config(&cfg, Some(email.to_string()));
+
+        unsafe {
+            match original_gnupghome {
+                Some(v) => std::env::set_var("GNUPGHOME", v),
+                None => std::env::remove_var("GNUPGHOME"),
+            }
+        }
+
+        handle.join().unwrap();
+
+        assert!(
+            result.is_ok(),
+            "handler should not return Err for API errors"
+        );
+        assert!(
+            output.contains("Failed to verify key decryption"),
+            "should show failure label, got: {output}"
+        );
+        assert!(
+            output.contains("Not authenticated") || output.contains("auth login"),
+            "should mention auth error, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_test_api_500_error() {
+        use std::io::{BufRead, BufReader, Read, Write};
+
+        let email = "test-keys-test-500@cadence.test";
+        let Some(gpg_home) = setup_push_test_gpg_keyring(email) else {
+            eprintln!("skipping test: gpg not available or key generation failed");
+            return;
+        };
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mock_url = format!("http://127.0.0.1:{port}");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            reader.read_line(&mut req_line).unwrap();
+
+            let mut content_length: usize = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let trimmed = line.trim().to_string();
+                if trimmed.is_empty() {
+                    break;
+                }
+                if let Some((key, value)) = trimmed.split_once(':') {
+                    if key.trim().to_lowercase() == "content-length" {
+                        content_length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+            }
+            if content_length > 0 {
+                let mut body_buf = vec![0u8; content_length];
+                reader.read_exact(&mut body_buf).unwrap();
+            }
+
+            let resp_body = r#"{"message":"Internal server error"}"#;
+            let resp = format!(
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                resp_body.len()
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let original_gnupghome = std::env::var("GNUPGHOME").ok();
+        unsafe { std::env::set_var("GNUPGHOME", gpg_home.path()) };
+
+        let cfg = config::CliConfig {
+            api_url: Some(mock_url),
+            token: Some("tok_test".to_string()),
+            ..Default::default()
+        };
+        let (output, result) = run_keys_test_with_config(&cfg, Some(email.to_string()));
+
+        unsafe {
+            match original_gnupghome {
+                Some(v) => std::env::set_var("GNUPGHOME", v),
+                None => std::env::remove_var("GNUPGHOME"),
+            }
+        }
+
+        handle.join().unwrap();
+
+        assert!(result.is_ok());
+        assert!(
+            output.contains("Failed to verify key decryption"),
+            "should show failure label, got: {output}"
+        );
+        assert!(
+            output.contains("Server error") || output.contains("Internal server error"),
+            "should include server error details, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_test_connection_refused() {
+        let email = "test-keys-test-connrefused@cadence.test";
+        let Some(gpg_home) = setup_push_test_gpg_keyring(email) else {
+            eprintln!("skipping test: gpg not available or key generation failed");
+            return;
+        };
+
+        let original_gnupghome = std::env::var("GNUPGHOME").ok();
+        unsafe { std::env::set_var("GNUPGHOME", gpg_home.path()) };
+
+        let cfg = config::CliConfig {
+            api_url: Some("http://127.0.0.1:1".to_string()),
+            token: Some("tok_test".to_string()),
+            ..Default::default()
+        };
+        let (output, result) = run_keys_test_with_config(&cfg, Some(email.to_string()));
+
+        unsafe {
+            match original_gnupghome {
+                Some(v) => std::env::set_var("GNUPGHOME", v),
+                None => std::env::remove_var("GNUPGHOME"),
+            }
+        }
+
+        assert!(result.is_ok());
+        assert!(
+            output.contains("Failed to verify key decryption"),
+            "should show failure label, got: {output}"
+        );
+        assert!(
+            output.contains("failed to connect"),
+            "should mention connection failure, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_test_unknown_key_errors() {
+        if !gpg::gpg_available() {
+            eprintln!("skipping test: gpg not available");
+            return;
+        }
+
+        let gpg_home = TempDir::new().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(gpg_home.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+
+        let original_gnupghome = std::env::var("GNUPGHOME").ok();
+        unsafe { std::env::set_var("GNUPGHOME", gpg_home.path()) };
+
+        let cfg = config::CliConfig {
+            token: Some("tok_test".to_string()),
+            ..Default::default()
+        };
+        let (_output, result) =
+            run_keys_test_with_config(&cfg, Some("nonexistent-key@invalid.test".to_string()));
+
+        unsafe {
+            match original_gnupghome {
+                Some(v) => std::env::set_var("GNUPGHOME", v),
+                None => std::env::remove_var("GNUPGHOME"),
+            }
+        }
+
+        assert!(result.is_err(), "unknown key should fail");
+        let err_msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            err_msg.contains("encrypt") || err_msg.contains("Unable to encrypt"),
+            "should mention encryption failure, got: {err_msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Keys status handler tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: write a CliConfig to a temp home and run keys status against it.
+    /// Returns the output as a String. Does NOT start a mock server — use
+    /// for unauthenticated tests only (no API call expected).
+    fn run_keys_status_with_config(cfg: &config::CliConfig) -> Result<String> {
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let config_path = fake_home
+            .path()
+            .join(".config")
+            .join("ai-session-commit-linker")
+            .join("config.toml");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        let toml_str = toml::to_string_pretty(cfg).expect("failed to serialize config");
+        std::fs::write(&config_path, &toml_str).unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+        let mut buf = Vec::new();
+        let result = run_keys_status_inner(&mut buf, false);
+
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        result?;
+        Ok(String::from_utf8(buf).expect("output should be valid UTF-8"))
+    }
+
+    /// Helper: write a CliConfig to a temp home with a token pointing at a mock
+    /// server, run keys status, and return the output.
+    fn run_keys_status_with_server(cfg: &config::CliConfig) -> Result<String> {
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let config_path = fake_home
+            .path()
+            .join(".config")
+            .join("ai-session-commit-linker")
+            .join("config.toml");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        let toml_str = toml::to_string_pretty(cfg).expect("failed to serialize config");
+        std::fs::write(&config_path, &toml_str).unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+        let mut buf = Vec::new();
+        let result = run_keys_status_inner(&mut buf, false);
+
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        result?;
+        Ok(String::from_utf8(buf).expect("output should be valid UTF-8"))
+    }
+
+    #[test]
+    #[serial]
+    fn keys_status_not_authenticated() {
+        let cfg = config::CliConfig::default();
+        let output = run_keys_status_with_config(&cfg).unwrap();
+        assert!(
+            output.contains("Not currently authenticated."),
+            "should show not-authenticated message, got: {output}"
+        );
+        assert!(
+            output.contains("Run `cadence auth login` first."),
+            "should show login hint, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_status_empty_token_treated_as_unauthenticated() {
+        let cfg = config::CliConfig {
+            token: Some("".to_string()),
+            ..Default::default()
+        };
+        let output = run_keys_status_with_config(&cfg).unwrap();
+        assert!(
+            output.contains("Not currently authenticated."),
+            "empty token should be treated as unauthenticated, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_status_whitespace_token_treated_as_unauthenticated() {
+        let cfg = config::CliConfig {
+            token: Some("   ".to_string()),
+            ..Default::default()
+        };
+        let output = run_keys_status_with_config(&cfg).unwrap();
+        assert!(
+            output.contains("Not currently authenticated."),
+            "whitespace-only token should be treated as unauthenticated, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_status_no_config_file_shows_unauthenticated() {
+        let fake_home = TempDir::new().unwrap();
+        // Don't create any config file
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+        let mut buf = Vec::new();
+        let result = run_keys_status_inner(&mut buf, false);
+
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        assert!(result.is_ok());
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("Not currently authenticated."),
+            "missing config should show unauthenticated, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_status_with_key() {
+        use std::io::{BufRead, BufReader, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mock_url = format!("http://127.0.0.1:{port}");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            reader.read_line(&mut req_line).unwrap();
+            // Drain headers
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim().is_empty() {
+                    break;
+                }
+            }
+            let body = r#"{"fingerprint":"ABCD1234EF56","created_at":"2026-02-10T14:30:00Z"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            req_line
+        });
+
+        let cfg = config::CliConfig {
+            api_url: Some(mock_url),
+            token: Some("tok_keys_test".to_string()),
+            ..Default::default()
+        };
+        let output = run_keys_status_with_server(&cfg).unwrap();
+        let req_line = handle.join().unwrap();
+
+        // Verify correct endpoint was called
+        assert!(
+            req_line.contains("GET /api/keys"),
+            "should call GET /api/keys, got: {req_line}"
+        );
+
+        // Verify output format
+        assert!(
+            output.contains("Key uploaded: ABCD1234EF56 (uploaded 2026-02-10)"),
+            "should show fingerprint and formatted date, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_status_no_key() {
+        use std::io::{BufRead, BufReader, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mock_url = format!("http://127.0.0.1:{port}");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            reader.read_line(&mut req_line).unwrap();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim().is_empty() {
+                    break;
+                }
+            }
+            let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let cfg = config::CliConfig {
+            api_url: Some(mock_url),
+            token: Some("tok_keys_test".to_string()),
+            ..Default::default()
+        };
+        let output = run_keys_status_with_server(&cfg).unwrap();
+        handle.join().unwrap();
+
+        assert!(
+            output.contains("No encryption key uploaded."),
+            "should show no-key message, got: {output}"
+        );
+        assert!(
+            output.contains("Run 'keys push' to upload one."),
+            "should show push hint, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_status_no_key_empty_body_200() {
+        use std::io::{BufRead, BufReader, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mock_url = format!("http://127.0.0.1:{port}");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            reader.read_line(&mut req_line).unwrap();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim().is_empty() {
+                    break;
+                }
+            }
+            let resp = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let cfg = config::CliConfig {
+            api_url: Some(mock_url),
+            token: Some("tok_keys_test".to_string()),
+            ..Default::default()
+        };
+        let output = run_keys_status_with_server(&cfg).unwrap();
+        handle.join().unwrap();
+
+        assert!(
+            output.contains("No encryption key uploaded."),
+            "empty 200 should show no-key message, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_status_api_http_error() {
+        use std::io::{BufRead, BufReader, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mock_url = format!("http://127.0.0.1:{port}");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            reader.read_line(&mut req_line).unwrap();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim().is_empty() {
+                    break;
+                }
+            }
+            let body = r#"{"message":"Internal failure"}"#;
+            let resp = format!(
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let cfg = config::CliConfig {
+            api_url: Some(mock_url),
+            token: Some("tok_keys_test".to_string()),
+            ..Default::default()
+        };
+        let output = run_keys_status_with_server(&cfg).unwrap();
+        handle.join().unwrap();
+
+        assert!(
+            output.contains("Failed to check key status"),
+            "should show failure label, got: {output}"
+        );
+        assert!(
+            output.contains("Server error") || output.contains("Internal failure"),
+            "should include server error details, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_status_network_error() {
+        // Point at a port that is not listening
+        let cfg = config::CliConfig {
+            api_url: Some("http://127.0.0.1:1".to_string()),
+            token: Some("tok_keys_test".to_string()),
+            ..Default::default()
+        };
+        let output = run_keys_status_with_server(&cfg).unwrap();
+
+        assert!(
+            output.contains("Failed to check key status"),
+            "should show failure label on transport error, got: {output}"
+        );
+        assert!(
+            output.contains("failed to connect"),
+            "should include connection error context, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_status_with_key_no_created_at() {
+        use std::io::{BufRead, BufReader, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mock_url = format!("http://127.0.0.1:{port}");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            reader.read_line(&mut req_line).unwrap();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim().is_empty() {
+                    break;
+                }
+            }
+            let body = r#"{"fingerprint":"DEADBEEF"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let cfg = config::CliConfig {
+            api_url: Some(mock_url),
+            token: Some("tok_keys_test".to_string()),
+            ..Default::default()
+        };
+        let output = run_keys_status_with_server(&cfg).unwrap();
+        handle.join().unwrap();
+
+        assert!(
+            output.contains("Key uploaded: DEADBEEF (uploaded (unknown date))"),
+            "missing created_at should show unknown date, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_status_with_key_invalid_created_at() {
+        use std::io::{BufRead, BufReader, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mock_url = format!("http://127.0.0.1:{port}");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            reader.read_line(&mut req_line).unwrap();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim().is_empty() {
+                    break;
+                }
+            }
+            let body = r#"{"fingerprint":"CAFE9876","created_at":"not-a-date"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let cfg = config::CliConfig {
+            api_url: Some(mock_url),
+            token: Some("tok_keys_test".to_string()),
+            ..Default::default()
+        };
+        let output = run_keys_status_with_server(&cfg).unwrap();
+        handle.join().unwrap();
+
+        // Should fall back to raw string, not crash
+        assert!(
+            output.contains("Key uploaded: CAFE9876 (uploaded not-a-date)"),
+            "invalid date should fall back to raw string, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_status_sends_bearer_token() {
+        use std::io::{BufRead, BufReader, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mock_url = format!("http://127.0.0.1:{port}");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            reader.read_line(&mut req_line).unwrap();
+            let mut headers = Vec::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let trimmed = line.trim().to_string();
+                if trimmed.is_empty() {
+                    break;
+                }
+                headers.push(trimmed);
+            }
+            let body = r#"{"fingerprint":"FP1234"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            headers
+        });
+
+        let cfg = config::CliConfig {
+            api_url: Some(mock_url),
+            token: Some("tok_verify_bearer".to_string()),
+            ..Default::default()
+        };
+        let _output = run_keys_status_with_server(&cfg).unwrap();
+        let headers = handle.join().unwrap();
+
+        let auth_header = headers
+            .iter()
+            .find(|h| h.to_lowercase().starts_with("authorization:"))
+            .expect("should send Authorization header");
+        assert!(
+            auth_header.contains("Bearer tok_verify_bearer"),
+            "should send correct Bearer token, got: {auth_header}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // format_api_date helper tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn format_api_date_valid_rfc3339() {
+        assert_eq!(format_api_date("2026-02-10T14:30:00Z"), "2026-02-10");
+    }
+
+    #[test]
+    fn format_api_date_valid_with_offset() {
+        assert_eq!(format_api_date("2025-12-31T23:59:59+10:00"), "2025-12-31");
+    }
+
+    #[test]
+    fn format_api_date_invalid_falls_back_to_raw() {
+        assert_eq!(format_api_date("not-a-date"), "not-a-date");
+    }
+
+    #[test]
+    fn format_api_date_empty_falls_back_to_empty() {
+        assert_eq!(format_api_date(""), "");
+    }
+
+    #[test]
+    fn format_api_date_trims_whitespace_on_fallback() {
+        assert_eq!(format_api_date("  something  "), "something");
+    }
+
+    // -----------------------------------------------------------------------
+    // Auth & Keys help output tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn help_output_contains_auth_command() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(
+            help.contains("auth"),
+            "top-level help should mention auth, got: {}",
+            help
+        );
+        assert!(
+            help.contains("Authenticate with the AI Barometer API"),
+            "top-level help should show auth description, got: {}",
+            help
+        );
+    }
+
+    #[test]
+    fn help_output_contains_keys_command() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(
+            help.contains("keys"),
+            "top-level help should mention keys, got: {}",
+            help
+        );
+        assert!(
+            help.contains("Manage encryption keys"),
+            "top-level help should show keys description, got: {}",
+            help
+        );
+    }
+
+    #[test]
+    fn help_output_preserves_existing_commands() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(
+            help.contains("install"),
+            "help should still mention install"
+        );
+        assert!(help.contains("hook"), "help should still mention hook");
+        assert!(
+            help.contains("hydrate"),
+            "help should still mention hydrate"
+        );
+        assert!(help.contains("status"), "help should still mention status");
+        assert!(help.contains("gpg"), "help should still mention gpg");
+    }
+
+    #[test]
+    fn auth_help_shows_subcommands() {
+        let mut cmd = Cli::command();
+        let auth_cmd = cmd
+            .find_subcommand_mut("auth")
+            .expect("auth subcommand should exist");
+        let help = auth_cmd.render_long_help().to_string();
+        assert!(help.contains("login"), "auth help should show login");
+        assert!(help.contains("logout"), "auth help should show logout");
+        assert!(help.contains("status"), "auth help should show status");
+        assert!(
+            help.contains("browser-based GitHub OAuth"),
+            "auth login description should mention GitHub OAuth, got: {}",
+            help
+        );
+        assert!(
+            help.contains("Remove stored API credentials"),
+            "auth logout description should be present, got: {}",
+            help
+        );
+    }
+
+    #[test]
+    fn keys_help_shows_subcommands() {
+        let mut cmd = Cli::command();
+        let keys_cmd = cmd
+            .find_subcommand_mut("keys")
+            .expect("keys subcommand should exist");
+        let help = keys_cmd.render_long_help().to_string();
+        assert!(help.contains("status"), "keys help should show status");
+        assert!(help.contains("push"), "keys help should show push");
+        assert!(help.contains("test"), "keys help should show test");
+        assert!(
+            help.contains("encryption key status"),
+            "keys status description should be present, got: {}",
+            help
+        );
+        assert!(
+            help.contains("Upload a GPG private key")
+                || help.contains("upload a GPG private key")
+                || help.contains("Export and upload"),
+            "keys push description should mention key upload, got: {}",
+            help
+        );
+    }
+
+    #[test]
+    fn keys_push_help_shows_flags() {
+        let mut cmd = Cli::command();
+        let keys_cmd = cmd
+            .find_subcommand_mut("keys")
+            .expect("keys subcommand should exist");
+        let push_cmd = keys_cmd
+            .find_subcommand_mut("push")
+            .expect("push subcommand should exist");
+        let help = push_cmd.render_long_help().to_string();
+        assert!(help.contains("--key"), "push help should show --key flag");
+        assert!(help.contains("--yes"), "push help should show --yes flag");
+        assert!(
+            help.contains("GPG key ID") || help.contains("key ID"),
+            "push --key help should describe key identifier, got: {}",
+            help
+        );
+        assert!(
+            help.contains("confirmation prompt") || help.contains("Skip confirmation"),
+            "push --yes help should describe skipping confirmation, got: {}",
+            help
+        );
+    }
+
+    #[test]
+    fn auth_login_help_shows_api_url_flag() {
+        let mut cmd = Cli::command();
+        let auth_cmd = cmd
+            .find_subcommand_mut("auth")
+            .expect("auth subcommand should exist");
+        let login_cmd = auth_cmd
+            .find_subcommand_mut("login")
+            .expect("login subcommand should exist");
+        let help = login_cmd.render_long_help().to_string();
+        assert!(
+            help.contains("--api-url"),
+            "login help should show --api-url flag"
+        );
+        assert!(
+            help.contains("API base URL"),
+            "login --api-url help should describe overriding the API URL, got: {}",
+            help
+        );
     }
 
     // -----------------------------------------------------------------------
