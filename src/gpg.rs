@@ -175,6 +175,128 @@ pub fn import_key(source: &str) -> Result<()> {
     Ok(())
 }
 
+/// Export the ASCII-armored private key for a given key identifier.
+///
+/// Runs `gpg --batch --yes --armor --export-secret-keys <key_identifier>` and
+/// returns the armored private key block as a `String`.
+///
+/// Returns an error if:
+/// - The key identifier is blank.
+/// - The `gpg` binary cannot be spawned.
+/// - `gpg` exits with a non-zero status (key not found, passphrase required, etc.).
+/// - The export output is empty (key has no secret component).
+/// - The output is not valid UTF-8.
+pub fn export_secret_key(key_identifier: &str) -> Result<String> {
+    let trimmed = key_identifier.trim();
+    if trimmed.is_empty() {
+        bail!("gpg export: key identifier must not be blank");
+    }
+
+    let output = Command::new("gpg")
+        .args([
+            "--batch",
+            "--yes",
+            "--armor",
+            "--export-secret-keys",
+            trimmed,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .context("gpg: failed to spawn gpg binary")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let lower = stderr.to_lowercase();
+        if lower.contains("no secret key")
+            || lower.contains("secret key not available")
+            || lower.contains("not found")
+        {
+            bail!("Key not found in local GPG keyring: {trimmed}");
+        }
+        if lower.contains("passphrase") || lower.contains("pinentry") || lower.contains("agent") {
+            bail!("Key requires a passphrase — export without passphrase and try again: {trimmed}");
+        }
+        let code = output.status.code().unwrap_or(-1);
+        bail!(
+            "gpg --export-secret-keys failed (exit {code}): {}",
+            stderr.trim()
+        );
+    }
+
+    let armored =
+        String::from_utf8(output.stdout).context("gpg: export output was not valid UTF-8")?;
+
+    // gpg may exit 0 but produce empty output when the key has no secret component
+    if armored.trim().is_empty() {
+        bail!("Key not found in local GPG keyring: {trimmed}");
+    }
+
+    Ok(armored)
+}
+
+/// Extract the fingerprint for a given key identifier.
+///
+/// Runs `gpg --batch --with-colons --fingerprint <key_identifier>` and parses
+/// the first `fpr:` line to extract the fingerprint.
+///
+/// Returns an error if:
+/// - The key identifier is blank.
+/// - The `gpg` binary cannot be spawned.
+/// - `gpg` exits with a non-zero status.
+/// - No `fpr:` line is found in the output.
+pub fn get_fingerprint(key_identifier: &str) -> Result<String> {
+    let trimmed = key_identifier.trim();
+    if trimmed.is_empty() {
+        bail!("gpg fingerprint: key identifier must not be blank");
+    }
+
+    let output = Command::new("gpg")
+        .args(["--batch", "--with-colons", "--fingerprint", trimmed])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .context("gpg: failed to spawn gpg binary")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let lower = stderr.to_lowercase();
+        if lower.contains("not found") || lower.contains("no public key") {
+            bail!("Key not found in local GPG keyring: {trimmed}");
+        }
+        let code = output.status.code().unwrap_or(-1);
+        bail!("gpg --fingerprint failed (exit {code}): {}", stderr.trim());
+    }
+
+    let stdout =
+        String::from_utf8(output.stdout).context("gpg: fingerprint output was not valid UTF-8")?;
+
+    parse_fingerprint_from_colons(&stdout)
+        .ok_or_else(|| anyhow::anyhow!("Invalid key format: no fingerprint found for {trimmed}"))
+}
+
+/// Parse the first fingerprint from `gpg --with-colons` output.
+///
+/// Looks for a line starting with `fpr:` and extracts the fingerprint field
+/// (field index 9, zero-based). Returns `None` if no valid fingerprint is found.
+fn parse_fingerprint_from_colons(output: &str) -> Option<String> {
+    for line in output.lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        if fields.first() == Some(&"fpr") {
+            // The fingerprint is in field index 9
+            if let Some(fpr) = fields.get(9) {
+                let fpr = fpr.trim();
+                if !fpr.is_empty() {
+                    return Some(fpr.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Check if a key for the given recipient exists in the GPG keyring.
 ///
 /// Runs `gpg --batch --list-keys <recipient>` and returns `true` if the
@@ -701,5 +823,210 @@ mod tests {
             key_exists(&email)
         });
         assert!(exists, "imported key should be found in keyring");
+    }
+
+    // -------------------------------------------------------------------
+    // Unit tests: export_secret_key
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_export_secret_key_blank_identifier() {
+        let result = export_secret_key("");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("key identifier must not be blank"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_export_secret_key_whitespace_identifier() {
+        let result = export_secret_key("   ");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("key identifier must not be blank"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_export_secret_key_unknown_key() {
+        if !gpg_available() {
+            eprintln!("skipping test: gpg not available");
+            return;
+        }
+
+        let dir = empty_gnupghome();
+        let result = with_env("GNUPGHOME", dir.path().to_str().unwrap(), || {
+            export_secret_key("nonexistent-key-id@invalid.test")
+        });
+
+        assert!(result.is_err(), "export of unknown key should fail");
+        let msg = result.unwrap_err().to_string();
+        // On Windows the gpg-agent in an empty temp GNUPGHOME may emit
+        // passphrase/pinentry errors before reporting the key as missing,
+        // so we accept that error variant too.
+        assert!(
+            msg.contains("Key not found")
+                || msg.contains("gpg --export-secret-keys failed")
+                || msg.contains("Key requires a passphrase"),
+            "expected key-not-found error, got: {msg}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_export_secret_key_success() {
+        let Some((gpg_home, email)) = setup_test_gpg_keyring() else {
+            eprintln!("skipping test: gpg not available or key generation failed");
+            return;
+        };
+
+        let result = with_env("GNUPGHOME", gpg_home.path().to_str().unwrap(), || {
+            export_secret_key(&email)
+        });
+
+        assert!(result.is_ok(), "export should succeed: {:?}", result.err());
+        let armored = result.unwrap();
+        assert!(
+            armored.contains("-----BEGIN PGP PRIVATE KEY BLOCK-----"),
+            "exported key should contain PGP private key header, got: {}",
+            &armored[..armored.len().min(200)]
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Unit tests: get_fingerprint
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_get_fingerprint_blank_identifier() {
+        let result = get_fingerprint("");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("key identifier must not be blank"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_get_fingerprint_whitespace_identifier() {
+        let result = get_fingerprint("   ");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("key identifier must not be blank"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_get_fingerprint_unknown_key() {
+        if !gpg_available() {
+            eprintln!("skipping test: gpg not available");
+            return;
+        }
+
+        let dir = empty_gnupghome();
+        let result = with_env("GNUPGHOME", dir.path().to_str().unwrap(), || {
+            get_fingerprint("nonexistent-key-id@invalid.test")
+        });
+
+        assert!(result.is_err(), "fingerprint of unknown key should fail");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("Key not found") || msg.contains("gpg --fingerprint failed"),
+            "expected key-not-found error, got: {msg}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_get_fingerprint_success() {
+        let Some((gpg_home, email)) = setup_test_gpg_keyring() else {
+            eprintln!("skipping test: gpg not available or key generation failed");
+            return;
+        };
+
+        let result = with_env("GNUPGHOME", gpg_home.path().to_str().unwrap(), || {
+            get_fingerprint(&email)
+        });
+
+        assert!(
+            result.is_ok(),
+            "fingerprint should succeed: {:?}",
+            result.err()
+        );
+        let fpr = result.unwrap();
+        assert!(!fpr.is_empty(), "fingerprint should not be empty");
+        // GPG fingerprints are 40 hex characters
+        assert!(
+            fpr.len() == 40 && fpr.chars().all(|c| c.is_ascii_hexdigit()),
+            "fingerprint should be 40 hex chars, got: {fpr}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Unit tests: parse_fingerprint_from_colons (pure logic)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_fingerprint_valid() {
+        let output = "tru::1:1234567890:\npub:u:2048:1:ABCDEF1234567890:1234567890:::-:::scESC::::::23::0:\nfpr:::::::::ABCDEF1234567890ABCDEF1234567890ABCDEF12:";
+        let fpr = parse_fingerprint_from_colons(output);
+        assert_eq!(
+            fpr,
+            Some("ABCDEF1234567890ABCDEF1234567890ABCDEF12".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_fingerprint_multiple_fpr_lines_returns_first() {
+        let output = "fpr:::::::::AAAA1111BBBB2222CCCC3333DDDD4444EEEE5555:\nfpr:::::::::1111222233334444555566667777888899990000:";
+        let fpr = parse_fingerprint_from_colons(output);
+        assert_eq!(
+            fpr,
+            Some("AAAA1111BBBB2222CCCC3333DDDD4444EEEE5555".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_fingerprint_no_fpr_line() {
+        let output = "pub:u:2048:1:ABCDEF:1234567890:::-:::scESC:\nuid:u::::1234567890::HASH::Test User <test@test>:";
+        let fpr = parse_fingerprint_from_colons(output);
+        assert!(fpr.is_none());
+    }
+
+    #[test]
+    fn test_parse_fingerprint_empty_fpr_field() {
+        let output = "fpr::::::::::";
+        let fpr = parse_fingerprint_from_colons(output);
+        assert!(fpr.is_none());
+    }
+
+    #[test]
+    fn test_parse_fingerprint_empty_output() {
+        let fpr = parse_fingerprint_from_colons("");
+        assert!(fpr.is_none());
+    }
+
+    #[test]
+    fn test_parse_fingerprint_whitespace_fpr_field() {
+        let output = "fpr:::::::::   :";
+        let fpr = parse_fingerprint_from_colons(output);
+        assert!(fpr.is_none());
+    }
+
+    #[test]
+    fn test_parse_fingerprint_short_fpr_line() {
+        // Not enough fields
+        let output = "fpr::::";
+        let fpr = parse_fingerprint_from_colons(output);
+        assert!(fpr.is_none());
     }
 }
