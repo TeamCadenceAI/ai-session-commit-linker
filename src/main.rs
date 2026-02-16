@@ -2476,6 +2476,110 @@ const CALLBACK_SUCCESS_HTML: &str = r#"<!doctype html>
 </body>
 </html>"#;
 
+/// HTTP response for an invalid or rejected callback.
+const CALLBACK_ERROR_HTML: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cadence | Authentication Error</title>
+  <style>
+    :root {
+      --bg-top: #041126;
+      --bg-bottom: #0a2043;
+      --surface: rgba(9, 28, 56, 0.82);
+      --surface-border: rgba(255, 143, 143, 0.28);
+      --text-main: #eef5ff;
+      --text-dim: #bfd0ec;
+      --warn: #ff8f8f;
+      --warn-soft: rgba(255, 143, 143, 0.15);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+      color: var(--text-main);
+      font-family: "Avenir Next", "Segoe UI", "Helvetica Neue", sans-serif;
+      background:
+        radial-gradient(900px 500px at 10% -10%, rgba(70, 208, 255, 0.20), transparent 60%),
+        radial-gradient(900px 420px at 95% 100%, rgba(255, 143, 143, 0.18), transparent 60%),
+        linear-gradient(165deg, var(--bg-top), var(--bg-bottom));
+    }
+
+    .card {
+      width: min(560px, 100%);
+      background: var(--surface);
+      border: 1px solid var(--surface-border);
+      border-radius: 20px;
+      padding: 32px 28px;
+      box-shadow:
+        0 30px 70px rgba(0, 0, 0, 0.4),
+        inset 0 1px 0 rgba(255, 255, 255, 0.08);
+      backdrop-filter: blur(8px);
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 12px;
+      border-radius: 999px;
+      border: 1px solid rgba(255, 143, 143, 0.45);
+      background: var(--warn-soft);
+      color: #ffe6e6;
+      font-size: 13px;
+      letter-spacing: 0.02em;
+    }
+
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      background: var(--warn);
+      box-shadow: 0 0 0 7px rgba(255, 143, 143, 0.15);
+    }
+
+    h1 {
+      margin: 18px 0 10px;
+      font-size: clamp(26px, 5vw, 34px);
+      line-height: 1.1;
+      letter-spacing: -0.02em;
+    }
+
+    p {
+      margin: 0;
+      color: var(--text-dim);
+      font-size: 16px;
+      line-height: 1.5;
+    }
+
+    .hint {
+      margin-top: 20px;
+      display: inline-block;
+      padding: 10px 14px;
+      border-radius: 12px;
+      border: 1px solid rgba(255, 143, 143, 0.35);
+      background: rgba(255, 143, 143, 0.08);
+      color: #ffe2e2;
+      font-size: 14px;
+    }
+  </style>
+</head>
+<body>
+  <main class="card" role="main" aria-live="polite">
+    <div class="badge"><span class="dot" aria-hidden="true"></span>Authentication Failed</div>
+    <h1>We could not complete sign in</h1>
+    <p>This callback was invalid or expired, so Cadence did not accept it.</p>
+    <div class="hint">Close this tab and run <code>cadence auth login</code> again.</div>
+  </main>
+</body>
+</html>"#;
+
 /// Write an HTTP response to a TCP stream.
 fn write_http_response(
     stream: &mut std::net::TcpStream,
@@ -2552,23 +2656,18 @@ fn run_callback_listener(
 
                 let mut request_line = String::new();
                 if reader.read_line(&mut request_line).is_err() || request_line.is_empty() {
-                    write_http_response(&mut stream, 400, "Bad Request", "Bad request");
+                    write_http_response(&mut stream, 400, "Bad Request", CALLBACK_ERROR_HTML);
                     continue;
                 }
 
                 match parse_callback_request(request_line.trim()) {
                     Err(_) => {
-                        write_http_response(
-                            &mut stream,
-                            400,
-                            "Bad Request",
-                            "Invalid callback request",
-                        );
+                        write_http_response(&mut stream, 400, "Bad Request", CALLBACK_ERROR_HTML);
                         continue;
                     }
                     Ok(params) => {
                         if params.state != expected_state {
-                            write_http_response(&mut stream, 403, "Forbidden", "State mismatch");
+                            write_http_response(&mut stream, 403, "Forbidden", CALLBACK_ERROR_HTML);
                             continue;
                         }
 
