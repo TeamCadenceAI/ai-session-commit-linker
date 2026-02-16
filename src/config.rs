@@ -1,6 +1,6 @@
 //! Local config file module for API credentials and settings.
 //!
-//! Persists API credentials in `$HOME/.config/ai-session-commit-linker/config.toml`
+//! Persists API credentials in `$HOME/.config/cadence/config.toml`
 //! so the CLI can authenticate with the AI Barometer API across sessions.
 //!
 //! The config path intentionally uses a hardcoded `$HOME/.config` base on all
@@ -16,13 +16,13 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Hardcoded default API URL for the AI Barometer service.
-pub const DEFAULT_API_URL: &str = "https://app.aibarometer.dev";
+pub const DEFAULT_API_URL: &str = "https://dash.teamcadence.ai";
 
 /// Environment variable name for overriding the API URL.
 const API_URL_ENV_VAR: &str = "AI_BAROMETER_API_URL";
 
 /// Config directory name under `$HOME/.config/`.
-const CONFIG_DIR_NAME: &str = "ai-session-commit-linker";
+const CONFIG_DIR_NAME: &str = "cadence";
 
 /// Config file name.
 const CONFIG_FILE_NAME: &str = "config.toml";
@@ -38,7 +38,7 @@ pub struct ResolvedApiUrl {
 
 /// Local CLI configuration for API credentials and settings.
 ///
-/// Persisted as TOML at `$HOME/.config/ai-session-commit-linker/config.toml`.
+/// Persisted as TOML at `$HOME/.config/cadence/config.toml`.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct CliConfig {
     /// API base URL for the AI Barometer service.
@@ -52,7 +52,7 @@ pub struct CliConfig {
 }
 
 impl CliConfig {
-    /// Resolve the config file path: `$HOME/.config/ai-session-commit-linker/config.toml`.
+    /// Resolve the config file path: `$HOME/.config/cadence/config.toml`.
     ///
     /// Returns `None` if `$HOME` cannot be determined.
     pub fn config_path() -> Option<PathBuf> {
@@ -139,7 +139,7 @@ impl CliConfig {
     /// 1. `cli_override` — the `--api-url` CLI flag value for this invocation
     /// 2. `AI_BAROMETER_API_URL` environment variable
     /// 3. `api_url` field from the persisted config file
-    /// 4. Hardcoded default: `https://app.aibarometer.dev`
+    /// 4. Hardcoded default: `https://dash.teamcadence.ai`
     ///
     /// Empty or whitespace-only values at any layer are treated as absent and
     /// fall through to the next layer.
@@ -253,7 +253,7 @@ mod tests {
         let path = CliConfig::config_path_with_home(&home).unwrap();
         assert_eq!(
             path,
-            PathBuf::from("/home/tester/.config/ai-session-commit-linker/config.toml")
+            PathBuf::from("/home/tester/.config/cadence/config.toml")
         );
     }
 
@@ -266,7 +266,7 @@ mod tests {
         let path = CliConfig::config_path().unwrap();
         assert_eq!(
             path,
-            PathBuf::from("/tmp/fake-home/.config/ai-session-commit-linker/config.toml")
+            PathBuf::from("/tmp/fake-home/.config/cadence/config.toml")
         );
         drop(guard);
     }

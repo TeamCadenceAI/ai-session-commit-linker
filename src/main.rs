@@ -2891,7 +2891,7 @@ fn run_keys_push_inner(
             .map(char::from)
             .collect()
     };
-    let test_encrypted_message = gpg::encrypt_to_recipient(&challenge, &fingerprint)
+    let test_encrypted_message = gpg::encrypt_to_recipient_openpgp_compat(&challenge, &fingerprint)
         .context("Unable to encrypt test message with selected key")?;
 
     // 6. Confirmation prompt
@@ -3024,7 +3024,7 @@ fn run_keys_test_inner(
             .map(char::from)
             .collect()
     };
-    let encrypted_message = gpg::encrypt_to_recipient(&challenge, &key_id)
+    let encrypted_message = gpg::encrypt_to_recipient_openpgp_compat(&challenge, &key_id)
         .context("Unable to encrypt test message with selected key")?;
 
     // 4. Send to API
@@ -4077,7 +4077,7 @@ mod tests {
         let config_path = fake_home
             .path()
             .join(".config")
-            .join("ai-session-commit-linker")
+            .join("cadence")
             .join("config.toml");
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         let existing_cfg = config::CliConfig {
@@ -4305,7 +4305,7 @@ mod tests {
         let config_path = fake_home
             .path()
             .join(".config")
-            .join("ai-session-commit-linker")
+            .join("cadence")
             .join("config.toml");
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         let existing_cfg = config::CliConfig {
@@ -4349,7 +4349,7 @@ mod tests {
         let config_path = fake_home
             .path()
             .join(".config")
-            .join("ai-session-commit-linker")
+            .join("cadence")
             .join("config.toml");
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         // Pre-populate with an existing token so we hit the confirmation path
@@ -4396,7 +4396,7 @@ mod tests {
         let config_path = fake_home
             .path()
             .join(".config")
-            .join("ai-session-commit-linker")
+            .join("cadence")
             .join("config.toml");
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         let existing_cfg = config::CliConfig {
@@ -4439,7 +4439,7 @@ mod tests {
         let config_path = fake_home
             .path()
             .join(".config")
-            .join("ai-session-commit-linker")
+            .join("cadence")
             .join("config.toml");
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         let toml_str = toml::to_string_pretty(cfg).expect("failed to serialize config");
@@ -4786,7 +4786,7 @@ mod tests {
         let config_path = fake_home
             .path()
             .join(".config")
-            .join("ai-session-commit-linker")
+            .join("cadence")
             .join("config.toml");
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         let toml_str = toml::to_string_pretty(cfg).expect("failed to serialize config");
@@ -4927,7 +4927,7 @@ mod tests {
         let config_path = fake_home
             .path()
             .join(".config")
-            .join("ai-session-commit-linker")
+            .join("cadence")
             .join("config.toml");
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         std::fs::write(&config_path, "this is not valid toml {{{").unwrap();
@@ -5030,7 +5030,7 @@ mod tests {
         let config_path = fake_home
             .path()
             .join(".config")
-            .join("ai-session-commit-linker")
+            .join("cadence")
             .join("config.toml");
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         let toml_str = toml::to_string_pretty(cfg).expect("failed to serialize config");
@@ -5688,7 +5688,7 @@ mod tests {
         let config_path = fake_home
             .path()
             .join(".config")
-            .join("ai-session-commit-linker")
+            .join("cadence")
             .join("config.toml");
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         let toml_str = toml::to_string_pretty(cfg).expect("failed to serialize config");
@@ -6274,7 +6274,7 @@ mod tests {
         let config_path = fake_home
             .path()
             .join(".config")
-            .join("ai-session-commit-linker")
+            .join("cadence")
             .join("config.toml");
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         let toml_str = toml::to_string_pretty(cfg).expect("failed to serialize config");
@@ -6304,7 +6304,7 @@ mod tests {
         let config_path = fake_home
             .path()
             .join(".config")
-            .join("ai-session-commit-linker")
+            .join("cadence")
             .join("config.toml");
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         let toml_str = toml::to_string_pretty(cfg).expect("failed to serialize config");

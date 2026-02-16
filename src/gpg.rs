@@ -121,6 +121,35 @@ pub fn encrypt_to_recipient(plaintext: &str, recipient: &str) -> Result<String> 
     .context("gpg encrypt failed")
 }
 
+/// Encrypt plaintext for API challenge/test payloads using strict OpenPGP mode.
+///
+/// This forces a conservative packet profile (`--openpgp`, no compression,
+/// AES-128) to maximize compatibility with server-side OpenPGP parsers.
+pub fn encrypt_to_recipient_openpgp_compat(plaintext: &str, recipient: &str) -> Result<String> {
+    let trimmed = recipient.trim();
+    if trimmed.is_empty() {
+        bail!("gpg encrypt: recipient must not be blank");
+    }
+
+    run_gpg_with_input(
+        &[
+            "--batch",
+            "--yes",
+            "--openpgp",
+            "--compress-algo",
+            "none",
+            "--cipher-algo",
+            "AES128",
+            "--encrypt",
+            "--armor",
+            "-r",
+            trimmed,
+        ],
+        plaintext,
+    )
+    .context("gpg encrypt failed")
+}
+
 /// Decrypt an ASCII-armored PGP message.
 ///
 /// Spawns `gpg --batch --yes --decrypt`, pipes `ciphertext` to stdin, and
@@ -513,6 +542,28 @@ mod tests {
     #[test]
     fn test_encrypt_whitespace_recipient_fails() {
         let result = encrypt_to_recipient("hello", "   ");
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("recipient must not be blank"),
+            "unexpected error: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_encrypt_openpgp_compat_blank_recipient_fails() {
+        let result = encrypt_to_recipient_openpgp_compat("hello", "");
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("recipient must not be blank"),
+            "unexpected error: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_encrypt_openpgp_compat_whitespace_recipient_fails() {
+        let result = encrypt_to_recipient_openpgp_compat("hello", "   ");
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
