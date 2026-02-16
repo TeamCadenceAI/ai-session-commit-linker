@@ -2366,7 +2366,115 @@ fn parse_callback_request(request_line: &str) -> Result<CallbackParams> {
 }
 
 /// HTTP response for a successful callback.
-const CALLBACK_SUCCESS_HTML: &str = "Authentication successful. You can close this tab.";
+const CALLBACK_SUCCESS_HTML: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cadence | Authentication Complete</title>
+  <style>
+    :root {
+      --bg-top: #041126;
+      --bg-bottom: #0a2043;
+      --surface: rgba(9, 28, 56, 0.82);
+      --surface-border: rgba(140, 186, 255, 0.22);
+      --text-main: #eef5ff;
+      --text-dim: #a6bddf;
+      --accent: #46d0ff;
+      --accent-soft: rgba(70, 208, 255, 0.24);
+      --success: #31d19d;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+      color: var(--text-main);
+      font-family: "Avenir Next", "Segoe UI", "Helvetica Neue", sans-serif;
+      background:
+        radial-gradient(900px 500px at 10% -10%, rgba(70, 208, 255, 0.20), transparent 60%),
+        radial-gradient(800px 420px at 90% 110%, rgba(49, 209, 157, 0.18), transparent 60%),
+        linear-gradient(165deg, var(--bg-top), var(--bg-bottom));
+    }
+
+    .card {
+      width: min(560px, 100%);
+      background: var(--surface);
+      border: 1px solid var(--surface-border);
+      border-radius: 20px;
+      padding: 32px 28px;
+      box-shadow:
+        0 30px 70px rgba(0, 0, 0, 0.4),
+        inset 0 1px 0 rgba(255, 255, 255, 0.08);
+      backdrop-filter: blur(8px);
+      animation: rise 320ms ease-out;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 12px;
+      border-radius: 999px;
+      border: 1px solid rgba(49, 209, 157, 0.45);
+      background: rgba(49, 209, 157, 0.12);
+      color: #d8ffef;
+      font-size: 13px;
+      letter-spacing: 0.02em;
+    }
+
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      background: var(--success);
+      box-shadow: 0 0 0 7px rgba(49, 209, 157, 0.15);
+    }
+
+    h1 {
+      margin: 18px 0 10px;
+      font-size: clamp(26px, 5vw, 34px);
+      line-height: 1.1;
+      letter-spacing: -0.02em;
+    }
+
+    p {
+      margin: 0;
+      color: var(--text-dim);
+      font-size: 16px;
+      line-height: 1.5;
+    }
+
+    .hint {
+      margin-top: 20px;
+      display: inline-block;
+      padding: 10px 14px;
+      border-radius: 12px;
+      border: 1px solid var(--accent-soft);
+      background: rgba(70, 208, 255, 0.08);
+      color: #d7f2ff;
+      font-size: 14px;
+    }
+
+    @keyframes rise {
+      from { opacity: 0; transform: translateY(6px) scale(0.99); }
+      to { opacity: 1; transform: translateY(0) scale(1); }
+    }
+  </style>
+</head>
+<body>
+  <main class="card" role="main" aria-live="polite">
+    <div class="badge"><span class="dot" aria-hidden="true"></span>Cadence Connected</div>
+    <h1>Authentication successful</h1>
+    <p>Your Cadence CLI session is now authenticated and ready to use.</p>
+    <div class="hint">You can close this tab and return to your terminal.</div>
+  </main>
+</body>
+</html>"#;
 
 /// Write an HTTP response to a TCP stream.
 fn write_http_response(
