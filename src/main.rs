@@ -2891,8 +2891,9 @@ fn run_keys_push_inner(
             .map(char::from)
             .collect()
     };
-    let test_encrypted_message = gpg::encrypt_to_recipient_openpgp_compat(&challenge, &fingerprint)
-        .context("Unable to encrypt test message with selected key")?;
+    let test_encrypted_message =
+        gpg::encrypt_to_armored_private_key(&challenge, &armored_private_key)
+            .context("Unable to encrypt test message with selected key")?;
 
     // 6. Confirmation prompt
     let confirmed = if yes {
@@ -2988,9 +2989,10 @@ fn run_keys_test(key: Option<String>) -> Result<()> {
 /// Flow:
 /// 1. Load config and check for existing token (FR-7).
 /// 2. Resolve key identifier (--key flag or git config fallback).
-/// 3. Generate random challenge and encrypt locally.
-/// 4. Send encrypted message to API for server-side decryption test.
-/// 5. Print success or failure message.
+/// 3. Export armored private key for the selected key.
+/// 4. Generate random challenge and encrypt locally.
+/// 5. Send encrypted message to API for server-side decryption test.
+/// 6. Print success or failure message.
 fn run_keys_test_inner(
     w: &mut dyn std::io::Write,
     is_tty: bool,
@@ -3015,7 +3017,11 @@ fn run_keys_test_inner(
     // 2. Resolve key identifier
     let key_id = resolve_local_key_id(key_override)?;
 
-    // 3. Generate random challenge and encrypt locally
+    // 3. Export armored private key for compatible challenge encryption
+    let armored_private_key =
+        gpg::export_secret_key(&key_id).context("Failed to export private key from GPG keyring")?;
+
+    // 4. Generate random challenge and encrypt locally
     let challenge: String = {
         use rand::Rng;
         rand::rng()
@@ -3024,10 +3030,10 @@ fn run_keys_test_inner(
             .map(char::from)
             .collect()
     };
-    let encrypted_message = gpg::encrypt_to_recipient_openpgp_compat(&challenge, &key_id)
+    let encrypted_message = gpg::encrypt_to_armored_private_key(&challenge, &armored_private_key)
         .context("Unable to encrypt test message with selected key")?;
 
-    // 4. Send to API
+    // 5. Send to API
     let client = api_client::ApiClient::new(&resolved.url, Some(token));
     match client.test_key(&encrypted_message) {
         Ok(resp) => {
@@ -4076,8 +4082,8 @@ mod tests {
         let fake_home = TempDir::new().unwrap();
         let config_path = fake_home
             .path()
-            .join(".config")
-            .join("cadence")
+            .join(".cadence")
+            .join("cli")
             .join("config.toml");
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         let existing_cfg = config::CliConfig {
@@ -4304,8 +4310,8 @@ mod tests {
         let fake_home = TempDir::new().unwrap();
         let config_path = fake_home
             .path()
-            .join(".config")
-            .join("cadence")
+            .join(".cadence")
+            .join("cli")
             .join("config.toml");
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         let existing_cfg = config::CliConfig {
@@ -4348,8 +4354,8 @@ mod tests {
         let fake_home = TempDir::new().unwrap();
         let config_path = fake_home
             .path()
-            .join(".config")
-            .join("cadence")
+            .join(".cadence")
+            .join("cli")
             .join("config.toml");
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         // Pre-populate with an existing token so we hit the confirmation path
@@ -4395,8 +4401,8 @@ mod tests {
         let fake_home = TempDir::new().unwrap();
         let config_path = fake_home
             .path()
-            .join(".config")
-            .join("cadence")
+            .join(".cadence")
+            .join("cli")
             .join("config.toml");
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         let existing_cfg = config::CliConfig {
@@ -4438,8 +4444,8 @@ mod tests {
     fn run_auth_logout_with_home(fake_home: &TempDir, cfg: &config::CliConfig) -> Result<String> {
         let config_path = fake_home
             .path()
-            .join(".config")
-            .join("cadence")
+            .join(".cadence")
+            .join("cli")
             .join("config.toml");
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         let toml_str = toml::to_string_pretty(cfg).expect("failed to serialize config");
@@ -4785,8 +4791,8 @@ mod tests {
         let fake_home = TempDir::new().expect("failed to create fake home");
         let config_path = fake_home
             .path()
-            .join(".config")
-            .join("cadence")
+            .join(".cadence")
+            .join("cli")
             .join("config.toml");
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         let toml_str = toml::to_string_pretty(cfg).expect("failed to serialize config");
@@ -4926,8 +4932,8 @@ mod tests {
         let fake_home = TempDir::new().expect("failed to create fake home");
         let config_path = fake_home
             .path()
-            .join(".config")
-            .join("cadence")
+            .join(".cadence")
+            .join("cli")
             .join("config.toml");
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         std::fs::write(&config_path, "this is not valid toml {{{").unwrap();
@@ -5029,8 +5035,8 @@ mod tests {
         let fake_home = TempDir::new().expect("failed to create fake home");
         let config_path = fake_home
             .path()
-            .join(".config")
-            .join("cadence")
+            .join(".cadence")
+            .join("cli")
             .join("config.toml");
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         let toml_str = toml::to_string_pretty(cfg).expect("failed to serialize config");
@@ -5687,8 +5693,8 @@ mod tests {
         let fake_home = TempDir::new().expect("failed to create fake home");
         let config_path = fake_home
             .path()
-            .join(".config")
-            .join("cadence")
+            .join(".cadence")
+            .join("cli")
             .join("config.toml");
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         let toml_str = toml::to_string_pretty(cfg).expect("failed to serialize config");
@@ -6257,8 +6263,8 @@ mod tests {
         assert!(result.is_err(), "unknown key should fail");
         let err_msg = format!("{:#}", result.unwrap_err());
         assert!(
-            err_msg.contains("encrypt") || err_msg.contains("Unable to encrypt"),
-            "should mention encryption failure, got: {err_msg}"
+            err_msg.contains("Key not found") || err_msg.contains("export"),
+            "should mention key export failure, got: {err_msg}"
         );
     }
 
@@ -6273,8 +6279,8 @@ mod tests {
         let fake_home = TempDir::new().expect("failed to create fake home");
         let config_path = fake_home
             .path()
-            .join(".config")
-            .join("cadence")
+            .join(".cadence")
+            .join("cli")
             .join("config.toml");
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         let toml_str = toml::to_string_pretty(cfg).expect("failed to serialize config");
@@ -6303,8 +6309,8 @@ mod tests {
         let fake_home = TempDir::new().expect("failed to create fake home");
         let config_path = fake_home
             .path()
-            .join(".config")
-            .join("cadence")
+            .join(".cadence")
+            .join("cli")
             .join("config.toml");
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         let toml_str = toml::to_string_pretty(cfg).expect("failed to serialize config");
