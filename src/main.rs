@@ -2900,16 +2900,25 @@ fn collect_setup_inputs(
                 "I couldn't find a matching key for '{}' on this computer.",
                 trimmed
             )?;
-            let Some(cont) = prompter.confirm("Use it anyway?", writer)? else {
+            let Some(try_again) = prompter.confirm("Try a different email?", writer)? else {
                 return Ok(SetupOutcome::Aborted);
             };
-            if cont {
-                break trimmed;
+            if !try_again {
+                return Ok(SetupOutcome::Aborted);
             }
         }
     } else {
         recipient
     };
+
+    if !gpg::key_exists(&recipient) {
+        writeln!(
+            writer,
+            "I couldn't find a matching key for '{}' on this computer.",
+            recipient
+        )?;
+        return Ok(SetupOutcome::Aborted);
+    }
 
     Ok(SetupOutcome::Completed {
         recipient,
