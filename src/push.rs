@@ -16,8 +16,8 @@
 //! commit, never retry automatically in the hook.
 
 use crate::{git, output};
-use console::style;
 use anyhow::{Context, Result};
+use console::style;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::path::Path;
 
