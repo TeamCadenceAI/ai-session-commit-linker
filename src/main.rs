@@ -8,6 +8,7 @@ mod output;
 mod pending;
 mod push;
 mod scanner;
+mod update;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -72,6 +73,17 @@ enum Command {
     Gpg {
         #[command(subcommand)]
         gpg_command: GpgCommands,
+    },
+
+    /// Check for and install updates.
+    Update {
+        /// Only check if a newer version is available; do not download or install.
+        #[arg(long)]
+        check: bool,
+
+        /// Skip confirmation prompt when installing an update.
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 
     /// Authenticate with the AI Barometer API.
@@ -1846,6 +1858,29 @@ fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
         output::detail_to_with_tty(w, "Repo enabled: (n/a - not in a repo)", false);
     }
 
+    // --- Version and update info ---
+    output::detail_to_with_tty(
+        w,
+        &format!("Current version: {}", update::current_version()),
+        false,
+    );
+
+    let latest =
+        config::read_cached_latest_version().unwrap_or_else(|| "(not checked yet)".to_string());
+    output::detail_to_with_tty(w, &format!("Latest available: {latest}"), false);
+
+    let auto_update_label = match config::CliConfig::load() {
+        Ok(cfg) => {
+            if cfg.auto_update_enabled() {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        }
+        Err(_) => "disabled (config error)",
+    };
+    output::detail_to_with_tty(w, &format!("Auto update: {auto_update_label}"), false);
+
     Ok(())
 }
 
@@ -3334,12 +3369,29 @@ fn run_keys_test_inner(
 }
 
 // ---------------------------------------------------------------------------
+// Update
+// ---------------------------------------------------------------------------
+
+/// Runs the `cadence update` command.
+///
+/// With `--check`: queries GitHub for the latest release and reports whether
+/// an update is available. Never downloads or writes files.
+///
+/// Without `--check`: downloads, verifies, and replaces the running binary.
+/// Use `--yes` / `-y` to skip the confirmation prompt.
+fn run_update(check: bool, yes: bool) -> Result<()> {
+    update::run_update(check, yes)
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
 fn main() {
     let cli = Cli::parse();
     output::set_verbose(cli.verbose);
+
+    let is_update_command = matches!(cli.command, Command::Update { .. });
 
     let result = match cli.command {
         Command::Install { org } => run_install(org),
@@ -3358,6 +3410,7 @@ fn main() {
             NotesCommand::List { notes_ref } => run_notes_list(&notes_ref),
         },
         Command::Status => run_status(),
+        Command::Update { check, yes } => run_update(check, yes),
         Command::Gpg { gpg_command } => match gpg_command {
             GpgCommands::Status => run_gpg_status(),
             GpgCommands::Setup => run_gpg_setup(),
@@ -3373,6 +3426,12 @@ fn main() {
             KeysCommands::Test { key } => run_keys_test(key),
         },
     };
+
+    // Passive background version check: run after successful command execution
+    // on all non-Update commands. Failures are silently ignored.
+    if result.is_ok() && !is_update_command {
+        update::passive_version_check();
+    }
 
     if let Err(e) = result {
         output::fail("Failed", &format!("{}", e));
@@ -3949,6 +4008,82 @@ mod tests {
             "bare 'cadence keys' should parse successfully with no subcommand"
         );
         // Dispatch will default None to KeysCommands::Status via unwrap_or.
+    }
+
+    // -----------------------------------------------------------------------
+    // Update command parsing tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cli_parses_update_defaults() {
+        let cli = Cli::parse_from(["cadence", "update"]);
+        match cli.command {
+            Command::Update { check, yes } => {
+                assert!(!check);
+                assert!(!yes);
+            }
+            _ => panic!("expected Update command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_update_check() {
+        let cli = Cli::parse_from(["cadence", "update", "--check"]);
+        match cli.command {
+            Command::Update { check, yes } => {
+                assert!(check);
+                assert!(!yes);
+            }
+            _ => panic!("expected Update command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_update_yes_long() {
+        let cli = Cli::parse_from(["cadence", "update", "--yes"]);
+        match cli.command {
+            Command::Update { check, yes } => {
+                assert!(!check);
+                assert!(yes);
+            }
+            _ => panic!("expected Update command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_update_yes_short() {
+        let cli = Cli::parse_from(["cadence", "update", "-y"]);
+        match cli.command {
+            Command::Update { check, yes } => {
+                assert!(!check);
+                assert!(yes);
+            }
+            _ => panic!("expected Update command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_update_check_and_yes() {
+        let cli = Cli::parse_from(["cadence", "update", "--check", "--yes"]);
+        match cli.command {
+            Command::Update { check, yes } => {
+                assert!(check);
+                assert!(yes);
+            }
+            _ => panic!("expected Update command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_update_check_and_short_yes() {
+        let cli = Cli::parse_from(["cadence", "update", "--check", "-y"]);
+        match cli.command {
+            Command::Update { check, yes } => {
+                assert!(check);
+                assert!(yes);
+            }
+            _ => panic!("expected Update command"),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -4793,6 +4928,7 @@ mod tests {
             token: Some("tok_to_revoke".to_string()),
             github_login: Some("testuser".to_string()),
             expires_at: Some("2027-01-01T00:00:00Z".to_string()),
+            ..Default::default()
         };
         let output = run_auth_logout_with_home(&fake_home, &cfg).unwrap();
 
@@ -4901,6 +5037,7 @@ mod tests {
             token: Some("tok_unreachable".to_string()),
             github_login: Some("testuser".to_string()),
             expires_at: Some("2027-01-01T00:00:00Z".to_string()),
+            ..Default::default()
         };
         let output = run_auth_logout_with_home(&fake_home, &cfg).unwrap();
 
@@ -4975,6 +5112,7 @@ mod tests {
             token: Some("tok_expired".to_string()),
             github_login: Some("testuser".to_string()),
             expires_at: Some("2027-01-01T00:00:00Z".to_string()),
+            ..Default::default()
         };
         let output = run_auth_logout_with_home(&fake_home, &cfg).unwrap();
 
@@ -5126,6 +5264,7 @@ mod tests {
             token: Some("tok_abc123".to_string()),
             github_login: Some("octocat".to_string()),
             expires_at: Some("2026-12-31T23:59:59Z".to_string()),
+            ..Default::default()
         };
         let output = run_auth_status_with_config(&cfg).unwrap();
         assert!(
@@ -10906,6 +11045,280 @@ mod tests {
             match original_home {
                 Some(h) => std::env::set_var("HOME", h),
                 None => std::env::remove_var("HOME"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Status: version and auto-update info
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn test_status_shows_current_version() {
+        let original_cwd = safe_cwd();
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        let original_global = std::env::var("GIT_CONFIG_GLOBAL").ok();
+
+        let global_config = fake_home.path().join("fake-global-gitconfig");
+        std::fs::write(&global_config, "").unwrap();
+
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+            std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
+        }
+        std::env::set_current_dir(tmp.path()).expect("failed to chdir");
+
+        let mut buf = Vec::new();
+        let result = run_status_inner(&mut buf);
+        assert!(result.is_ok());
+
+        let output = String::from_utf8(buf).unwrap();
+        let expected_version = update::current_version();
+        assert!(
+            output.contains(&format!("Current version: {expected_version}")),
+            "should show current version, got: {output}"
+        );
+
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+            match original_global {
+                Some(g) => std::env::set_var("GIT_CONFIG_GLOBAL", g),
+                None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_status_shows_latest_not_checked_when_no_cache() {
+        let original_cwd = safe_cwd();
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        let original_global = std::env::var("GIT_CONFIG_GLOBAL").ok();
+
+        let global_config = fake_home.path().join("fake-global-gitconfig");
+        std::fs::write(&global_config, "").unwrap();
+
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+            std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
+        }
+        std::env::set_current_dir(tmp.path()).expect("failed to chdir");
+
+        let mut buf = Vec::new();
+        let result = run_status_inner(&mut buf);
+        assert!(result.is_ok());
+
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("Latest available: (not checked yet)"),
+            "should show not-checked-yet when no cache, got: {output}"
+        );
+
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+            match original_global {
+                Some(g) => std::env::set_var("GIT_CONFIG_GLOBAL", g),
+                None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_status_shows_cached_latest_version() {
+        let original_cwd = safe_cwd();
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        let original_global = std::env::var("GIT_CONFIG_GLOBAL").ok();
+
+        let global_config = fake_home.path().join("fake-global-gitconfig");
+        std::fs::write(&global_config, "").unwrap();
+
+        // Create cached latest version file
+        let config_dir = fake_home.path().join(".cadence").join("cli");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join(config::LATEST_VERSION_CACHE_FILE),
+            "0.5.0\n",
+        )
+        .unwrap();
+
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+            std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
+        }
+        std::env::set_current_dir(tmp.path()).expect("failed to chdir");
+
+        let mut buf = Vec::new();
+        let result = run_status_inner(&mut buf);
+        assert!(result.is_ok());
+
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("Latest available: 0.5.0"),
+            "should show cached version, got: {output}"
+        );
+
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+            match original_global {
+                Some(g) => std::env::set_var("GIT_CONFIG_GLOBAL", g),
+                None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_status_shows_auto_update_disabled_by_default() {
+        let original_cwd = safe_cwd();
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        let original_global = std::env::var("GIT_CONFIG_GLOBAL").ok();
+
+        let global_config = fake_home.path().join("fake-global-gitconfig");
+        std::fs::write(&global_config, "").unwrap();
+
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+            std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
+        }
+        std::env::set_current_dir(tmp.path()).expect("failed to chdir");
+
+        let mut buf = Vec::new();
+        let result = run_status_inner(&mut buf);
+        assert!(result.is_ok());
+
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("Auto update: disabled"),
+            "should show auto-update disabled by default, got: {output}"
+        );
+
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+            match original_global {
+                Some(g) => std::env::set_var("GIT_CONFIG_GLOBAL", g),
+                None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_status_shows_auto_update_enabled_from_config() {
+        let original_cwd = safe_cwd();
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        let original_global = std::env::var("GIT_CONFIG_GLOBAL").ok();
+
+        let global_config = fake_home.path().join("fake-global-gitconfig");
+        std::fs::write(&global_config, "").unwrap();
+
+        // Create config with auto_update = true
+        let config_dir = fake_home.path().join(".cadence").join("cli");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join("config.toml"), "auto_update = true\n").unwrap();
+
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+            std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
+        }
+        std::env::set_current_dir(tmp.path()).expect("failed to chdir");
+
+        let mut buf = Vec::new();
+        let result = run_status_inner(&mut buf);
+        assert!(result.is_ok());
+
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("Auto update: enabled"),
+            "should show auto-update enabled when config says true, got: {output}"
+        );
+
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+            match original_global {
+                Some(g) => std::env::set_var("GIT_CONFIG_GLOBAL", g),
+                None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_status_handles_corrupt_cache_gracefully() {
+        let original_cwd = safe_cwd();
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        let original_global = std::env::var("GIT_CONFIG_GLOBAL").ok();
+
+        let global_config = fake_home.path().join("fake-global-gitconfig");
+        std::fs::write(&global_config, "").unwrap();
+
+        // Create a corrupt cache file (just whitespace)
+        let config_dir = fake_home.path().join(".cadence").join("cli");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join(config::LATEST_VERSION_CACHE_FILE),
+            "   \n\n  ",
+        )
+        .unwrap();
+
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+            std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
+        }
+        std::env::set_current_dir(tmp.path()).expect("failed to chdir");
+
+        let mut buf = Vec::new();
+        let result = run_status_inner(&mut buf);
+        assert!(result.is_ok(), "status should not fail on corrupt cache");
+
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("Latest available: (not checked yet)"),
+            "corrupt cache should fall back to not-checked-yet, got: {output}"
+        );
+
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+            match original_global {
+                Some(g) => std::env::set_var("GIT_CONFIG_GLOBAL", g),
+                None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
             }
         }
         std::env::set_current_dir(original_cwd).unwrap();
