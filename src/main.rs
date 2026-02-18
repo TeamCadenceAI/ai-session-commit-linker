@@ -572,7 +572,7 @@ fn run_hook_post_commit() -> Result<()> {
         hook_post_commit_inner()
     });
 
-    match result {
+    let final_result = match result {
         Ok(Ok(())) => Ok(()),
         Ok(Err(HookError::GpgEncryptionFailed(msg))) => {
             output::fail("GPG", &format!("encryption failed ({})", msg));
@@ -586,7 +586,10 @@ fn run_hook_post_commit() -> Result<()> {
             output::note("Hook panicked (please report this issue)");
             Ok(())
         }
-    }
+    };
+
+    eprintln!();
+    final_result
 }
 
 /// The pre-push hook handler. Must never block the push.
@@ -605,6 +608,7 @@ fn run_hook_pre_push(remote: &str, url: &str) -> Result<()> {
         }
     }
 
+    eprintln!();
     Ok(())
 }
 

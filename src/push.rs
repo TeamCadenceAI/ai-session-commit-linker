@@ -16,6 +16,7 @@
 //! commit, never retry automatically in the hook.
 
 use crate::{git, output};
+use console::style;
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::path::Path;
@@ -65,6 +66,11 @@ pub fn attempt_push_remote(remote: &str) {
 pub fn sync_notes_for_remote(remote: &str) {
     let start = std::time::Instant::now();
     let use_progress = output::is_stderr_tty() && !output::is_verbose();
+    let cadence_label = if output::is_stderr_tty() {
+        style("[Cadence]").bold().green().to_string()
+    } else {
+        "[Cadence]".to_string()
+    };
     let progress = if use_progress {
         let pb = ProgressBar::new_spinner();
         pb.set_draw_target(ProgressDrawTarget::stderr());
@@ -74,12 +80,12 @@ pub fn sync_notes_for_remote(remote: &str) {
         );
         pb.enable_steady_tick(std::time::Duration::from_millis(120));
         pb.set_message(format!(
-            "[Cadence] Syncing attached agent sessions with {}",
-            remote
+            "{} Syncing attached agent sessions with {}",
+            cadence_label, remote
         ));
         Some(pb)
     } else {
-        output::action("Cadence", &format!("Syncing notes with {}", remote));
+        output::success("Cadence", &format!("Syncing notes with {}", remote));
         None
     };
 
@@ -87,11 +93,12 @@ pub fn sync_notes_for_remote(remote: &str) {
     if let Some(pb) = progress {
         match &result {
             Ok(()) => pb.finish_with_message(format!(
-                "[Cadence] Synced attached agent sessions with {}",
-                remote
+                "✔ {} Synced attached agent sessions with {}",
+                cadence_label, remote
             )),
             Err(_) => pb.finish_and_clear(),
         }
+        eprintln!();
     }
 
     if let Err(e) = result {
@@ -101,6 +108,7 @@ pub fn sync_notes_for_remote(remote: &str) {
             "Cadence",
             &format!("Notes sync done in {} ms", start.elapsed().as_millis()),
         );
+        eprintln!();
     }
 }
 
