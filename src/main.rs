@@ -73,12 +73,6 @@ enum Command {
     /// Show Cadence CLI status for the current repository.
     Status,
 
-    /// Authenticate with the AI Barometer API.
-    Auth {
-        #[command(subcommand)]
-        auth_command: AuthCommands,
-    },
-
     /// Manage encryption for local + API recipients.
     Keys {
         #[command(subcommand)]
@@ -117,20 +111,6 @@ enum HookCommand {
         /// Unix epoch timestamp of the commit.
         timestamp: i64,
     },
-}
-
-#[derive(Subcommand, Debug)]
-enum AuthCommands {
-    /// Authenticate with the AI Barometer API via browser-based GitHub OAuth.
-    Login {
-        /// Override the API base URL (default: production).
-        #[arg(long)]
-        api_url: Option<String>,
-    },
-    /// Remove stored API credentials.
-    Logout,
-    /// Show current authentication status.
-    Status,
 }
 
 #[derive(Subcommand, Debug)]
@@ -265,8 +245,11 @@ fn resolve_api_public_key_cache(force_refresh: bool) -> Result<Option<String>> {
 
     let cfg = config::CliConfig::load()?;
     let resolved = cfg.resolve_api_url(None);
-    let client = api_client::ApiClient::new(&resolved.url, None);
-    let api_key = client.get_api_public_key()?;
+    let client = api_client::ApiClient::new(&resolved.url);
+    let keys_url = format!("{}/api/keys/public", resolved.url.trim_end_matches('/'));
+    let api_key = client
+        .get_api_public_key()
+        .with_context(|| format!("failed to fetch API public key from {keys_url}"))?;
 
     let meta = pgp_keys::ApiPublicKeyMetadata {
         fingerprint: api_key.fingerprint.clone(),
@@ -2134,7 +2117,7 @@ fn run_keys_setup() -> Result<()> {
         anyhow::bail!("cadence keys setup requires an interactive TTY. Run from a terminal.");
     }
     let mut prompter = DialoguerPrompter::new();
-    run_keys_setup_inner(&mut prompter, &mut std::io::stdout())
+    run_keys_setup_inner(&mut prompter, &mut std::io::stdout(), true)
 }
 
 fn run_keys_refresh() -> Result<()> {
@@ -2198,10 +2181,10 @@ fn run_install_encryption_setup() -> Result<()> {
         return Ok(());
     }
 
-    if let Err(e) = run_keys_setup_inner(&mut prompter, &mut stdout) {
+    if let Err(e) = run_keys_setup_inner(&mut prompter, &mut stdout, false) {
         output::note_to_with_tty(
             &mut stdout,
-            &format!("Encryption setup incomplete: {}", e),
+            &format!("Encryption setup incomplete: {e:#}"),
             is_tty,
         );
         anyhow::bail!("encryption setup failed");
@@ -2298,15 +2281,18 @@ fn generate_passphrase() -> String {
 fn run_keys_setup_inner(
     prompter: &mut dyn Prompter,
     writer: &mut dyn std::io::Write,
+    show_intro: bool,
 ) -> Result<()> {
     let is_tty = Term::stdout().is_term();
-    output::action_to_with_tty(writer, "Encryption", "setup", is_tty);
-    output::detail_to_with_tty(
-        writer,
-        "Encrypt attached session notes so only you and the Cadence API can read them.",
-        is_tty,
-    );
-    writeln!(writer)?;
+    if show_intro {
+        output::action_to_with_tty(writer, "Encryption", "setup", is_tty);
+        output::detail_to_with_tty(
+            writer,
+            "Encrypt attached session notes so only you and the Cadence API can read them.",
+            is_tty,
+        );
+        writeln!(writer)?;
+    }
 
     let name = required_git_value("user.name", "user.name")?;
     let email = required_git_value("user.email", "user.email")?;
@@ -2318,6 +2304,10 @@ fn run_keys_setup_inner(
         .context("failed to read cached local public key")?;
     let cached_private = pgp_keys::load_cached_user_private_key()
         .context("failed to read cached local private key")?;
+
+    if resolve_api_public_key_cache(true)?.is_none() {
+        anyhow::bail!("failed to fetch API public key");
+    }
 
     let fingerprint = if let (Some(public), Some(_private)) =
         (cached_public.as_ref(), cached_private.as_ref())
@@ -2361,648 +2351,11 @@ fn run_keys_setup_inner(
     git::config_set_global(pgp_keys::USER_FINGERPRINT_KEY, &fingerprint)
         .context("failed to save user fingerprint to git config")?;
 
-    if resolve_api_public_key_cache(true)?.is_none() {
-        anyhow::bail!("failed to fetch api public key");
-    }
-
     writeln!(writer)?;
     output::success_to_with_tty(writer, "Encryption", "ready.", is_tty);
     writeln!(writer, "Local key fingerprint: {}", fingerprint)?;
     if let Ok(Some(api_fpr)) = pgp_keys::get_api_fingerprint() {
         writeln!(writer, "API key fingerprint: {}", api_fpr)?;
-    }
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Auth login helpers
-// ---------------------------------------------------------------------------
-
-/// Generate a random 16-byte CSRF nonce as a 32-character lowercase hex string.
-fn generate_auth_nonce() -> String {
-    let mut bytes = [0u8; 16];
-    rand::fill(&mut bytes);
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
-}
-
-/// Build the OAuth browser URL: `{api_url}/auth/token?port={port}&state={nonce}`.
-fn build_auth_browser_url(api_url: &str, port: u16, state: &str) -> String {
-    let base = api_url.trim_end_matches('/');
-    format!("{base}/auth/token?port={port}&state={state}")
-}
-
-/// Parsed callback request from the localhost listener.
-#[derive(Debug)]
-struct CallbackParams {
-    code: String,
-    state: String,
-}
-
-/// Parse an HTTP request line from the callback listener.
-///
-/// Enforces the strict callback contract: only `GET /callback?code=<...>&state=<...>`
-/// is accepted. Returns an error describing the rejection reason for any
-/// non-conforming request.
-fn parse_callback_request(request_line: &str) -> Result<CallbackParams> {
-    let parts: Vec<&str> = request_line.split_whitespace().collect();
-    if parts.len() < 2 {
-        anyhow::bail!("malformed request line");
-    }
-
-    let method = parts[0];
-    if method != "GET" {
-        anyhow::bail!("unexpected method: {method}");
-    }
-
-    // Parse the path + query using the url crate with a dummy base
-    let full_url = format!("http://localhost{}", parts[1]);
-    let parsed = url::Url::parse(&full_url).map_err(|e| anyhow::anyhow!("malformed URL: {e}"))?;
-
-    if parsed.path() != "/callback" {
-        anyhow::bail!("unexpected path: {}", parsed.path());
-    }
-
-    let mut code: Option<String> = None;
-    let mut state: Option<String> = None;
-
-    for (key, value) in parsed.query_pairs() {
-        match key.as_ref() {
-            "code" => code = Some(value.into_owned()),
-            "state" => state = Some(value.into_owned()),
-            _ => {} // Ignore extra params
-        }
-    }
-
-    let code = code.ok_or_else(|| anyhow::anyhow!("missing 'code' parameter"))?;
-    let state = state.ok_or_else(|| anyhow::anyhow!("missing 'state' parameter"))?;
-
-    if code.is_empty() {
-        anyhow::bail!("empty 'code' parameter");
-    }
-    if state.is_empty() {
-        anyhow::bail!("empty 'state' parameter");
-    }
-
-    Ok(CallbackParams { code, state })
-}
-
-/// HTTP response for a successful callback.
-const CALLBACK_SUCCESS_HTML: &str = r#"<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Cadence | Authentication Complete</title>
-  <style>
-    :root {
-      --bg-top: #041126;
-      --bg-bottom: #0a2043;
-      --surface: rgba(9, 28, 56, 0.82);
-      --surface-border: rgba(140, 186, 255, 0.22);
-      --text-main: #eef5ff;
-      --text-dim: #a6bddf;
-      --accent: #46d0ff;
-      --accent-soft: rgba(70, 208, 255, 0.24);
-      --success: #31d19d;
-    }
-
-    * { box-sizing: border-box; }
-
-    body {
-      margin: 0;
-      min-height: 100vh;
-      display: grid;
-      place-items: center;
-      padding: 24px;
-      color: var(--text-main);
-      font-family: "Avenir Next", "Segoe UI", "Helvetica Neue", sans-serif;
-      background:
-        radial-gradient(900px 500px at 10% -10%, rgba(70, 208, 255, 0.20), transparent 60%),
-        radial-gradient(800px 420px at 90% 110%, rgba(49, 209, 157, 0.18), transparent 60%),
-        linear-gradient(165deg, var(--bg-top), var(--bg-bottom));
-    }
-
-    .card {
-      width: min(560px, 100%);
-      background: var(--surface);
-      border: 1px solid var(--surface-border);
-      border-radius: 20px;
-      padding: 32px 28px;
-      box-shadow:
-        0 30px 70px rgba(0, 0, 0, 0.4),
-        inset 0 1px 0 rgba(255, 255, 255, 0.08);
-      backdrop-filter: blur(8px);
-      animation: rise 320ms ease-out;
-    }
-
-    .badge {
-      display: inline-flex;
-      align-items: center;
-      gap: 10px;
-      padding: 8px 12px;
-      border-radius: 999px;
-      border: 1px solid rgba(49, 209, 157, 0.45);
-      background: rgba(49, 209, 157, 0.12);
-      color: #d8ffef;
-      font-size: 13px;
-      letter-spacing: 0.02em;
-    }
-
-    .dot {
-      width: 10px;
-      height: 10px;
-      border-radius: 999px;
-      background: var(--success);
-      box-shadow: 0 0 0 7px rgba(49, 209, 157, 0.15);
-    }
-
-    h1 {
-      margin: 18px 0 10px;
-      font-size: clamp(26px, 5vw, 34px);
-      line-height: 1.1;
-      letter-spacing: -0.02em;
-    }
-
-    p {
-      margin: 0;
-      color: var(--text-dim);
-      font-size: 16px;
-      line-height: 1.5;
-    }
-
-    .hint {
-      margin-top: 20px;
-      display: inline-block;
-      padding: 10px 14px;
-      border-radius: 12px;
-      border: 1px solid var(--accent-soft);
-      background: rgba(70, 208, 255, 0.08);
-      color: #d7f2ff;
-      font-size: 14px;
-    }
-
-    @keyframes rise {
-      from { opacity: 0; transform: translateY(6px) scale(0.99); }
-      to { opacity: 1; transform: translateY(0) scale(1); }
-    }
-  </style>
-</head>
-<body>
-  <main class="card" role="main" aria-live="polite">
-    <div class="badge"><span class="dot" aria-hidden="true"></span>Cadence Connected</div>
-    <h1>Authentication successful</h1>
-    <p>Your Cadence CLI session is now authenticated and ready to use.</p>
-    <div class="hint">You can close this tab and return to your terminal.</div>
-  </main>
-</body>
-</html>"#;
-
-/// HTTP response for an invalid or rejected callback.
-const CALLBACK_ERROR_HTML: &str = r#"<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Cadence | Authentication Error</title>
-  <style>
-    :root {
-      --bg-top: #041126;
-      --bg-bottom: #0a2043;
-      --surface: rgba(9, 28, 56, 0.82);
-      --surface-border: rgba(255, 143, 143, 0.28);
-      --text-main: #eef5ff;
-      --text-dim: #bfd0ec;
-      --warn: #ff8f8f;
-      --warn-soft: rgba(255, 143, 143, 0.15);
-    }
-
-    * { box-sizing: border-box; }
-
-    body {
-      margin: 0;
-      min-height: 100vh;
-      display: grid;
-      place-items: center;
-      padding: 24px;
-      color: var(--text-main);
-      font-family: "Avenir Next", "Segoe UI", "Helvetica Neue", sans-serif;
-      background:
-        radial-gradient(900px 500px at 10% -10%, rgba(70, 208, 255, 0.20), transparent 60%),
-        radial-gradient(900px 420px at 95% 100%, rgba(255, 143, 143, 0.18), transparent 60%),
-        linear-gradient(165deg, var(--bg-top), var(--bg-bottom));
-    }
-
-    .card {
-      width: min(560px, 100%);
-      background: var(--surface);
-      border: 1px solid var(--surface-border);
-      border-radius: 20px;
-      padding: 32px 28px;
-      box-shadow:
-        0 30px 70px rgba(0, 0, 0, 0.4),
-        inset 0 1px 0 rgba(255, 255, 255, 0.08);
-      backdrop-filter: blur(8px);
-    }
-
-    .badge {
-      display: inline-flex;
-      align-items: center;
-      gap: 10px;
-      padding: 8px 12px;
-      border-radius: 999px;
-      border: 1px solid rgba(255, 143, 143, 0.45);
-      background: var(--warn-soft);
-      color: #ffe6e6;
-      font-size: 13px;
-      letter-spacing: 0.02em;
-    }
-
-    .dot {
-      width: 10px;
-      height: 10px;
-      border-radius: 999px;
-      background: var(--warn);
-      box-shadow: 0 0 0 7px rgba(255, 143, 143, 0.15);
-    }
-
-    h1 {
-      margin: 18px 0 10px;
-      font-size: clamp(26px, 5vw, 34px);
-      line-height: 1.1;
-      letter-spacing: -0.02em;
-    }
-
-    p {
-      margin: 0;
-      color: var(--text-dim);
-      font-size: 16px;
-      line-height: 1.5;
-    }
-
-    .hint {
-      margin-top: 20px;
-      display: inline-block;
-      padding: 10px 14px;
-      border-radius: 12px;
-      border: 1px solid rgba(255, 143, 143, 0.35);
-      background: rgba(255, 143, 143, 0.08);
-      color: #ffe2e2;
-      font-size: 14px;
-    }
-  </style>
-</head>
-<body>
-  <main class="card" role="main" aria-live="polite">
-    <div class="badge"><span class="dot" aria-hidden="true"></span>Authentication Failed</div>
-    <h1>We could not complete sign in</h1>
-    <p>This callback was invalid or expired, so Cadence did not accept it.</p>
-    <div class="hint">Close this tab and run <code>cadence auth login</code> again.</div>
-  </main>
-</body>
-</html>"#;
-
-/// Write an HTTP response to a TCP stream.
-fn write_http_response(
-    stream: &mut std::net::TcpStream,
-    status: u16,
-    status_text: &str,
-    body: &str,
-) {
-    use std::io::Write;
-    let response = format!(
-        "HTTP/1.1 {status} {status_text}\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    let _ = stream.write_all(response.as_bytes());
-    let _ = stream.flush();
-}
-
-/// Run the localhost callback listener.
-///
-/// Binds to `127.0.0.1:0` (OS-assigned port), listens for up to `timeout`
-/// duration, and enforces the strict callback contract. Returns the OAuth
-/// authorization code on success.
-///
-/// - Malformed requests are rejected and the listener keeps serving.
-/// - State mismatches are rejected and the listener keeps serving.
-/// - Only a valid `GET /callback?code=<...>&state=<expected>` stops the listener.
-fn run_callback_listener(
-    listener: &std::net::TcpListener,
-    expected_state: &str,
-    timeout: std::time::Duration,
-) -> Result<String> {
-    use std::io::{BufRead, BufReader};
-
-    let deadline = std::time::Instant::now() + timeout;
-
-    // Set a short accept timeout for polling
-    listener.set_nonblocking(false)?;
-
-    loop {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            anyhow::bail!("Authentication timed out. Please try again.");
-        }
-
-        // Use a poll interval: accept with a short timeout then check deadline
-        let poll_interval = remaining.min(std::time::Duration::from_millis(500));
-        listener.set_nonblocking(false)?;
-        // We simulate timeout by setting SO_RCVTIMEO-like behavior via
-        // set_nonblocking + sleep to avoid platform-specific socket options.
-        listener.set_nonblocking(true)?;
-
-        let accept_result = listener.accept();
-        match accept_result {
-            Err(ref e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                std::thread::sleep(poll_interval);
-                continue;
-            }
-            Err(e) => {
-                // Transient accept error — log and keep listening
-                eprintln!("listener accept error: {e}");
-                continue;
-            }
-            Ok((mut stream, _addr)) => {
-                // Set a read timeout on the connection to avoid hanging on slow clients
-                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
-
-                let mut reader = BufReader::new(stream.try_clone().unwrap_or_else(|_| {
-                    // If clone fails, we still have the original stream reference
-                    // This path is unlikely but handle gracefully
-                    stream.try_clone().expect("TCP stream clone failed")
-                }));
-
-                let mut request_line = String::new();
-                if reader.read_line(&mut request_line).is_err() || request_line.is_empty() {
-                    write_http_response(&mut stream, 400, "Bad Request", CALLBACK_ERROR_HTML);
-                    continue;
-                }
-
-                match parse_callback_request(request_line.trim()) {
-                    Err(_) => {
-                        write_http_response(&mut stream, 400, "Bad Request", CALLBACK_ERROR_HTML);
-                        continue;
-                    }
-                    Ok(params) => {
-                        if params.state != expected_state {
-                            write_http_response(&mut stream, 403, "Forbidden", CALLBACK_ERROR_HTML);
-                            continue;
-                        }
-
-                        // Valid callback — send success response and return the code
-                        write_http_response(&mut stream, 200, "OK", CALLBACK_SUCCESS_HTML);
-                        return Ok(params.code);
-                    }
-                }
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Auth login command
-// ---------------------------------------------------------------------------
-
-/// Outer entry point for `auth login` — uses real stderr and TTY detection.
-fn run_auth_login(api_url: Option<String>) -> Result<()> {
-    let is_tty = output::is_stderr_tty();
-    run_auth_login_inner(
-        api_url,
-        &mut std::io::stderr(),
-        is_tty,
-        None, // real stdin for confirmation prompts
-    )
-}
-
-/// Inner implementation of `auth login` for testability.
-///
-/// `confirm_override`: if `Some(bool)`, skips interactive prompt and uses
-/// the provided value for the already-authenticated confirmation. If `None`,
-/// uses interactive prompt (or fails in non-TTY mode).
-fn run_auth_login_inner(
-    api_url: Option<String>,
-    w: &mut dyn std::io::Write,
-    is_tty: bool,
-    confirm_override: Option<bool>,
-) -> Result<()> {
-    // Step 1: Load config
-    let mut cfg = config::CliConfig::load()?;
-
-    // Step 2: Resolve API URL
-    let resolved = cfg.resolve_api_url(api_url.as_deref());
-    if resolved.is_non_https {
-        output::note_to_with_tty(
-            w,
-            &format!("Using non-HTTPS API URL: {}", resolved.url),
-            is_tty,
-        );
-    }
-
-    // Persist API URL if CLI override was provided
-    if api_url.is_some() {
-        cfg.api_url = Some(resolved.url.clone());
-        cfg.save()?;
-    }
-
-    // Step 3: Already-authenticated guard
-    if cfg.token.is_some() {
-        let login_display = cfg.github_login.as_deref().unwrap_or("(unknown)");
-        output::note_to_with_tty(
-            w,
-            &format!("Already authenticated as @{login_display}."),
-            is_tty,
-        );
-
-        let confirmed = match confirm_override {
-            Some(v) => v,
-            None => {
-                if !is_tty {
-                    anyhow::bail!(
-                        "Already authenticated. Use --api-url or re-run interactively to overwrite."
-                    );
-                }
-                let result =
-                    dialoguer::Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default())
-                        .with_prompt("Overwrite existing credentials?")
-                        .default(false)
-                        .interact();
-                match result {
-                    Ok(v) => v,
-                    Err(dialoguer::Error::IO(err))
-                        if err.kind() == std::io::ErrorKind::UnexpectedEof =>
-                    {
-                        false
-                    }
-                    Err(err) => return Err(err.into()),
-                }
-            }
-        };
-
-        if !confirmed {
-            output::action_to_with_tty(w, "Login cancelled.", "", is_tty);
-            return Ok(());
-        }
-    }
-
-    // Step 4: Bind localhost listener
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")
-        .context("failed to bind localhost listener for OAuth callback")?;
-    let port = listener.local_addr()?.port();
-
-    // Step 5: Generate nonce and build browser URL
-    let nonce = generate_auth_nonce();
-    let browser_url = build_auth_browser_url(&resolved.url, port, &nonce);
-
-    // Step 6: Open browser
-    output::action_to_with_tty(
-        w,
-        "Opening browser",
-        &format!("for authentication on port {port}..."),
-        is_tty,
-    );
-    if let Err(e) = open::that(&browser_url) {
-        output::fail_to_with_tty(
-            w,
-            "Failed to open browser.",
-            &format!("Please open this URL manually:\n  {browser_url}"),
-            is_tty,
-        );
-        // Log the underlying error but don't fail — user can still open manually
-        let _ = writeln!(w, "  (error: {e})");
-    }
-
-    // Step 7: Wait for callback
-    output::detail_to_with_tty(w, "Waiting for authentication callback...", is_tty);
-    let code = run_callback_listener(
-        &listener,
-        &nonce,
-        std::time::Duration::from_secs(300), // 5 minutes
-    )?;
-
-    // Step 8: Exchange code for token
-    let api_client = api_client::ApiClient::new(&resolved.url, None);
-    let exchange_result = api_client.exchange_code(&code)?;
-
-    // Step 9: Persist credentials
-    cfg.token = Some(exchange_result.token);
-    cfg.github_login = exchange_result.login.clone();
-    cfg.expires_at = exchange_result.expires_at.clone();
-    cfg.save()?;
-
-    let login_display = exchange_result.login.as_deref().unwrap_or("(unknown)");
-    output::success_to_with_tty(w, &format!("Authenticated as @{login_display}"), "", is_tty);
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Auth & Keys stub handlers
-// ---------------------------------------------------------------------------
-
-fn run_auth_logout() -> Result<()> {
-    let is_tty = output::is_stderr_tty();
-    run_auth_logout_inner(&mut std::io::stderr(), is_tty)
-}
-
-/// Inner implementation of `auth logout` that writes to the provided writer.
-///
-/// Flow:
-/// 1. Load config and check for existing token.
-/// 2. If no token, print "Not currently authenticated." and return.
-/// 3. Attempt server-side token revocation (best-effort).
-/// 4. Always clear local credentials regardless of revocation outcome.
-/// 5. Print success or warning message.
-fn run_auth_logout_inner(w: &mut dyn std::io::Write, is_tty: bool) -> Result<()> {
-    let mut cfg = config::CliConfig::load()?;
-
-    // No token → not authenticated
-    if cfg.token.is_none() {
-        output::action_to_with_tty(w, "Not currently authenticated.", "", is_tty);
-        return Ok(());
-    }
-
-    // Resolve API URL and attempt server-side revocation
-    let resolved = cfg.resolve_api_url(None);
-    let token = cfg.token.clone().unwrap(); // safe: checked above
-    let client = api_client::ApiClient::new(&resolved.url, Some(token));
-
-    let revoke_result = client.revoke_token();
-
-    // Always clear local credentials, regardless of revocation outcome
-    cfg.clear_token()?;
-
-    // Classify the revocation result and print appropriate message
-    match revoke_result {
-        Ok(()) => {
-            output::success_to_with_tty(w, "Logged out and token revoked.", "", is_tty);
-        }
-        Err(ref err) => {
-            let err_msg = format!("{err:#}");
-            if is_connection_error(&err_msg) {
-                output::action_to_with_tty(
-                    w,
-                    "Logged out.",
-                    "Warning: could not reach server to revoke token.",
-                    is_tty,
-                );
-            } else {
-                // Non-transport API error (e.g. 401, 500) — still cleaned up locally
-                output::success_to_with_tty(w, "Logged out.", "", is_tty);
-                output::note_to_with_tty(
-                    w,
-                    &format!("Server-side revocation failed: {err_msg}"),
-                    is_tty,
-                );
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Classify whether an error message indicates a transport/connectivity failure
-/// (DNS resolution, connection refused, timeout) vs an application-level HTTP error.
-fn is_connection_error(err_msg: &str) -> bool {
-    let lower = err_msg.to_lowercase();
-    lower.contains("failed to connect")
-        || lower.contains("connection refused")
-        || lower.contains("dns error")
-        || lower.contains("timed out")
-        || lower.contains("no route to host")
-}
-
-fn run_auth_status() -> Result<()> {
-    let is_tty = output::is_stderr_tty();
-    run_auth_status_inner(&mut std::io::stderr(), is_tty)
-}
-
-/// Inner implementation of `auth status` that writes to the provided writer.
-///
-/// This is purely local — it reads from `CliConfig::load()` only and never
-/// constructs API clients or makes network requests.
-fn run_auth_status_inner(w: &mut dyn std::io::Write, is_tty: bool) -> Result<()> {
-    let cfg = config::CliConfig::load()?;
-
-    if cfg.token.is_some() {
-        let api_url = cfg.api_url.as_deref().unwrap_or(config::DEFAULT_API_URL);
-        let login = cfg.github_login.as_deref().unwrap_or("(unknown)");
-        let expires = cfg.expires_at.as_deref().unwrap_or("(unknown)");
-
-        output::success_to_with_tty(w, "Authenticated", "", is_tty);
-        output::detail_to_with_tty(w, &format!("API URL: {api_url}"), is_tty);
-        output::detail_to_with_tty(w, &format!("GitHub login: {login}"), is_tty);
-        output::detail_to_with_tty(w, &format!("Token expires: {expires}"), is_tty);
-    } else {
-        output::action_to_with_tty(
-            w,
-            "Not authenticated.",
-            "Run 'auth login' to connect.",
-            is_tty,
-        );
     }
 
     Ok(())
@@ -3033,11 +2386,6 @@ fn main() {
             NotesCommand::List { notes_ref } => run_notes_list(&notes_ref),
         },
         Command::Status => run_status(),
-        Command::Auth { auth_command } => match auth_command {
-            AuthCommands::Login { api_url } => run_auth_login(api_url),
-            AuthCommands::Logout => run_auth_logout(),
-            AuthCommands::Status => run_auth_status(),
-        },
         Command::Keys { keys_command } => match keys_command.unwrap_or(KeysCommands::Status) {
             KeysCommands::Setup => run_keys_setup(),
             KeysCommands::Status => run_keys_status(),

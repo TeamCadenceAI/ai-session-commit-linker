@@ -219,14 +219,14 @@ pub fn generate_user_keypair(identity: &str, passphrase: &str) -> Result<(String
     }
 
     let key_params = SecretKeyParamsBuilder::default()
-        .key_type(KeyType::Rsa(4096))
+        .key_type(KeyType::Rsa(2048))
         .can_certify(true)
         .can_sign(true)
         .primary_user_id(identity.to_string())
         .passphrase(Some(passphrase.into()))
         .subkey(
             SubkeyParamsBuilder::default()
-                .key_type(KeyType::Rsa(4096))
+                .key_type(KeyType::Rsa(2048))
                 .can_encrypt(true)
                 .passphrase(Some(passphrase.into()))
                 .build()
