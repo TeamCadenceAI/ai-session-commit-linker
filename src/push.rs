@@ -308,9 +308,19 @@ fn local_notes_hash() -> Result<Option<String>> {
 
 fn remote_notes_hash(remote: &str) -> Result<Option<String>> {
     let start = std::time::Instant::now();
-    let output =
-        git::run_git_output_at(None, &["ls-remote", "--refs", remote, git::NOTES_REF], &[])
-            .context("failed to execute git ls-remote")?;
+    let output = git::run_git_output_at(
+        None,
+        &[
+            "-c",
+            "protocol.version=2",
+            "ls-remote",
+            "--refs",
+            remote,
+            git::NOTES_REF,
+        ],
+        &[("GIT_TERMINAL_PROMPT", "0"), ("GIT_OPTIONAL_LOCKS", "0")],
+    )
+    .context("failed to execute git ls-remote")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -318,7 +328,9 @@ fn remote_notes_hash(remote: &str) -> Result<Option<String>> {
     }
 
     let stdout = String::from_utf8(output.stdout).context("git output was not valid UTF-8")?;
-    output::detail(&format!("ls-remote in {} ms", start.elapsed().as_millis()));
+    if output::is_verbose() {
+        output::detail(&format!("ls-remote in {} ms", start.elapsed().as_millis()));
+    }
     let line = stdout.lines().next().unwrap_or("");
     let hash = line.split_whitespace().next().unwrap_or("");
     if hash.is_empty() {
