@@ -510,8 +510,11 @@ pub(crate) fn delete_remote_ref_at(
     remote: &str,
     ref_name: &str,
 ) -> Result<()> {
-    let output = run_git_output_at(repo, &["push", remote, "--delete", ref_name], &[])
-        .context("failed to execute git push --delete")?;
+    // Use --no-verify to skip the pre-push hook, which would otherwise
+    // try to sync notes (fetch-merge-push) and change the ref we're deleting.
+    let output =
+        run_git_output_at(repo, &["push", "--no-verify", remote, "--delete", ref_name], &[])
+            .context("failed to execute git push --delete")?;
 
     // Tolerate "not found" — the remote ref may not exist.
     if !output.status.success() {

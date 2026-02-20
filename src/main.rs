@@ -1441,6 +1441,19 @@ fn parse_since_duration(since: &str) -> Result<i64> {
 /// - All errors are non-fatal (logged and continued)
 /// - Does NOT auto-push by default (use `--push` flag)
 fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
+    run_hydrate_inner(since, do_push, None)
+}
+
+/// Inner implementation of hydrate that accepts an optional repo filter.
+///
+/// When `repo_filter` is `Some`, only sessions whose resolved repo root
+/// matches the given path are processed. Used by `cadence gc` to scope
+/// re-hydration to the current repository.
+fn run_hydrate_inner(
+    since: &str,
+    do_push: bool,
+    repo_filter: Option<&std::path::Path>,
+) -> Result<()> {
     let since_secs = parse_since_duration(since)?;
     let since_days = since_secs / 86_400;
 
@@ -1543,6 +1556,13 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
             Ok(r) => r,
             Err(_) => continue,
         };
+
+        // If a repo filter is set, skip sessions that don't match.
+        if let Some(filter) = repo_filter {
+            if repo_root != filter {
+                continue;
+            }
+        }
 
         let session_id = metadata
             .session_id
@@ -2623,12 +2643,12 @@ fn run_gc(since: &str, confirm: bool) -> Result<()> {
         Err(e) => output::detail(&format!("Could not delete local ref (continuing): {e}")),
     }
 
-    // Step 3: Re-hydrate in v2 format with push enabled.
+    // Step 3: Re-hydrate in v2 format with push enabled (scoped to this repo).
     output::action(
         "GC",
         &format!("Re-hydrating (last {} days) with push", since_days),
     );
-    run_hydrate(since, true)?;
+    run_hydrate_inner(since, true, Some(&repo_root))?;
 
     output::success("GC", "Complete. Notes have been regenerated in v2 format.");
     Ok(())
