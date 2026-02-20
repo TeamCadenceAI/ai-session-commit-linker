@@ -1488,7 +1488,7 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
             }
         }
 
-        if let Ok(Some(remote)) = git::resolve_push_remote_at(&repo_root) {
+        let repo_remote = if let Ok(Some(remote)) = git::resolve_push_remote_at(&repo_root) {
             let fetch_start = std::time::Instant::now();
             match push::fetch_merge_notes_for_remote_at(&repo_root, &remote) {
                 Ok(()) => {
@@ -1502,7 +1502,10 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
                     output::note(&format!("Could not fetch notes from {}: {}", remote, e));
                 }
             }
-        }
+            Some(remote)
+        } else {
+            None
+        };
 
         let mut repo_total = 0usize;
         let mut repo_with_commits = 0usize;
@@ -1797,6 +1800,13 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
             "{} sessions, {} with commits, {} without",
             repo_total, repo_with_commits, repo_without_commits
         ));
+
+        // Push notes for this repo if requested
+        if do_push
+            && let Some(ref remote) = repo_remote
+        {
+            push::attempt_push_remote_at(&repo_root, remote);
+        }
     }
 
     // Final summary
@@ -1807,16 +1817,6 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
             attached, fallback_attached, skipped, errors
         ),
     );
-
-    // Step 7: Push if requested
-    if do_push {
-        output::action("Pushing", "notes");
-        if let Ok(Some(remote)) = git::resolve_push_remote()
-            && push::should_push_remote(&remote)
-        {
-            push::attempt_push_remote(&remote);
-        }
-    }
 
     Ok(())
 }

@@ -491,8 +491,12 @@ fn parse_noted_commit_ids(notes_list_stdout: &str) -> HashSet<String> {
 
 /// Push the AI-session notes ref to the provided remote.
 pub fn push_notes(remote: &str) -> Result<()> {
+    push_notes_at(None, remote)
+}
+
+pub fn push_notes_at(repo: Option<&Path>, remote: &str) -> Result<()> {
     let output = run_git_output_at(
-        None,
+        repo,
         &["push", "--no-verify", remote, NOTES_REF],
         &[("GIT_TERMINAL_PROMPT", "0")],
     )

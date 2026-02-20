@@ -51,13 +51,45 @@ pub fn should_push_remote(remote: &str) -> bool {
     true
 }
 
-/// Attempt to push notes to the remote. Handles failure gracefully.
+/// Attempt to push notes for a specific repository with a spinner and timing.
 ///
-/// On success: silent (no output).
-/// On failure: logs a note to stderr. Never blocks, never retries.
-pub fn attempt_push_remote(remote: &str) {
-    if let Err(e) = try_push_remote(remote) {
-        output::note(&format!("Could not push notes: {}", e));
+/// Shows a spinner while pushing (if stderr is a TTY) and reports the elapsed
+/// time on completion. On failure: logs a note to stderr.
+pub fn attempt_push_remote_at(repo: &Path, remote: &str) {
+    let push_start = std::time::Instant::now();
+    let use_spinner = output::is_stderr_tty();
+
+    let spinner = if use_spinner {
+        let pb = ProgressBar::new_spinner();
+        pb.set_draw_target(ProgressDrawTarget::stderr());
+        pb.set_style(
+            ProgressStyle::with_template("{spinner:.cyan} {msg}")
+                .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+        );
+        pb.enable_steady_tick(std::time::Duration::from_millis(120));
+        pb.set_message(format!("Pushing notes to {}", remote));
+        Some(pb)
+    } else {
+        None
+    };
+
+    let result = git::push_notes_at(Some(repo), remote);
+
+    if let Some(pb) = spinner {
+        pb.finish_and_clear();
+    }
+
+    match result {
+        Ok(()) => {
+            output::detail(&format!(
+                "Pushed notes to {} in {} ms",
+                remote,
+                push_start.elapsed().as_millis()
+            ));
+        }
+        Err(e) => {
+            output::note(&format!("Could not push notes to {}: {}", remote, e));
+        }
     }
 }
 
