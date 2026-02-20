@@ -300,14 +300,10 @@ pub(crate) fn add_note_at(repo: &Path, commit: &str, content: &str) -> Result<()
     Ok(())
 }
 
-/// Store arbitrary bytes as a git blob object and return its 40-char SHA-1 hash.
+/// Store arbitrary bytes as a git blob in a specific repository and return its
+/// 40-char SHA-1 hash.
 ///
 /// Uses `git hash-object -w --stdin` to write the blob to the object store.
-pub fn store_blob(data: &[u8]) -> Result<String> {
-    store_blob_at(None, data)
-}
-
-/// Store arbitrary bytes as a git blob in a specific repository.
 pub fn store_blob_at(repo: Option<&Path>, data: &[u8]) -> Result<String> {
     let mut cmd = Command::new("git");
     if let Some(repo) = repo {
@@ -345,14 +341,9 @@ pub fn store_blob_at(repo: Option<&Path>, data: &[u8]) -> Result<String> {
     Ok(sha)
 }
 
-/// Read a git blob by its SHA and return the raw bytes.
+/// Read a git blob by its SHA from a specific repository.
 ///
 /// Uses `git cat-file blob <sha>`.
-pub fn read_blob(sha: &str) -> Result<Vec<u8>> {
-    read_blob_at(None, sha)
-}
-
-/// Read a git blob by its SHA from a specific repository.
 pub fn read_blob_at(repo: Option<&Path>, sha: &str) -> Result<Vec<u8>> {
     let output = run_git_output_at(repo, &["cat-file", "blob", sha], &[])
         .context("failed to execute git cat-file blob")?;
@@ -489,6 +480,45 @@ pub(crate) fn update_ref_at(repo: Option<&Path>, ref_name: &str, commit: &str) -
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!("git update-ref failed: {}", stderr.trim());
+    }
+    Ok(())
+}
+
+/// Delete a local ref (e.g. `refs/notes/ai-sessions`).
+///
+/// Wraps `git update-ref -d <ref>`. Returns Ok even if the ref didn't exist.
+pub(crate) fn delete_local_ref_at(repo: Option<&Path>, ref_name: &str) -> Result<()> {
+    let output = run_git_output_at(repo, &["update-ref", "-d", ref_name], &[])
+        .context("failed to execute git update-ref -d")?;
+
+    // Tolerate "not found" — the ref may not exist locally.
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.contains("does not exist") {
+            bail!("git update-ref -d failed: {}", stderr.trim());
+        }
+    }
+    Ok(())
+}
+
+/// Delete a ref on a remote (e.g. `refs/notes/ai-sessions`).
+///
+/// Wraps `git push <remote> --delete <ref>`. Returns Ok even if the remote ref
+/// didn't exist.
+pub(crate) fn delete_remote_ref_at(
+    repo: Option<&Path>,
+    remote: &str,
+    ref_name: &str,
+) -> Result<()> {
+    let output = run_git_output_at(repo, &["push", remote, "--delete", ref_name], &[])
+        .context("failed to execute git push --delete")?;
+
+    // Tolerate "not found" — the remote ref may not exist.
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.contains("remote ref does not exist") && !stderr.contains("unable to delete") {
+            bail!("git push --delete failed: {}", stderr.trim());
+        }
     }
     Ok(())
 }
@@ -748,6 +778,7 @@ pub fn has_upstream() -> Result<bool> {
 /// 5) otherwise return None
 ///
 /// Returns `Ok(None)` when HEAD is detached or the remote is "."/empty.
+#[cfg(test)]
 pub fn resolve_push_remote() -> Result<Option<String>> {
     let output = run_git_output_at(None, &["symbolic-ref", "--quiet", "--short", "HEAD"], &[])
         .context("failed to execute git symbolic-ref")?;

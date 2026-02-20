@@ -160,7 +160,7 @@ Similarly in `sync_notes_for_remote_inner()`, the existing `(None, None)` check 
 
 ---
 
-## Phase 4: Clear and re-push existing repos
+## Phase 4: Clear and re-push existing repos ✅ DONE
 
 **Goal**: After deploying the new CLI, clear bloated notes refs on affected remotes and re-hydrate.
 
@@ -188,7 +188,7 @@ This is nice-to-have and can come later.
 1. **Phase 3** (skip push when no ref) — ✅ DONE (commit 0adab24)
 2. **Phase 1** (new note format) — ✅ DONE (commit 2a44a37)
 3. **Phase 2** (squash on push) — ✅ DONE
-4. **Phase 4** (clear and re-push) — operational, after Phases 1-3 are shipped
+4. **Phase 4** (clear and re-push) — ✅ DONE (`cadence gc` command)
 
 ---
 

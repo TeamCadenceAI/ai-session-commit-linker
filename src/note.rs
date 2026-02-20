@@ -62,6 +62,7 @@ impl std::fmt::Display for Confidence {
 /// `splitn(3, "---\n")` (splitting on at most 3 occurrences) to correctly
 /// separate the header from the payload, and verify integrity using the
 /// `payload_sha256` field.
+#[cfg(test)]
 pub fn format(
     agent: &AgentType,
     session_id: &str,
@@ -82,6 +83,7 @@ pub fn format(
 }
 
 /// Produce a complete note with an explicit confidence value.
+#[cfg(test)]
 pub fn format_with_confidence(
     agent: &AgentType,
     session_id: &str,
@@ -130,6 +132,7 @@ pub fn payload_sha256(content: &str) -> String {
 
 /// Encoding applied to the payload blob.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum PayloadEncoding {
     /// Raw JSONL, no compression, no encryption.
     Plain,
@@ -172,6 +175,7 @@ impl std::fmt::Display for PayloadEncoding {
 /// payload_encoding: zstd+pgp | zstd | pgp | plain
 /// ---
 /// ```
+#[allow(clippy::too_many_arguments)]
 pub fn format_v2(
     agent: &AgentType,
     session_id: &str,
@@ -214,6 +218,7 @@ pub fn compress_payload(data: &[u8]) -> anyhow::Result<Vec<u8>> {
 }
 
 /// Decompress zstd-compressed payload bytes.
+#[cfg(test)]
 pub fn decompress_payload(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     zstd::decode_all(std::io::Cursor::new(data))
         .map_err(|e| anyhow::anyhow!("zstd decompression failed: {}", e))

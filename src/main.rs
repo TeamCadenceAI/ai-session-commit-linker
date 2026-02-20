@@ -90,6 +90,20 @@ enum Command {
         #[command(subcommand)]
         keys_command: Option<KeysCommands>,
     },
+
+    /// Clear bloated notes and re-hydrate in the optimized v2 format.
+    ///
+    /// Deletes the local and remote notes refs, then re-runs hydration
+    /// to regenerate notes with payload deduplication and compression.
+    Gc {
+        /// How far back to re-hydrate, e.g. "30d" for 30 days.
+        #[arg(long, default_value = "30d")]
+        since: String,
+
+        /// Confirm destructive operation (required).
+        #[arg(long)]
+        confirm: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -233,17 +247,9 @@ fn maybe_encrypt_note(content: &str, method: &EncryptionMethod) -> Result<String
 }
 
 /// Encode a session log payload: compress with zstd, optionally encrypt
-/// (binary, not armored), store as a git blob in the current repo.
+/// (binary, not armored), store as a git blob in a specific repository.
 ///
 /// Returns `(blob_sha, payload_sha256, encoding)`.
-fn encode_and_store_payload(
-    session_log: &str,
-    method: &EncryptionMethod,
-) -> Result<(String, String, note::PayloadEncoding)> {
-    encode_and_store_payload_at(None, session_log, method)
-}
-
-/// Same as [`encode_and_store_payload`] but for a specific repository.
 fn encode_and_store_payload_at(
     repo: Option<&std::path::Path>,
     session_log: &str,
@@ -2571,6 +2577,64 @@ fn run_update(check: bool, yes: bool) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// GC: clear bloated notes and re-hydrate
+// ---------------------------------------------------------------------------
+
+fn run_gc(since: &str, confirm: bool) -> Result<()> {
+    // Validate the --since value early so we fail before any destructive work.
+    let since_secs = parse_since_duration(since)?;
+    let since_days = since_secs / 86_400;
+
+    let repo_root = git::repo_root()?;
+
+    if !confirm {
+        output::note("This will DELETE all local and remote AI session notes for this repo,");
+        output::note("then re-hydrate them in the optimized v2 format.");
+        output::detail(&format!("Re-hydration window: last {} days", since_days));
+        output::detail("Local ref:  refs/notes/ai-sessions  → deleted");
+        output::detail("Remote ref: refs/notes/ai-sessions  → deleted");
+        output::detail("Then: cadence hydrate --since <window> --push");
+        eprintln!();
+        output::fail("Aborted", "pass --confirm to proceed.");
+        anyhow::bail!("gc requires --confirm to proceed");
+    }
+
+    // Resolve push remote (e.g. "origin").
+    let remote = git::resolve_push_remote_at(&repo_root)?;
+
+    // Step 1: Delete remote notes ref.
+    if let Some(ref remote_name) = remote {
+        output::action(
+            "GC",
+            &format!("Deleting remote notes ref on '{}'", remote_name),
+        );
+        match git::delete_remote_ref_at(Some(&repo_root), remote_name, git::NOTES_REF) {
+            Ok(()) => output::detail("Remote notes ref deleted (or did not exist)."),
+            Err(e) => output::detail(&format!("Could not delete remote ref (continuing): {e}")),
+        }
+    } else {
+        output::detail("No push remote found; skipping remote ref deletion.");
+    }
+
+    // Step 2: Delete local notes ref.
+    output::action("GC", "Deleting local notes ref");
+    match git::delete_local_ref_at(Some(&repo_root), git::NOTES_REF) {
+        Ok(()) => output::detail("Local notes ref deleted (or did not exist)."),
+        Err(e) => output::detail(&format!("Could not delete local ref (continuing): {e}")),
+    }
+
+    // Step 3: Re-hydrate in v2 format with push enabled.
+    output::action(
+        "GC",
+        &format!("Re-hydrating (last {} days) with push", since_days),
+    );
+    run_hydrate(since, true)?;
+
+    output::success("GC", "Complete. Notes have been regenerated in v2 format.");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -2604,6 +2668,7 @@ fn main() {
             KeysCommands::Disable => run_keys_disable(),
             KeysCommands::Refresh => run_keys_refresh(),
         },
+        Command::Gc { since, confirm } => run_gc(&since, confirm),
     };
 
     // Passive background version check: run after successful command execution
