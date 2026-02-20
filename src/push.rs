@@ -75,8 +75,24 @@ pub fn attempt_push_remote_at(repo: &Path, remote: &str) {
 
     // Fetch and merge remote notes before pushing to avoid overwriting
     // notes pushed by other users.
-    let result = fetch_merge_notes_for_remote_at(repo, remote)
-        .and_then(|()| git::push_notes_at(Some(repo), remote));
+    let result = fetch_merge_notes_for_remote_at(repo, remote).and_then(|()| {
+        // After fetch-merge, check if the local notes ref exists. If the repo
+        // has no attached sessions (and the remote didn't have any either),
+        // there's nothing to push — skip to avoid a spurious error.
+        let has_local_notes = git::run_git_output_at(
+            Some(repo),
+            &["show-ref", "--verify", "--quiet", git::NOTES_REF],
+            &[],
+        )
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+        if !has_local_notes {
+            return Ok(());
+        }
+
+        git::push_notes_at(Some(repo), remote)
+    });
 
     if let Some(pb) = spinner {
         pb.finish_and_clear();
@@ -1065,6 +1081,46 @@ mod tests {
 
         assert_eq!(note1, "note-from-other-user");
         assert_eq!(note2, "note-from-local-user");
+    }
+
+    // -----------------------------------------------------------------------
+    // attempt_push — skip when no local notes ref
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn test_attempt_push_skips_when_no_local_notes() {
+        // Phase 3: When a repo has no local notes ref after fetch-merge,
+        // attempt_push_remote_at should succeed silently (no push error).
+        let (local, _bare) = init_repo_with_remote();
+
+        // Verify there's no local notes ref
+        let output = Command::new("git")
+            .args([
+                "-C",
+                local.path().to_str().unwrap(),
+                "show-ref",
+                "--verify",
+                "--quiet",
+                crate::git::NOTES_REF,
+            ])
+            .output()
+            .expect("failed to run git");
+        assert!(
+            !output.status.success(),
+            "precondition: no local notes ref should exist"
+        );
+
+        // This should complete without errors (previously would fail trying
+        // to push a non-existent notes ref).
+        attempt_push_remote_at(local.path(), "origin");
+
+        // Verify the remote also has no notes ref (nothing was pushed)
+        let ls = run_git(
+            local.path(),
+            &["ls-remote", "--refs", "origin", crate::git::NOTES_REF],
+        );
+        assert!(ls.is_empty(), "no notes should have been pushed to remote");
     }
 
     // -----------------------------------------------------------------------
