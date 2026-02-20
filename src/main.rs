@@ -1642,7 +1642,22 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
                     }
                 };
 
-                match git::add_note_at(&session.repo_root, hash, &note_content) {
+                // Optionally encrypt — encryption failure is non-fatal
+                let final_content = match maybe_encrypt_note(&note_content, &encryption_method) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        output::detail(&format!(
+                            "{} encryption failed for {}: {}",
+                            header,
+                            &hash[..7],
+                            e
+                        ));
+                        errors += 1;
+                        continue;
+                    }
+                };
+
+                match git::add_note_at(&session.repo_root, hash, &final_content) {
                     Ok(()) => {
                         attached += 1;
                         fallback_attached += 1;
