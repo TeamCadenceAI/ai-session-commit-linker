@@ -56,9 +56,14 @@ pub fn should_push_remote(remote: &str) -> bool {
 /// On success: silent (no output).
 /// On failure: logs a note to stderr. Never blocks, never retries.
 pub fn attempt_push_remote(remote: &str) {
-    if let Err(e) = git::push_notes(remote) {
+    if let Err(e) = try_push_remote(remote) {
         output::note(&format!("Could not push notes: {}", e));
     }
+}
+
+/// Inner push logic that returns a Result instead of logging.
+fn try_push_remote(remote: &str) -> Result<()> {
+    git::push_notes(remote)
 }
 
 /// Sync notes with the provided remote:
@@ -908,7 +913,7 @@ mod tests {
         std::env::set_current_dir(dir.path()).expect("failed to chdir");
 
         // No remote configured -- push will fail, but should not panic
-        attempt_push_remote("origin");
+        let _ = try_push_remote("origin");
 
         std::env::set_current_dir(original_cwd).unwrap();
     }
@@ -920,8 +925,10 @@ mod tests {
         let original_cwd = safe_cwd();
         std::env::set_current_dir(dir.path()).expect("failed to chdir");
 
-        // No remote configured -- sync should warn but not panic
-        sync_notes_for_remote("origin");
+        // No remote configured -- sync should fail but not panic.
+        // Call the inner function directly to avoid stderr output from
+        // the public wrapper.
+        let _ = sync_notes_for_remote_inner("origin");
 
         std::env::set_current_dir(original_cwd).unwrap();
     }
@@ -945,7 +952,7 @@ mod tests {
         );
 
         // This will fail (can't connect) but should not panic or block
-        attempt_push_remote("origin");
+        let _ = try_push_remote("origin");
 
         std::env::set_current_dir(original_cwd).unwrap();
     }
