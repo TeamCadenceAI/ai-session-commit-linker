@@ -272,46 +272,6 @@ pub fn fingerprint_from_public_key(armored_public_key: &str) -> Result<String> {
     Ok(fingerprint_to_string(&public_key.fingerprint()))
 }
 
-/// Encrypt plaintext to multiple armored public keys using SEIPDv1.
-pub fn encrypt_to_public_keys(plaintext: &str, armored_public_keys: &[String]) -> Result<String> {
-    if armored_public_keys.is_empty() {
-        bail!("rpgp encrypt: at least one public key is required");
-    }
-
-    let mut public_keys: Vec<SignedPublicKey> = Vec::new();
-
-    for armored in armored_public_keys {
-        let trimmed = armored.trim();
-        if trimmed.is_empty() {
-            bail!("rpgp encrypt: public key material must not be blank");
-        }
-        let (public_key, _headers) = SignedPublicKey::from_string(trimmed)
-            .context("rpgp encrypt failed: public key parse error")?;
-        public_keys.push(public_key);
-    }
-
-    let mut enc_subkeys: Vec<&pgp::composed::SignedPublicSubKey> = Vec::new();
-    for public_key in &public_keys {
-        let enc_subkey = public_key
-            .public_subkeys
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("rpgp encrypt failed: no encryption subkey found"))?;
-        enc_subkeys.push(enc_subkey);
-    }
-
-    let literal = pgp::packet::LiteralData::from_bytes((&[]).into(), plaintext.as_bytes());
-    let message = Message::Literal(literal);
-
-    let mut rng = rand08::thread_rng();
-    let encrypted = message
-        .encrypt_to_keys_seipdv1(&mut rng, SymmetricKeyAlgorithm::AES128, &enc_subkeys)
-        .context("rpgp encrypt failed: encryption error")?;
-
-    encrypted
-        .to_armored_string(ArmorOptions::default())
-        .context("rpgp encrypt failed: armored serialization error")
-}
-
 /// Encrypt binary data to multiple armored public keys, returning raw bytes (not armored).
 ///
 /// Same as [`encrypt_to_public_keys`] but operates on `&[u8]` input and returns

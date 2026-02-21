@@ -233,18 +233,6 @@ fn resolve_encryption_method() -> Result<EncryptionMethod> {
     }
 }
 
-/// Optionally encrypt note content before storage.
-fn maybe_encrypt_note(content: &str, method: &EncryptionMethod) -> Result<String> {
-    match method {
-        EncryptionMethod::RpgpMulti { user_key, api_key } => {
-            pgp_keys::encrypt_to_public_keys(content, &[user_key.clone(), api_key.clone()])
-        }
-        EncryptionMethod::Unavailable(reason) => {
-            anyhow::bail!("encryption unavailable: {}", reason);
-        }
-        EncryptionMethod::None => Ok(content.to_string()),
-    }
-}
 
 /// Encode a session log payload: compress with zstd, optionally encrypt
 /// (binary, not armored), store as a git blob in a specific repository.
@@ -1099,12 +1087,11 @@ fn attach_note_from_log_v2(
         encoding,
     )?;
 
-    // Optionally encrypt the pointer note itself (small, armored is fine)
-    let final_content = maybe_encrypt_note(&note_content, method)?;
-
+    // Pointer note stays plaintext — only the payload blob is encrypted.
+    // This lets the API index metadata without needing decryption keys.
     match repo {
-        Some(r) => git::add_note_at(r, commit, &final_content)?,
-        None => git::add_note(commit, &final_content)?,
+        Some(r) => git::add_note_at(r, commit, &note_content)?,
+        None => git::add_note(commit, &note_content)?,
     }
     Ok(())
 }

@@ -471,8 +471,7 @@ fn squash_notes_ref(repo: Option<&Path>) -> Result<String> {
     let mut payload_blobs: HashSet<String> = HashSet::new();
 
     for (note_sha, _commit) in &notes {
-        // Read the note blob. If it's encrypted (PGP), we can't parse it —
-        // but we preserve existing _payload entries from the merged tree.
+        // Pointer notes are always plaintext v2 YAML; extract payload_blob SHAs.
         if let Ok(blob_data) = git::read_blob_at(repo, note_sha) {
             let content = String::from_utf8_lossy(&blob_data);
             for line in content.lines() {
