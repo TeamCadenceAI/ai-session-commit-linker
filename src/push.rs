@@ -348,10 +348,17 @@ fn sync_notes_for_remote_retry(remote: &str) -> Result<()> {
     let temp_ref = format!("refs/notes/ai-sessions-remote/{}", remote);
     let fetch_spec = format!("+{}:{}", git::NOTES_REF, temp_ref);
 
+    // Clean up any stale temp ref before fetching to avoid merge conflicts.
+    let _ = git::run_git_output_at(None, &["update-ref", "-d", &temp_ref], &[]);
+
+    // Abort any in-progress notes merge left by a previous failed attempt.
+    let _ = git::run_git_output_at(None, &["notes", "--ref", git::NOTES_REF, "merge", "--abort"], &[]);
+
     let fetch_status = git::run_git_output_at(None, &["fetch", remote, &fetch_spec], &[])
         .context("failed to execute git fetch for notes")?;
 
-    if !fetch_status.status.success() {
+    let fetched = fetch_status.status.success();
+    if !fetched {
         let stderr = String::from_utf8_lossy(&fetch_status.stderr);
         let stderr_trim = stderr.trim();
         if !(stderr_trim.contains("couldn't find remote ref")
@@ -361,19 +368,21 @@ fn sync_notes_for_remote_retry(remote: &str) -> Result<()> {
         }
     }
 
-    let merge_status = git::run_git_output_at(
-        None,
-        &["notes", "--ref", git::NOTES_REF, "merge", &temp_ref],
-        &[],
-    )
-    .context("failed to execute git notes merge")?;
+    if fetched {
+        let merge_status = git::run_git_output_at(
+            None,
+            &["notes", "--ref", git::NOTES_REF, "merge", &temp_ref],
+            &[],
+        )
+        .context("failed to execute git notes merge")?;
 
-    if !merge_status.status.success() {
-        let stderr = String::from_utf8_lossy(&merge_status.stderr);
-        anyhow::bail!("git notes merge failed: {}", stderr.trim());
+        if !merge_status.status.success() {
+            let stderr = String::from_utf8_lossy(&merge_status.stderr);
+            anyhow::bail!("git notes merge failed: {}", stderr.trim());
+        }
+
+        let _ = git::run_git_output_at(None, &["update-ref", "-d", &temp_ref], &[]);
     }
-
-    let _ = git::run_git_output_at(None, &["update-ref", "-d", &temp_ref], &[]);
 
     // Squash the notes ref into an orphan commit.
     squash_notes_ref(None).context("failed to squash notes ref on retry")?;
