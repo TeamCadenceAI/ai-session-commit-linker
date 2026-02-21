@@ -97,8 +97,8 @@ pub fn attempt_push_remote_at(repo: &Path, remote: &str) {
             return Ok(());
         }
 
-        // Squash the notes ref into an orphan commit with payload blobs.
-        squash_notes_ref(Some(repo))?;
+        // Prepare the notes ref for push (ensures payload blobs are referenced).
+        prepare_notes_for_push(Some(repo))?;
 
         // Force-push with lease for safety.
         let lease = force_with_lease_arg(&pre_fetch_remote_hash);
@@ -252,7 +252,14 @@ fn sync_notes_for_remote_inner(remote: &str) -> Result<()> {
         let merge_start = std::time::Instant::now();
         let merge_status = git::run_git_output_at(
             None,
-            &["notes", "--ref", git::NOTES_REF, "merge", &temp_ref],
+            &[
+                "notes",
+                "--ref",
+                git::NOTES_REF,
+                "merge",
+                "--strategy=union",
+                &temp_ref,
+            ],
             &[],
         )
         .context("failed to execute git notes merge")?;
@@ -270,6 +277,12 @@ fn sync_notes_for_remote_inner(remote: &str) -> Result<()> {
                 remote,
                 stderr.trim()
             ));
+            // Abort the failed merge to clean up .git/NOTES_MERGE_* state.
+            let _ = git::run_git_output_at(
+                None,
+                &["notes", "--ref", git::NOTES_REF, "merge", "--abort"],
+                &[],
+            );
         }
 
         let _ = git::run_git_output_at(None, &["update-ref", "-d", &temp_ref], &[]);
@@ -293,13 +306,13 @@ fn sync_notes_for_remote_inner(remote: &str) -> Result<()> {
         return Ok(());
     }
 
-    // Squash the notes ref into an orphan commit with payload blobs.
-    let squash_start = std::time::Instant::now();
-    squash_notes_ref(None).context("failed to squash notes ref")?;
+    // Prepare the notes ref for push (ensures payload blobs are referenced).
+    let prepare_start = std::time::Instant::now();
+    prepare_notes_for_push(None).context("failed to prepare notes ref")?;
     if output::is_verbose() {
         output::detail(&format!(
-            "Squash in {} ms",
-            squash_start.elapsed().as_millis()
+            "Prepare in {} ms",
+            prepare_start.elapsed().as_millis()
         ));
     }
 
@@ -352,7 +365,11 @@ fn sync_notes_for_remote_retry(remote: &str) -> Result<()> {
     let _ = git::run_git_output_at(None, &["update-ref", "-d", &temp_ref], &[]);
 
     // Abort any in-progress notes merge left by a previous failed attempt.
-    let _ = git::run_git_output_at(None, &["notes", "--ref", git::NOTES_REF, "merge", "--abort"], &[]);
+    let _ = git::run_git_output_at(
+        None,
+        &["notes", "--ref", git::NOTES_REF, "merge", "--abort"],
+        &[],
+    );
 
     let fetch_status = git::run_git_output_at(None, &["fetch", remote, &fetch_spec], &[])
         .context("failed to execute git fetch for notes")?;
@@ -371,7 +388,14 @@ fn sync_notes_for_remote_retry(remote: &str) -> Result<()> {
     if fetched {
         let merge_status = git::run_git_output_at(
             None,
-            &["notes", "--ref", git::NOTES_REF, "merge", &temp_ref],
+            &[
+                "notes",
+                "--ref",
+                git::NOTES_REF,
+                "merge",
+                "--strategy=union",
+                &temp_ref,
+            ],
             &[],
         )
         .context("failed to execute git notes merge")?;
@@ -384,8 +408,8 @@ fn sync_notes_for_remote_retry(remote: &str) -> Result<()> {
         let _ = git::run_git_output_at(None, &["update-ref", "-d", &temp_ref], &[]);
     }
 
-    // Squash the notes ref into an orphan commit.
-    squash_notes_ref(None).context("failed to squash notes ref on retry")?;
+    // Prepare the notes ref for push (ensures payload blobs are referenced).
+    prepare_notes_for_push(None).context("failed to prepare notes ref on retry")?;
 
     let lease = force_with_lease_arg(&retry_remote_hash);
     let push_status = git::run_git_output_at(
@@ -459,17 +483,18 @@ fn remote_notes_hash(remote: &str) -> Result<Option<String>> {
 }
 
 // ---------------------------------------------------------------------------
-// Notes ref squashing (Phase 2)
+// Notes ref preparation for push
 // ---------------------------------------------------------------------------
 
-/// Squash the notes ref into a single orphan commit.
+/// Prepare the notes ref for pushing by ensuring payload blobs are referenced.
 ///
-/// This replaces the full merge history with a single commit, and ensures
-/// that v2 payload blobs are referenced in the tree (via a `_payload/`
-/// subtree) so they survive GC and are included in push packs.
+/// Creates a new commit on the notes ref that includes a `_payload/` subtree
+/// referencing all v2 payload blobs, so they survive GC and are included in
+/// push packs. The commit preserves history by using the current notes tip
+/// as its parent (or creates an initial commit if no history exists).
 ///
-/// Returns the SHA of the new orphan commit.
-fn squash_notes_ref(repo: Option<&Path>) -> Result<String> {
+/// Returns the SHA of the new commit.
+fn prepare_notes_for_push(repo: Option<&Path>) -> Result<String> {
     // 1. Get the current tree from the notes ref.
     let tree_rev = format!("{}^{{tree}}", git::NOTES_REF);
     let current_tree =
@@ -499,7 +524,7 @@ fn squash_notes_ref(repo: Option<&Path>) -> Result<String> {
         // No payload blobs — use the existing tree as-is.
         current_tree
     } else {
-        // Read existing _payload entries (from previous squash or remote merge).
+        // Read existing _payload entries (from previous prepare or remote merge).
         let top_entries = git::ls_tree_at(repo, &tree_rev)?;
         let mut existing_payload_shas: HashSet<String> = HashSet::new();
 
@@ -542,22 +567,20 @@ fn squash_notes_ref(repo: Option<&Path>) -> Result<String> {
         git::mktree_at(repo, &new_entries).context("failed to create augmented notes tree")?
     };
 
-    // 4. Create orphan commit (no parents).
-    let orphan = git::commit_tree_at(repo, &final_tree, "cadence notes")
-        .context("failed to create orphan commit for notes")?;
+    // 4. Create commit with current notes tip as parent (preserves merge history).
+    let current_tip = git::rev_parse_at(repo, git::NOTES_REF).ok();
+    let new_commit =
+        git::commit_tree_at(repo, &final_tree, "cadence notes", current_tip.as_deref())
+            .context("failed to create notes commit")?;
 
     // 5. Update ref.
-    git::update_ref_at(repo, git::NOTES_REF, &orphan)
-        .context("failed to update notes ref to orphan commit")?;
+    git::update_ref_at(repo, git::NOTES_REF, &new_commit).context("failed to update notes ref")?;
 
     if output::is_verbose() {
-        output::detail(&format!(
-            "Squashed notes ref to orphan commit {}",
-            &orphan[..8]
-        ));
+        output::detail(&format!("Prepared notes ref -> {}", &new_commit[..8]));
     }
 
-    Ok(orphan)
+    Ok(new_commit)
 }
 
 /// Get the remote notes ref hash for a specific repo via `ls-remote`.
@@ -683,13 +706,26 @@ fn fetch_merge_notes_for_remote_inner(repo: Option<&Path>, remote: &str) -> Resu
 
     let merge_status = git::run_git_output_at(
         repo,
-        &["notes", "--ref", git::NOTES_REF, "merge", &temp_ref],
+        &[
+            "notes",
+            "--ref",
+            git::NOTES_REF,
+            "merge",
+            "--strategy=union",
+            &temp_ref,
+        ],
         &[("GIT_TERMINAL_PROMPT", "0")],
     )
     .context("failed to execute git notes merge")?;
 
     if !merge_status.status.success() {
         let stderr = String::from_utf8_lossy(&merge_status.stderr);
+        // Abort the failed merge to clean up .git/NOTES_MERGE_* state.
+        let _ = git::run_git_output_at(
+            repo,
+            &["notes", "--ref", git::NOTES_REF, "merge", "--abort"],
+            &[("GIT_TERMINAL_PROMPT", "0")],
+        );
         anyhow::bail!("git notes merge failed: {}", stderr.trim());
     }
 
@@ -1384,15 +1420,15 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Phase 2: squash_notes_ref
+    // Phase 2: prepare_notes_for_push
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_squash_produces_orphan_commit() {
+    fn test_prepare_creates_commit_with_parent() {
         let dir = init_temp_repo();
         let commit = head_hash(dir.path());
 
-        // Attach a note.
+        // Attach a note (creates the initial notes ref commit).
         run_git(
             dir.path(),
             &[
@@ -1406,27 +1442,20 @@ mod tests {
             ],
         );
 
-        // Squash.
-        squash_notes_ref(Some(dir.path())).expect("squash failed");
+        // Record the notes tip before prepare.
+        let pre_tip = run_git(dir.path(), &["rev-parse", crate::git::NOTES_REF]);
 
-        // Verify the notes ref now points to an orphan commit (no parents).
-        let parents = Command::new("git")
-            .args(["-C", dir.path().to_str().unwrap()])
-            .args([
-                "log",
-                "--format=%P",
-                "--ref-exclude=*",
-                crate::git::NOTES_REF,
-            ])
-            .output()
-            .expect("failed to run git log");
-        let stdout = String::from_utf8(parents.stdout).unwrap();
-        // An orphan commit's parent line is empty.
-        let parent_line = stdout.lines().next().unwrap_or("");
-        assert!(
-            parent_line.is_empty(),
-            "expected orphan commit (no parents), got: {:?}",
-            parent_line
+        // Prepare.
+        prepare_notes_for_push(Some(dir.path())).expect("prepare failed");
+
+        // Verify the notes ref now points to a commit with the previous tip as parent.
+        let parent_line = run_git(
+            dir.path(),
+            &["log", "--format=%P", "-1", crate::git::NOTES_REF],
+        );
+        assert_eq!(
+            parent_line, pre_tip,
+            "expected parent to be the previous notes tip"
         );
 
         // Verify the note is still readable.
@@ -1438,7 +1467,7 @@ mod tests {
     }
 
     #[test]
-    fn test_squash_includes_payload_blobs_in_tree() {
+    fn test_prepare_includes_payload_blobs_in_tree() {
         let dir = init_temp_repo();
         let commit = head_hash(dir.path());
 
@@ -1465,8 +1494,8 @@ mod tests {
             ],
         );
 
-        // Squash.
-        squash_notes_ref(Some(dir.path())).expect("squash failed");
+        // Prepare.
+        prepare_notes_for_push(Some(dir.path())).expect("prepare failed");
 
         // Verify _payload subtree exists and contains the blob.
         let tree_rev = format!("{}^{{tree}}", crate::git::NOTES_REF);
@@ -1475,7 +1504,7 @@ mod tests {
         let has_payload_tree = entries.iter().any(|e| e.ends_with("\t_payload"));
         assert!(
             has_payload_tree,
-            "_payload subtree not found in squashed tree. Entries: {:?}",
+            "_payload subtree not found in prepared tree. Entries: {:?}",
             entries
         );
 
@@ -1501,7 +1530,7 @@ mod tests {
     }
 
     #[test]
-    fn test_squash_preserves_existing_payload_entries() {
+    fn test_prepare_preserves_existing_payload_entries() {
         let dir = init_temp_repo();
         let commit = head_hash(dir.path());
 
@@ -1529,8 +1558,8 @@ mod tests {
             ],
         );
 
-        // First squash — should include blob1 in _payload.
-        squash_notes_ref(Some(dir.path())).expect("first squash failed");
+        // First prepare — should include blob1 in _payload.
+        prepare_notes_for_push(Some(dir.path())).expect("first prepare failed");
 
         // Add a second commit and note referencing blob2.
         std::fs::write(dir.path().join("file2.txt"), "second").unwrap();
@@ -1555,8 +1584,8 @@ mod tests {
             ],
         );
 
-        // Second squash — should include both blob1 and blob2.
-        squash_notes_ref(Some(dir.path())).expect("second squash failed");
+        // Second prepare — should include both blob1 and blob2.
+        prepare_notes_for_push(Some(dir.path())).expect("second prepare failed");
 
         // Verify both blobs are in _payload.
         let tree_rev = format!("{}^{{tree}}", crate::git::NOTES_REF);
@@ -1568,18 +1597,18 @@ mod tests {
 
         assert!(
             payload_children.iter().any(|e| e.contains(&blob1_sha)),
-            "blob1 {} not found after second squash",
+            "blob1 {} not found after second prepare",
             blob1_sha
         );
         assert!(
             payload_children.iter().any(|e| e.contains(&blob2_sha)),
-            "blob2 {} not found after second squash",
+            "blob2 {} not found after second prepare",
             blob2_sha
         );
     }
 
     #[test]
-    fn test_squash_no_payload_blobs_still_works() {
+    fn test_prepare_no_payload_blobs_still_works() {
         let dir = init_temp_repo();
         let commit = head_hash(dir.path());
 
@@ -1597,8 +1626,8 @@ mod tests {
             ],
         );
 
-        // Squash should succeed — no _payload subtree needed.
-        squash_notes_ref(Some(dir.path())).expect("squash failed");
+        // Prepare should succeed — no _payload subtree needed.
+        prepare_notes_for_push(Some(dir.path())).expect("prepare failed");
 
         // Verify note is still intact.
         let note = run_git(
@@ -1618,8 +1647,8 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_squash_push_end_to_end() {
-        // End-to-end test: attach v2 notes, squash, force-push to remote.
+    fn test_prepare_push_end_to_end() {
+        // End-to-end test: attach v2 notes, prepare, force-push to remote.
         let (local, bare) = init_repo_with_remote();
         let commit = head_hash(local.path());
 
@@ -1643,7 +1672,7 @@ mod tests {
             ],
         );
 
-        // Push using attempt_push_remote_at (which squashes internally).
+        // Push using attempt_push_remote_at (which prepares internally).
         attempt_push_remote_at(local.path(), "origin");
 
         // Verify the remote has the notes ref.
@@ -1694,8 +1723,8 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_squash_push_merges_with_remote_notes() {
-        // Two users push notes; after merge + squash, both notes survive.
+    fn test_prepare_push_merges_with_remote_notes() {
+        // Two users push notes; after merge + prepare, both notes survive.
         let (local, bare) = init_repo_with_remote();
 
         // Create two commits.
@@ -1746,7 +1775,7 @@ mod tests {
             ],
         );
 
-        // Push via attempt_push_remote_at (fetch-merge-squash-force-push).
+        // Push via attempt_push_remote_at (fetch-merge-prepare-force-push).
         attempt_push_remote_at(local.path(), "origin");
 
         // Fetch back and verify both notes are present.

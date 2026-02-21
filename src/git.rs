@@ -452,12 +452,24 @@ pub(crate) fn mktree_at(repo: Option<&Path>, entries: &[String]) -> Result<Strin
     Ok(sha)
 }
 
-/// Create an orphan commit (no parents) from a tree object.
+/// Create a commit from a tree object, optionally with a parent.
 ///
+/// If `parent` is `None`, creates an orphan commit (no parents).
+/// If `parent` is `Some(sha)`, creates a commit with that parent.
 /// Returns the 40-char SHA of the new commit.
-pub(crate) fn commit_tree_at(repo: Option<&Path>, tree: &str, message: &str) -> Result<String> {
-    let output = run_git_output_at(repo, &["commit-tree", tree, "-m", message], &[])
-        .context("failed to execute git commit-tree")?;
+pub(crate) fn commit_tree_at(
+    repo: Option<&Path>,
+    tree: &str,
+    message: &str,
+    parent: Option<&str>,
+) -> Result<String> {
+    let mut args = vec!["commit-tree", tree, "-m", message];
+    if let Some(p) = parent {
+        args.push("-p");
+        args.push(p);
+    }
+    let output =
+        run_git_output_at(repo, &args, &[]).context("failed to execute git commit-tree")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -2170,8 +2182,8 @@ mod tests {
         let tree = mktree_at(Some(dir.path()), &[entry]).expect("mktree failed");
 
         // Create orphan commit.
-        let commit =
-            commit_tree_at(Some(dir.path()), &tree, "test commit").expect("commit_tree failed");
+        let commit = commit_tree_at(Some(dir.path()), &tree, "test commit", None)
+            .expect("commit_tree failed");
         assert_eq!(commit.len(), 40);
 
         // Verify no parents.
@@ -2191,7 +2203,8 @@ mod tests {
         let sha = store_blob_at(Some(dir.path()), b"data").expect("store_blob failed");
         let entry = format!("100644 blob {}\tfile.txt", sha);
         let tree = mktree_at(Some(dir.path()), &[entry]).expect("mktree failed");
-        let commit = commit_tree_at(Some(dir.path()), &tree, "test").expect("commit_tree failed");
+        let commit =
+            commit_tree_at(Some(dir.path()), &tree, "test", None).expect("commit_tree failed");
 
         // Update a ref.
         update_ref_at(Some(dir.path()), "refs/test/foo", &commit).expect("update_ref_at failed");

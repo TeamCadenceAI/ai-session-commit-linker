@@ -233,7 +233,6 @@ fn resolve_encryption_method() -> Result<EncryptionMethod> {
     }
 }
 
-
 /// Encode a session log payload: compress with zstd, optionally encrypt
 /// (binary, not armored), store as a git blob in a specific repository.
 ///
