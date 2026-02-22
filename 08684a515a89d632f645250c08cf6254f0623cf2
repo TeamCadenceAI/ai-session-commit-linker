@@ -1,0 +1,12 @@
+---
+cadence_version: 2
+agent: claude-code
+session_id: e6cc6dcb-e034-4eec-9a12-9e57f7b981a1
+repo: /Users/chrisraethke/projects/cadence-cli
+commit: 08684a5
+confidence: exact_hash_match
+session_start: 2026-02-16T05:41:11Z
+payload_blob: ca000e7d2d20f497ed6f5e26e19a5c113c6b02a4
+payload_sha256: b174abdfe35a4473321e5c83331f82fc8952038b10abf85166c35ae848c8ee5f
+payload_encoding: zstd+pgp
+---
