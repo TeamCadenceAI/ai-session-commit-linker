@@ -19,3 +19,16 @@ R+OnqJSeTrNl1rWTHlfcfN2qjSDo9q3a236g2XdRP2Fd9cHODgX3nM522VULGC85
 QEpT34M2DYGX8x/muSl1XVg=
 =mRmA
 -----END PGP MESSAGE-----
+
+---
+cadence_version: 2
+agent: claude-code
+session_id: f727bdfd-ea32-4a2c-a8bb-990c8da2e929
+repo: /Users/daveslutzkin/dev/cadence-cli
+commit: 36cc926
+confidence: exact_hash_match
+session_start: 2026-02-20T09:50:17Z
+payload_blob: ac9b2b3f11e4158d54c2c806ba7f32a687872e92
+payload_sha256: 42802fe1fd0f603552d5bfba92876ecbcbe1c2bc2e46556919abb1098f2d9c35
+payload_encoding: zstd+pgp
+---

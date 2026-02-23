@@ -19,3 +19,16 @@ yFLySLFJR3IBRoWFVy2lQSxqB57+3VAJrMRJpJQYEzMWfZWt0MVruiB2XNrENuaX
 UrEWgo28rHC8GwKmPQIuNvmogPyWBw==
 =Ikn5
 -----END PGP MESSAGE-----
+
+---
+cadence_version: 2
+agent: claude-code
+session_id: 55b69a77-b671-4148-b7a9-28c18ebf8257
+repo: /Users/chrisraethke/projects/cadence-cli
+commit: 9176607
+confidence: exact_hash_match
+session_start: 2026-02-13T07:08:41Z
+payload_blob: 69ecb27f62fbb526c76bc5f3cd14a9c0a2c47c7d
+payload_sha256: c6743c1e1f152449712b134f8136970c8de8d3f0baae27a1a28e15504657ce18
+payload_encoding: zstd+pgp
+---

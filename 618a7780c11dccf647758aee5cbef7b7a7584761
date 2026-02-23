@@ -19,3 +19,16 @@ eK9rnJV4dGyHKXCGdckfaeAyKQhTj3IeXF4mKyHbE+XzD3WiaIUyrqeCsuWtUI2I
 G2zAOVn0WGfjqvJVTw5kCIY3E5niGw==
 =FPOU
 -----END PGP MESSAGE-----
+
+---
+cadence_version: 2
+agent: claude-code
+session_id: dbc7a93c-5db2-49be-8d16-5486f9e853a7
+repo: /Users/chrisraethke/projects/cadence-cli
+commit: 618a778
+confidence: exact_hash_match
+session_start: 2026-02-13T23:18:40Z
+payload_blob: fee7d4ec514cf15f0846913770f15f09fb6e91ff
+payload_sha256: 4e233c8777c12f35d6b016cb6fb41ca2c4b7a6ded03661a96c2e2e0143deabb9
+payload_encoding: zstd+pgp
+---

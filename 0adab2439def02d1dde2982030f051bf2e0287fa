@@ -19,3 +19,16 @@ rWMWKaFpFLKbOCJ9tTkqiVoZDIX7EHkYAumtTvkDSEn4HeGFUVfE3Wq2YMqbxCN+
 I+gK6os3U0HfCQNrpCHbN0o=
 =7cAa
 -----END PGP MESSAGE-----
+
+---
+cadence_version: 2
+agent: claude-code
+session_id: 93debcb8-eaf6-4ca3-bd6a-22f4362a2978
+repo: /Users/daveslutzkin/dev/cadence-cli
+commit: 0adab24
+confidence: exact_hash_match
+session_start: 2026-02-20T21:12:18Z
+payload_blob: b1ea6ae50a3fb985b58e0505284d93616d15ee43
+payload_sha256: 170f8febf6445895cadc425e73b51de55c9967af1fde9708db0b7445f6d247db
+payload_encoding: zstd+pgp
+---

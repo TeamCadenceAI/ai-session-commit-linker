@@ -19,3 +19,16 @@ c+GzSOXiMWcjh0s+ZTq3/tksnAfkIEc83HD/288ODx4/1Zv2zWqdJXJ3EuAsW9TH
 nBuKNjJ4jynSgEPFU6pCHlk=
 =zve7
 -----END PGP MESSAGE-----
+
+---
+cadence_version: 2
+agent: claude-code
+session_id: 399cf645-8617-4810-a351-89bd670121e0
+repo: /Users/daveslutzkin/dev/cadence-cli
+commit: 47a8f7a
+confidence: exact_hash_match
+session_start: 2026-02-20T10:11:54Z
+payload_blob: a016848f9f555886b8d7fbb29e6e1f1a8e903729
+payload_sha256: 7fcafa18413f87ea5a52bea57325dd8d8a737d3de9c7ba01fd813d04b299cf07
+payload_encoding: zstd+pgp
+---

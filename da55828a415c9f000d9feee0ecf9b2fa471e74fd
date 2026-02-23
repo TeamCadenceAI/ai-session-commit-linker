@@ -19,3 +19,16 @@ Wg8WhM+X1fwOIH5RTMLRTRtOerQ+kg8I5MwR8ctECMyFg+i0A+ICt3gTV8LYiQwk
 NPQRA63Gi6/eBgIQqln9aTo=
 =dx8p
 -----END PGP MESSAGE-----
+
+---
+cadence_version: 2
+agent: claude-code
+session_id: fc93c9bb-7ff0-4d8f-b43d-c1dd6c23e3ad
+repo: /Users/daveslutzkin/dev/cadence-cli
+commit: da55828
+confidence: exact_hash_match
+session_start: 2026-02-20T18:24:26Z
+payload_blob: 34a85ebd4e3089bb0b11337ad83d052c6025f115
+payload_sha256: 54d71c3e1d54274702408a475f609e42f36b5d9ecf157896534896e61743938e
+payload_encoding: zstd+pgp
+---

@@ -20,3 +20,16 @@ wPo8EsJcVpyhT/2sdXLOYBZOAFBUqtKf0TtlD9HUA7a0pf/EcWsVho/3j2r7PgFU
 is4W
 =NX8+
 -----END PGP MESSAGE-----
+
+---
+cadence_version: 2
+agent: claude-code
+session_id: b455c8b5-27f5-43d2-bf83-60aa33bb5162
+repo: /Users/daveslutzkin/dev/cadence-cli
+commit: 9577f67
+confidence: exact_hash_match
+session_start: 2026-02-20T23:19:51Z
+payload_blob: 0ff0972a32944c4de53bd3d82767c51dd26028c4
+payload_sha256: 93148c754b529b017fab039118e9f51cf1734d1c79357b9cfd677e79a155ca95
+payload_encoding: zstd+pgp
+---

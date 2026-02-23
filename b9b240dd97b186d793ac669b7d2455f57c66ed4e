@@ -19,3 +19,16 @@ rXTnRp9ruTY3ESaIBNlMMNyXEHau7cEZ+e1OABRb8XCwHOpQ+/tJySy9vb8EXObY
 u+5SZw+XIv3XD1nLmYgWGkCHDHnrCg==
 =alXW
 -----END PGP MESSAGE-----
+
+---
+cadence_version: 2
+agent: claude-code
+session_id: f9b6bb31-5645-4642-98ca-af28e9909116
+repo: /Users/chrisraethke/projects/cadence-cli
+commit: b9b240d
+confidence: exact_hash_match
+session_start: 2026-02-13T22:23:46Z
+payload_blob: d6c3d1c81ea886f40cf6ee630853ca43470aacc0
+payload_sha256: 380391eaf192e8ea4895c59cf6cd3b8d25b3031d9c3940f15b635c7cc2d39465
+payload_encoding: zstd+pgp
+---
