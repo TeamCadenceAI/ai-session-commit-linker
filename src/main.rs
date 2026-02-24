@@ -823,7 +823,7 @@ fn report_backfill_completion(window_days: i32, stats: BackfillSyncStats) {
     let finished_at = time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
-    let request = api_client::HydrateCompleteRequest {
+    let request = api_client::BackfillCompleteRequest {
         window_days,
         notes_attached: stats.notes_attached,
         notes_skipped: stats.notes_skipped,
@@ -833,12 +833,12 @@ fn report_backfill_completion(window_days: i32, stats: BackfillSyncStats) {
         cli_version: env!("CARGO_PKG_VERSION").to_string(),
     };
 
-    match client.report_hydrate_complete(&token, &request, Duration::from_secs(API_TIMEOUT_SECS)) {
+    match client.report_backfill_complete(&token, &request, Duration::from_secs(API_TIMEOUT_SECS)) {
         Ok(response) => {
             if response.recorded {
                 output::detail(&format!(
                     "Backfill results synced to Cadence onboarding at {}.",
-                    response.hydrate_completed_at
+                    response.backfill_completed_at
                 ));
             } else {
                 output::detail("Backfill sync already recorded.");

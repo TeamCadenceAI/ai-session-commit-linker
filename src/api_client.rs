@@ -3,7 +3,7 @@
 //! Includes:
 //! - Public key retrieval for encryption setup
 //! - CLI auth exchange + revoke
-//! - Hydrate-complete reporting
+//! - Backfill-complete reporting
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -16,7 +16,7 @@ use std::time::Duration;
 const KEYS_PUBLIC_PATH: &str = "/api/keys/public";
 const AUTH_EXCHANGE_PATH: &str = "/api/auth/exchange";
 const AUTH_REVOKE_PATH: &str = "/api/auth";
-const HYDRATE_COMPLETE_PATH: &str = "/api/onboarding/hydrate-complete";
+const BACKFILL_COMPLETE_PATH: &str = "/api/onboarding/backfill-complete";
 
 // ---------------------------------------------------------------------------
 // Response DTOs
@@ -49,9 +49,9 @@ pub struct CliTokenExchangeResult {
     pub expires_at: String,
 }
 
-/// Request body for `POST /api/onboarding/hydrate-complete`.
+/// Request body for `POST /api/onboarding/backfill-complete`.
 #[derive(Debug, Clone, Serialize)]
-pub struct HydrateCompleteRequest {
+pub struct BackfillCompleteRequest {
     pub window_days: i32,
     pub notes_attached: i64,
     pub notes_skipped: i64,
@@ -61,11 +61,11 @@ pub struct HydrateCompleteRequest {
     pub cli_version: String,
 }
 
-/// Data payload from `POST /api/onboarding/hydrate-complete`.
+/// Data payload from `POST /api/onboarding/backfill-complete`.
 #[derive(Debug, Clone, Deserialize)]
-pub struct HydrateCompleteResponse {
+pub struct BackfillCompleteResponse {
     pub recorded: bool,
-    pub hydrate_completed_at: String,
+    pub backfill_completed_at: String,
     pub next_step: String,
 }
 
@@ -196,14 +196,14 @@ impl ApiClient {
         Err(map_authenticated_http_error(status, &body))
     }
 
-    /// Report hydration completion to onboarding state.
-    pub fn report_hydrate_complete(
+    /// Report backfill completion to onboarding state.
+    pub fn report_backfill_complete(
         &self,
         token: &str,
-        report: &HydrateCompleteRequest,
+        report: &BackfillCompleteRequest,
         timeout: Duration,
-    ) -> std::result::Result<HydrateCompleteResponse, AuthenticatedRequestError> {
-        let url = self.url(HYDRATE_COMPLETE_PATH);
+    ) -> std::result::Result<BackfillCompleteResponse, AuthenticatedRequestError> {
+        let url = self.url(BACKFILL_COMPLETE_PATH);
         let resp = self
             .client
             .post(&url)
@@ -222,8 +222,9 @@ impl ApiClient {
         let body = resp
             .text()
             .map_err(|e| AuthenticatedRequestError::Network(e.to_string()))?;
-        let envelope: ApiResponseEnvelope<HydrateCompleteResponse> = serde_json::from_str(&body)
-            .map_err(|e| AuthenticatedRequestError::Parse(e.to_string()))?;
+        let envelope: ApiResponseEnvelope<BackfillCompleteResponse> =
+            serde_json::from_str(&body)
+                .map_err(|e| AuthenticatedRequestError::Parse(e.to_string()))?;
         Ok(envelope.data)
     }
 
