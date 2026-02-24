@@ -1763,6 +1763,10 @@ fn run_backfill_inner(
     let mut skipped = 0usize;
     let mut errors = 0usize;
     let mut fallback_attached = 0usize;
+    let sync_remote_before_attach = should_sync_remote_before_attach(do_push);
+    if !sync_remote_before_attach {
+        output::detail("Remote notes sync skipped (no --push)");
+    }
 
     // Step 3: Pre-process each file to resolve repo and group by repo display
     struct SessionInfo {
@@ -1872,21 +1876,25 @@ fn run_backfill_inner(
             }
         }
 
-        let repo_remote = if let Ok(Some(remote)) = git::resolve_push_remote_at(&repo_root) {
-            let fetch_start = std::time::Instant::now();
-            match push::fetch_merge_notes_for_remote_at(&repo_root, &remote) {
-                Ok(()) => {
-                    output::detail(&format!(
-                        "Fetched notes from {} in {} ms",
-                        remote,
-                        fetch_start.elapsed().as_millis()
-                    ));
+        let repo_remote = if sync_remote_before_attach {
+            if let Ok(Some(remote)) = git::resolve_push_remote_at(&repo_root) {
+                let fetch_start = std::time::Instant::now();
+                match push::fetch_merge_notes_for_remote_at(&repo_root, &remote) {
+                    Ok(()) => {
+                        output::detail(&format!(
+                            "Fetched notes from {} in {} ms",
+                            remote,
+                            fetch_start.elapsed().as_millis()
+                        ));
+                    }
+                    Err(e) => {
+                        output::note(&format!("Could not fetch notes from {}: {}", remote, e));
+                    }
                 }
-                Err(e) => {
-                    output::note(&format!("Could not fetch notes from {}: {}", remote, e));
-                }
+                Some(remote)
+            } else {
+                None
             }
-            Some(remote)
         } else {
             None
         };
@@ -2275,6 +2283,10 @@ fn run_backfill_inner(
     }
 
     Ok(())
+}
+
+fn should_sync_remote_before_attach(do_push: bool) -> bool {
+    do_push
 }
 
 fn run_retry() -> Result<()> {
@@ -3357,6 +3369,12 @@ mod tests {
             }
             _ => panic!("expected Backfill command"),
         }
+    }
+
+    #[test]
+    fn backfill_remote_sync_depends_on_push_flag() {
+        assert!(should_sync_remote_before_attach(true));
+        assert!(!should_sync_remote_before_attach(false));
     }
 
     // -----------------------------------------------------------------------
