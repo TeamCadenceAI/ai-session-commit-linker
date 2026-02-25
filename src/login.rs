@@ -260,9 +260,9 @@ body {{
 }}
 .brand-logo {{
   display: block;
-  height: 32px;
+  height: 64px;
   width: auto;
-  max-width: 140px;
+  max-width: 280px;
 }}
 .badge {{
   display: inline-flex;
@@ -294,8 +294,8 @@ p {{
 }}
 @media (max-width: 480px) {{
   .brand-logo {{
-    height: 28px;
-    max-width: 120px;
+    height: 56px;
+    max-width: 240px;
   }}
 }}
 </style>
