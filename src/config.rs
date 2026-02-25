@@ -582,6 +582,16 @@ mod tests {
         CliConfig::config_path_with_home(home).unwrap()
     }
 
+    /// Helper: produce a platform-appropriate fake absolute path for testing.
+    /// On Unix returns `/tmp/<name>`, on Windows returns `C:\tmp\<name>`.
+    fn fake_abs(name: &str) -> String {
+        if cfg!(windows) {
+            format!("C:\\tmp\\{}", name)
+        } else {
+            format!("/tmp/{}", name)
+        }
+    }
+
     /// Helper: save/restore an env var around a closure.
     struct EnvGuard {
         key: String,
@@ -1596,20 +1606,23 @@ mod tests {
 
     #[test]
     fn test_parse_repo_path_list_comma_separated() {
-        let paths = parse_repo_path_list("/tmp/a,/tmp/b").unwrap();
-        assert_eq!(paths, vec!["/tmp/a".to_string(), "/tmp/b".to_string()]);
+        let input = format!("{},{}", fake_abs("a"), fake_abs("b"));
+        let paths = parse_repo_path_list(&input).unwrap();
+        assert_eq!(paths, vec![fake_abs("a"), fake_abs("b")]);
     }
 
     #[test]
     fn test_parse_repo_path_list_newline_separated() {
-        let paths = parse_repo_path_list("/tmp/a\n/tmp/b").unwrap();
-        assert_eq!(paths, vec!["/tmp/a".to_string(), "/tmp/b".to_string()]);
+        let input = format!("{}\n{}", fake_abs("a"), fake_abs("b"));
+        let paths = parse_repo_path_list(&input).unwrap();
+        assert_eq!(paths, vec![fake_abs("a"), fake_abs("b")]);
     }
 
     #[test]
     fn test_parse_repo_path_list_deduplicates() {
-        let paths = parse_repo_path_list("/tmp/a, /tmp/a").unwrap();
-        assert_eq!(paths, vec!["/tmp/a".to_string()]);
+        let input = format!("{}, {}", fake_abs("a"), fake_abs("a"));
+        let paths = parse_repo_path_list(&input).unwrap();
+        assert_eq!(paths, vec![fake_abs("a")]);
     }
 
     #[test]
@@ -1675,13 +1688,14 @@ mod tests {
     #[test]
     fn test_set_get_watched_repo_paths() {
         let mut cfg = CliConfig::default();
-        cfg.set_key(ConfigKey::WatchedRepoPaths, "/tmp/a,/tmp/b")
-            .unwrap();
+        let input = format!("{},{}", fake_abs("a"), fake_abs("b"));
+        cfg.set_key(ConfigKey::WatchedRepoPaths, &input).unwrap();
         assert_eq!(
             cfg.watched_repo_paths,
-            Some(vec!["/tmp/a".to_string(), "/tmp/b".to_string()])
+            Some(vec![fake_abs("a"), fake_abs("b")])
         );
-        assert_eq!(cfg.get_key(ConfigKey::WatchedRepoPaths), "/tmp/a,/tmp/b");
+        let expected_display = format!("{},{}", fake_abs("a"), fake_abs("b"));
+        assert_eq!(cfg.get_key(ConfigKey::WatchedRepoPaths), expected_display);
     }
 
     #[test]
@@ -1734,7 +1748,8 @@ mod tests {
         cfg.set_key(ConfigKey::ApiUrl, "https://test.example.com")
             .unwrap();
         cfg.set_key(ConfigKey::WatchAllRepos, "false").unwrap();
-        cfg.set_key(ConfigKey::WatchedRepoPaths, "/tmp/r1,/tmp/r2")
+        let paths_input = format!("{},{}", fake_abs("r1"), fake_abs("r2"));
+        cfg.set_key(ConfigKey::WatchedRepoPaths, &paths_input)
             .unwrap();
         cfg.save_to(&path).unwrap();
 
@@ -1745,7 +1760,7 @@ mod tests {
         assert_eq!(loaded.watch_all_repos, Some(false));
         assert_eq!(
             loaded.watched_repo_paths,
-            Some(vec!["/tmp/r1".to_string(), "/tmp/r2".to_string()])
+            Some(vec![fake_abs("r1"), fake_abs("r2")])
         );
     }
 

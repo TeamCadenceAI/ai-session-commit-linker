@@ -3751,6 +3751,15 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// Helper: produce a platform-appropriate fake absolute path for testing.
+    fn fake_abs(name: &str) -> String {
+        if cfg!(windows) {
+            format!("C:\\tmp\\{}", name)
+        } else {
+            format!("/tmp/{}", name)
+        }
+    }
+
     #[test]
     fn cli_parses_keys_setup() {
         let cli = Cli::parse_from(["cadence", "keys", "setup"]);
@@ -4012,11 +4021,9 @@ mod tests {
 
     #[test]
     fn parse_install_repo_scope_paths_accepts_multiple_tokens() {
-        let paths = parse_install_repo_scope_paths("/tmp/repo-a,/tmp/repo-b").unwrap();
-        assert_eq!(
-            paths,
-            vec!["/tmp/repo-a".to_string(), "/tmp/repo-b".to_string()]
-        );
+        let input = format!("{},{}", fake_abs("repo-a"), fake_abs("repo-b"));
+        let paths = parse_install_repo_scope_paths(&input).unwrap();
+        assert_eq!(paths, vec![fake_abs("repo-a"), fake_abs("repo-b")]);
     }
 
     #[test]
