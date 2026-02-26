@@ -226,18 +226,18 @@ body {{
   min-height: 100%;
   display: grid;
   place-items: center;
-  padding: 28px;
+  padding: 32px;
 }}
 .card {{
   position: relative;
   overflow: hidden;
-  width: min(620px, 100%);
-  text-align: center;
+  width: min(640px, 100%);
+  text-align: left;
   background: linear-gradient(180deg, rgba(255, 255, 255, 0.96) 0%, #ffffff 100%);
   border: 1px solid rgba(148, 163, 184, 0.25);
   border-radius: 24px;
   box-shadow: 0 24px 60px rgba(15, 23, 42, 0.13);
-  padding: 54px 48px 46px;
+  padding: 58px 52px 56px;
 }}
 .card::before {{
   content: "";
@@ -247,41 +247,50 @@ body {{
   background: linear-gradient(90deg, #1A1363 0%, #4f46e5 52%, #1e40af 100%);
 }}
 .brand {{
-  margin: 0 0 18px;
+  margin: 0 0 14px;
   display: flex;
-  justify-content: center;
+  justify-content: flex-start;
 }}
 .brand-logo {{
   display: block;
-  height: 72px;
+  height: 68px;
   width: auto;
-  max-width: 320px;
+  max-width: 305px;
+}}
+.content {{
+  max-width: 40ch;
+  padding-left: 12px;
 }}
 h1 {{
-  margin: 0 0 12px;
-  font-size: 34px;
-  line-height: 1.1;
-  letter-spacing: -0.02em;
+  margin: 0 0 14px;
+  font-size: 30px;
+  line-height: 1.14;
+  letter-spacing: -0.015em;
   color: #0f172a;
 }}
 p {{
-  margin: 0 auto;
-  max-width: 34ch;
-  font-size: 17px;
-  line-height: 1.6;
+  margin: 0;
+  font-size: 18px;
+  line-height: 1.5;
   color: #475569;
 }}
 @media (max-width: 600px) {{
+  .wrap {{
+    padding: 20px;
+  }}
   .card {{
     border-radius: 20px;
-    padding: 42px 28px 34px;
+    padding: 44px 24px 40px;
   }}
   .brand-logo {{
-    height: 58px;
-    max-width: 252px;
+    height: 56px;
+    max-width: 240px;
+  }}
+  .content {{
+    padding-left: 8px;
   }}
   h1 {{
-    font-size: 28px;
+    font-size: 24px;
   }}
   p {{
     font-size: 16px;
@@ -295,8 +304,10 @@ p {{
 <div class="brand" aria-label="Cadence">
 {brand_svg}
 </div>
+<div class="content">
 <h1>{escaped_title}</h1>
 <p>{escaped_body}</p>
+</div>
 </main>
 </div>
 </body>
