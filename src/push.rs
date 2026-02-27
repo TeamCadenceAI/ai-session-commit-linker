@@ -56,9 +56,19 @@ pub fn should_push_remote(remote: &str) -> bool {
 ///
 /// Shows a spinner while pushing (if stderr is a TTY) and reports the elapsed
 /// time on completion. On failure: logs a note to stderr.
+#[allow(dead_code)]
 pub fn attempt_push_remote_at(repo: &Path, remote: &str) {
+    attempt_push_remote_at_with_options(repo, remote, true);
+}
+
+/// Backfill/helper variant: run push sync without spinner or summary logs.
+pub fn attempt_push_remote_at_quiet(repo: &Path, remote: &str) {
+    attempt_push_remote_at_with_options(repo, remote, false);
+}
+
+fn attempt_push_remote_at_with_options(repo: &Path, remote: &str, show_progress: bool) {
     let push_start = std::time::Instant::now();
-    let use_spinner = output::is_stderr_tty();
+    let use_spinner = show_progress && output::is_stderr_tty();
 
     let spinner = if use_spinner {
         let pb = ProgressBar::new_spinner();
@@ -120,14 +130,20 @@ pub fn attempt_push_remote_at(repo: &Path, remote: &str) {
 
     match result {
         Ok(()) => {
-            output::detail(&format!(
-                "Synced notes with {} in {} ms",
-                remote,
-                push_start.elapsed().as_millis()
-            ));
+            if show_progress {
+                output::detail(&format!(
+                    "Synced notes with {} in {} ms",
+                    remote,
+                    push_start.elapsed().as_millis()
+                ));
+            }
         }
         Err(e) => {
-            output::note(&format!("Could not sync notes with {}: {}", remote, e));
+            if show_progress {
+                output::note(&format!("Could not sync notes with {}: {}", remote, e));
+            } else if output::is_verbose() {
+                output::detail(&format!("Could not sync notes with {}: {}", remote, e));
+            }
         }
     }
 }

@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use console::Term;
 use dialoguer::{Confirm, theme::ColorfulTheme};
-use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -1639,6 +1639,7 @@ struct SessionInfo {
     session_id: String,
     repo_root: std::path::PathBuf,
     metadata: scanner::SessionMetadata,
+    commit_hashes: Vec<String>,
 }
 
 #[derive(Default)]
@@ -1648,6 +1649,44 @@ struct RepoBackfillStats {
     errors: usize,
     fallback_attached: usize,
     commits_found: usize,
+}
+
+fn repo_label_from_display(display: &str) -> String {
+    let trimmed = display.trim();
+    if trimmed.is_empty() {
+        return "unknown".to_string();
+    }
+
+    // HTTPS / HTTP remotes: https://github.com/org/repo(.git)
+    if let Ok(url) = reqwest::Url::parse(trimmed) {
+        let mut segments = url
+            .path_segments()
+            .map(|s| s.filter(|p| !p.is_empty()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        if segments.len() >= 2 {
+            let org = segments.remove(segments.len() - 2);
+            let mut repo = segments.remove(segments.len() - 1).to_string();
+            if let Some(stripped) = repo.strip_suffix(".git") {
+                repo = stripped.to_string();
+            }
+            return format!("{org}/{repo}");
+        }
+    }
+
+    // SSH remote: git@github.com:org/repo.git
+    if let Some((_, path)) = trimmed.split_once(':') {
+        let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+        if parts.len() >= 2 {
+            let org = parts[parts.len() - 2];
+            let mut repo = parts[parts.len() - 1].to_string();
+            if let Some(stripped) = repo.strip_suffix(".git") {
+                repo = stripped.to_string();
+            }
+            return format!("{org}/{repo}");
+        }
+    }
+
+    trimmed.to_string()
 }
 
 fn backfill_repo_concurrency() -> usize {
@@ -1668,26 +1707,58 @@ fn process_repo_backfill(
     do_push: bool,
     sync_remote_before_attach: bool,
     encryption_method: EncryptionMethod,
+    repo_progress: Option<ProgressBar>,
 ) -> RepoBackfillStats {
     let mut stats = RepoBackfillStats::default();
+    let planned_units: u64 = sessions
+        .iter()
+        .map(|s| {
+            if s.commit_hashes.is_empty() {
+                1_u64
+            } else {
+                s.commit_hashes.len() as u64
+            }
+        })
+        .sum::<u64>()
+        .max(1);
+    if let Some(pb) = &repo_progress {
+        pb.set_length(planned_units);
+        pb.set_message("starting");
+    }
 
     let repo_root = match sessions.first() {
         Some(session) => session.repo_root.clone(),
-        None => return stats,
+        None => {
+            if let Some(pb) = &repo_progress {
+                pb.finish_with_message("no sessions");
+            }
+            return stats;
+        }
     };
 
     match git::repo_matches_org_filter(&repo_root) {
         Ok(true) => {}
-        Ok(false) => return stats,
+        Ok(false) => {
+            if let Some(pb) = &repo_progress {
+                pb.finish_with_message("skipped (org filter)");
+            }
+            return stats;
+        }
         Err(e) => {
             output::detail(&format!("{}: org filter check failed: {}", repo_display, e));
             stats.errors += 1;
+            if let Some(pb) = &repo_progress {
+                pb.finish_with_message("error (org filter)");
+            }
             return stats;
         }
     }
 
     let repo_enabled = git::check_enabled_at(&repo_root);
     if !repo_enabled {
+        if let Some(pb) = &repo_progress {
+            pb.finish_with_message("skipped (disabled)");
+        }
         return stats;
     }
 
@@ -1707,7 +1778,7 @@ fn process_repo_backfill(
         .unwrap_or_default();
 
     for session in sessions {
-        let commit_hashes = scanner::extract_commit_hashes(&session.file);
+        let commit_hashes = session.commit_hashes.clone();
         stats.commits_found += commit_hashes.len();
 
         if commit_hashes.is_empty() {
@@ -1727,11 +1798,25 @@ fn process_repo_backfill(
                 Ok(c) => c,
                 Err(_) => {
                     stats.errors += 1;
+                    if let Some(pb) = &repo_progress {
+                        pb.inc(1);
+                        pb.set_message(format!(
+                            "commits={}, errors={}",
+                            stats.commits_found, stats.errors
+                        ));
+                    }
                     continue;
                 }
             };
             stats.commits_found += commits.len();
             if commits.is_empty() {
+                if let Some(pb) = &repo_progress {
+                    pb.inc(1);
+                    pb.set_message(format!(
+                        "commits={}, attached={}, skipped={}",
+                        stats.commits_found, stats.attached, stats.skipped
+                    ));
+                }
                 continue;
             }
 
@@ -1758,18 +1843,39 @@ fn process_repo_backfill(
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
             if scored.is_empty() {
+                if let Some(pb) = &repo_progress {
+                    pb.inc(1);
+                    pb.set_message(format!(
+                        "commits={}, attached={}, skipped={}",
+                        stats.commits_found, stats.attached, stats.skipped
+                    ));
+                }
                 continue;
             }
             if scored.len() > 1
                 && (scored[0].1.candidate.score - scored[1].1.candidate.score)
                     < scanner::min_margin_score()
             {
+                if let Some(pb) = &repo_progress {
+                    pb.inc(1);
+                    pb.set_message(format!(
+                        "commits={}, attached={}, skipped={}",
+                        stats.commits_found, stats.attached, stats.skipped
+                    ));
+                }
                 continue;
             }
 
             let (hash, selected) = scored.remove(0);
             if noted_commits.contains(&hash) {
                 stats.skipped += 1;
+                if let Some(pb) = &repo_progress {
+                    pb.inc(1);
+                    pb.set_message(format!(
+                        "commits={}, attached={}, skipped={}",
+                        stats.commits_found, stats.attached, stats.skipped
+                    ));
+                }
                 continue;
             }
 
@@ -1777,6 +1883,13 @@ fn process_repo_backfill(
                 Ok(content) => content,
                 Err(_) => {
                     stats.errors += 1;
+                    if let Some(pb) = &repo_progress {
+                        pb.inc(1);
+                        pb.set_message(format!(
+                            "commits={}, errors={}",
+                            stats.commits_found, stats.errors
+                        ));
+                    }
                     continue;
                 }
             };
@@ -1812,6 +1925,13 @@ fn process_repo_backfill(
                 }
                 Err(_) => stats.errors += 1,
             }
+            if let Some(pb) = &repo_progress {
+                pb.inc(1);
+                pb.set_message(format!(
+                    "commits={}, attached={}, skipped={}",
+                    stats.commits_found, stats.attached, stats.skipped
+                ));
+            }
             continue;
         }
 
@@ -1828,14 +1948,29 @@ fn process_repo_backfill(
         for hash in &commit_hashes {
             match git::commit_exists_at(&session.repo_root, hash) {
                 Ok(true) => {}
-                Ok(false) => continue,
+                Ok(false) => {
+                    if let Some(pb) = &repo_progress {
+                        pb.inc(1);
+                    }
+                    continue;
+                }
                 Err(_) => {
                     stats.errors += 1;
+                    if let Some(pb) = &repo_progress {
+                        pb.inc(1);
+                    }
                     continue;
                 }
             }
             if noted_commits.contains(hash) {
                 stats.skipped += 1;
+                if let Some(pb) = &repo_progress {
+                    pb.inc(1);
+                    pb.set_message(format!(
+                        "commits={}, attached={}, skipped={}",
+                        stats.commits_found, stats.attached, stats.skipped
+                    ));
+                }
                 continue;
             }
 
@@ -1871,6 +2006,9 @@ fn process_repo_backfill(
                     }
                     Err(_) => {
                         stats.errors += 1;
+                        if let Some(pb) = &repo_progress {
+                            pb.inc(1);
+                        }
                         break;
                     }
                 }
@@ -1898,11 +2036,25 @@ fn process_repo_backfill(
                 }
                 Err(_) => stats.errors += 1,
             }
+            if let Some(pb) = &repo_progress {
+                pb.inc(1);
+                pb.set_message(format!(
+                    "commits={}, attached={}, skipped={}",
+                    stats.commits_found, stats.attached, stats.skipped
+                ));
+            }
         }
     }
 
     if do_push && let Some(ref remote) = repo_remote {
-        push::attempt_push_remote_at(&repo_root, remote);
+        push::attempt_push_remote_at_quiet(&repo_root, remote);
+    }
+
+    if let Some(pb) = &repo_progress {
+        pb.finish_with_message(format!(
+            "done: commits={}, attached={}, skipped={}, issues={}",
+            stats.commits_found, stats.attached, stats.skipped, stats.errors
+        ));
     }
 
     stats
@@ -2058,6 +2210,7 @@ async fn run_backfill_inner(
                 session_id,
                 repo_root,
                 metadata,
+                commit_hashes: scanner::extract_commit_hashes(file),
             });
 
         if let Some(ref pb) = progress {
@@ -2073,25 +2226,47 @@ async fn run_backfill_inner(
     let total_repos = sessions_by_repo.len();
     let concurrency = backfill_repo_concurrency();
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
-    let commits_found = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut join_set = tokio::task::JoinSet::new();
+    let multi = use_progress.then(MultiProgress::new);
+    if let Some(mp) = &multi {
+        mp.set_draw_target(ProgressDrawTarget::stderr());
+        mp.set_move_cursor(true);
+    }
 
-    let repo_progress = if use_progress {
-        let pb = ProgressBar::new(total_repos as u64);
-        pb.set_draw_target(ProgressDrawTarget::stderr());
-        pb.set_style(
-            ProgressStyle::with_template("{bar:40.cyan/blue} {pos}/{len} {msg}")
-                .unwrap_or_else(|_| ProgressStyle::default_bar()),
-        );
-        pb.set_message("repositories");
-        Some(pb)
-    } else {
-        None
-    };
-
-    for (repo_display, sessions) in sessions_by_repo.clone() {
+    for (repo_display, sessions) in sessions_by_repo {
         let permit = semaphore.clone().acquire_owned().await?;
         let method = encryption_method.clone();
+        let per_repo_bar = if let Some(mp) = &multi {
+            let total_units: u64 = sessions
+                .iter()
+                .map(|s| {
+                    if s.commit_hashes.is_empty() {
+                        1_u64
+                    } else {
+                        s.commit_hashes.len() as u64
+                    }
+                })
+                .sum::<u64>()
+                .max(1);
+            let pb = mp.add(ProgressBar::new(total_units));
+            pb.set_style(
+                ProgressStyle::with_template(
+                    "  {prefix:36.cyan.bold} {bar:20.green/black} {pos:>3}/{len:<3} {msg:.yellow}",
+                )
+                .unwrap_or_else(|_| ProgressStyle::default_bar()),
+            );
+            let repo_label = repo_label_from_display(&repo_display);
+            let short_name = if repo_label.len() > 36 {
+                format!("{}…", &repo_label[..35])
+            } else {
+                repo_label
+            };
+            pb.set_prefix(short_name);
+            pb.set_message("queued");
+            Some(pb)
+        } else {
+            None
+        };
         join_set.spawn(async move {
             let _permit = permit;
             tokio::task::spawn_blocking(move || {
@@ -2101,6 +2276,7 @@ async fn run_backfill_inner(
                     do_push,
                     sync_remote_before_attach,
                     method,
+                    per_repo_bar,
                 )
             })
             .await
@@ -2114,34 +2290,16 @@ async fn run_backfill_inner(
                 skipped += repo_stats.skipped;
                 errors += repo_stats.errors;
                 fallback_attached += repo_stats.fallback_attached;
-                let running = commits_found.fetch_add(
-                    repo_stats.commits_found,
-                    std::sync::atomic::Ordering::Relaxed,
-                ) + repo_stats.commits_found;
-                if let Some(pb) = &repo_progress {
-                    pb.inc(1);
-                    pb.set_message(format!("commits found: {}", running));
-                }
             }
             Ok(Err(e)) => {
                 errors += 1;
                 output::detail(&format!("repo worker failed: {}", e));
-                if let Some(pb) = &repo_progress {
-                    pb.inc(1);
-                }
             }
             Err(e) => {
                 errors += 1;
                 output::detail(&format!("repo task join failed: {}", e));
-                if let Some(pb) = &repo_progress {
-                    pb.inc(1);
-                }
             }
         }
-    }
-
-    if let Some(pb) = repo_progress {
-        pb.finish_and_clear();
     }
 
     // Final summary
