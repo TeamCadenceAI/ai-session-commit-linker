@@ -339,7 +339,7 @@ where
     F: std::future::Future,
 {
     if let Ok(handle) = Handle::try_current() {
-        handle.block_on(fut)
+        tokio::task::block_in_place(|| handle.block_on(fut))
     } else {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
