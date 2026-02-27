@@ -1,0 +1,12 @@
+---
+cadence_version: 2
+agent: claude-code
+session_id: 0e5dfcbb-bc92-477b-94e9-807d9da23830
+repo: /Users/daveslutzkin/dev/cadence-cli/worktrees/codex/ftue-watch-scope
+commit: ef44b4f94a0449f74d03b38266300b685b68625f
+confidence: time_window_match
+session_start: 2026-02-27T18:25:03Z
+payload_blob: e7ce0e3d1ccd13ad1cb658fa35c9d94af23442f6
+payload_sha256: c3e57f4af8b526b2567ded11a5d53364c92e532bfc6e896918213d7b30bed8e5
+payload_encoding: zstd+pgp
+---
