@@ -5,6 +5,7 @@ mod git;
 mod keychain;
 mod note;
 mod output;
+mod payload_pending;
 mod pending;
 mod pgp_keys;
 mod push;
@@ -1122,6 +1123,7 @@ fn attach_note_from_log(
         confidence,
         method,
         session_start,
+        true,
         None, // no pre-stored payload — will store a new blob
         None, // use CWD repo
     )
@@ -1141,6 +1143,7 @@ fn attach_note_from_log_v2(
     confidence: note::Confidence,
     method: &EncryptionMethod,
     session_start: Option<i64>,
+    anchor_payload_ref: bool,
     existing_payload: Option<&PayloadInfo>,
     repo: Option<&std::path::Path>,
 ) -> Result<()> {
@@ -1169,6 +1172,25 @@ fn attach_note_from_log_v2(
 
     // Pointer note stays plaintext — only the payload blob is encrypted.
     // This lets the API index metadata without needing decryption keys.
+    if anchor_payload_ref {
+        let payload_repo = match repo {
+            Some(r) => Some(r.to_path_buf()),
+            None => git::repo_root().ok(),
+        };
+        if let Some(r) = payload_repo.as_deref()
+            && let Err(e) = git::ensure_payload_blob_referenced_at(r, &blob_sha)
+        {
+            let short = if blob_sha.len() >= 8 {
+                &blob_sha[..8]
+            } else {
+                &blob_sha
+            };
+            output::note(&format!(
+                "Could not update payload ref for blob {}: {}",
+                short, e
+            ));
+        }
+    }
     match repo {
         Some(r) => git::add_note_at(r, commit, &note_content)?,
         None => git::add_note(commit, &note_content)?,
@@ -1866,6 +1888,7 @@ fn run_hydrate_inner(
                         note::Confidence::TimeWindowMatch,
                         &encryption_method,
                         session_start,
+                        true,
                         None,
                         Some(&session.repo_root),
                     ) {
@@ -1923,6 +1946,7 @@ fn run_hydrate_inner(
                 // Lazily store the payload blob once for this session.
                 // We defer reading until we know at least one commit needs a note.
                 let mut payload_info: Option<PayloadInfo> = None;
+                let mut payload_anchored = false;
 
                 for hash in &commit_hashes {
                     // Verify the commit exists in the resolved repo
@@ -1980,6 +2004,16 @@ fn run_hydrate_inner(
                                     payload_sha256: sha256,
                                     encoding,
                                 });
+                                if let Some(info) = payload_info.as_ref()
+                                    && let Err(e) = git::ensure_payload_blob_referenced_at(
+                                        &session.repo_root,
+                                        &info.blob_sha,
+                                    )
+                                {
+                                    messages.push(format!("could not anchor payload ref: {}", e));
+                                } else {
+                                    payload_anchored = true;
+                                }
                             }
                             Err(e) => {
                                 messages.push(format!("could not store payload: {}", e));
@@ -2001,6 +2035,7 @@ fn run_hydrate_inner(
                         note::Confidence::ExactHashMatch,
                         &encryption_method,
                         session_start,
+                        !payload_anchored,
                         Some(info),
                         Some(&session.repo_root),
                     ) {
