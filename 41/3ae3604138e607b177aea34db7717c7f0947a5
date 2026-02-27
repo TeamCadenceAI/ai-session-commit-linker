@@ -1,0 +1,12 @@
+---
+cadence_version: 2
+agent: claude-code
+session_id: d5c3ebd8-736c-44ec-b962-90c1ab9cec43
+repo: /Users/daveslutzkin/dev/cadence-cli/worktrees/codex/add-branding-to-success-screen
+commit: 413ae3604138e607b177aea34db7717c7f0947a5
+confidence: time_window_match
+session_start: 2026-02-27T18:25:17Z
+payload_blob: 7bb023bd5dca3c36f11f001bdee12e4fe03a30b1
+payload_sha256: 46b9266b16dd4598a95bd80137b8a95498ffd5ef62ddc3a7715e1410b562eff9
+payload_encoding: zstd+pgp
+---
