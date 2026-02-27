@@ -1000,20 +1000,48 @@ fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
 
     // Step 2: Deduplication — if note already exists, exit early
     if git::note_exists(&head_hash)? {
+        match maybe_refresh_rewritten_note(&head_hash) {
+            Ok(true) => {
+                output::success(
+                    "[Cadence]",
+                    &format!(
+                        "Reattached session note to amended commit {}",
+                        &head_hash[..7]
+                    ),
+                );
+            }
+            Ok(false) => {
+                output::success(
+                    "[Cadence]",
+                    &format!(
+                        "Session note already attached to commit {}",
+                        &head_hash[..7]
+                    ),
+                );
+            }
+            Err(e) => {
+                output::note(&format!(
+                    "Could not refresh rewritten note for amended commit {} ({})",
+                    &head_hash[..7],
+                    e
+                ));
+            }
+        }
         // Note already attached (e.g., by backfill). Clean up stale pending record.
         let _ = pending::remove(&head_hash);
         return Ok(());
     }
 
     // Step 3: Collect candidate files across all agents
-    let candidate_files = agents::all_candidate_files(&repo_root, head_timestamp, 600);
+    let candidate_files =
+        agents::all_candidate_files(&repo_root, head_timestamp, POST_COMMIT_MATCH_WINDOW_SECS);
 
     let selected = select_session_for_commit(
         &head_hash,
         &repo_root,
         head_timestamp,
         &candidate_files,
-        600,
+        POST_COMMIT_MATCH_WINDOW_SECS,
     );
 
     let mut attached = false;
@@ -1130,6 +1158,152 @@ fn log_attached_session(
     output::success("[Cadence]", &message);
 }
 
+fn parse_note_header(note_content: &str) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let mut in_header = false;
+
+    for line in note_content.lines() {
+        if line == "---" {
+            if !in_header {
+                in_header = true;
+                continue;
+            }
+            break;
+        }
+        if !in_header {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            map.insert(k.trim().to_string(), v.trim().to_string());
+        }
+    }
+
+    map
+}
+
+fn parse_agent_type(value: &str) -> Option<scanner::AgentType> {
+    match value {
+        "claude-code" => Some(scanner::AgentType::Claude),
+        "codex" => Some(scanner::AgentType::Codex),
+        "cursor" => Some(scanner::AgentType::Cursor),
+        "copilot" => Some(scanner::AgentType::Copilot),
+        "antigravity" => Some(scanner::AgentType::Antigravity),
+        _ => None,
+    }
+}
+
+fn parse_confidence(value: &str) -> Option<note::Confidence> {
+    match value {
+        "exact_hash_match" => Some(note::Confidence::ExactHashMatch),
+        "time_window_match" => Some(note::Confidence::TimeWindowMatch),
+        "scored_match" => Some(note::Confidence::ScoredMatch),
+        _ => None,
+    }
+}
+
+fn parse_payload_encoding(value: &str) -> Option<note::PayloadEncoding> {
+    match value {
+        "plain" => Some(note::PayloadEncoding::Plain),
+        "zstd" => Some(note::PayloadEncoding::Zstd),
+        "pgp" => Some(note::PayloadEncoding::Pgp),
+        "zstd+pgp" => Some(note::PayloadEncoding::ZstdPgp),
+        _ => None,
+    }
+}
+
+fn parse_rfc3339_unix(value: &str) -> Option<i64> {
+    time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+        .ok()
+        .map(|dt| dt.unix_timestamp())
+}
+
+fn maybe_refresh_rewritten_note(commit: &str) -> Result<bool> {
+    let note_content = match git::read_note(commit) {
+        Ok(content) => content,
+        Err(_) => return Ok(false),
+    };
+
+    let header = parse_note_header(&note_content);
+    if header.get("cadence_version").map(String::as_str) != Some("2") {
+        return Ok(false);
+    }
+
+    let existing_commit = match header.get("commit").map(String::as_str) {
+        Some(c) => c,
+        None => return Ok(false),
+    };
+    if existing_commit == commit {
+        return Ok(false);
+    }
+
+    let agent = match header.get("agent").and_then(|v| parse_agent_type(v)) {
+        Some(a) => a,
+        None => return Ok(false),
+    };
+    let session_id = match header.get("session_id").map(String::as_str) {
+        Some(v) => v,
+        None => return Ok(false),
+    };
+    let repo = match header.get("repo").map(String::as_str) {
+        Some(v) => v,
+        None => return Ok(false),
+    };
+    let payload_blob = match header.get("payload_blob").map(String::as_str) {
+        Some(v) => v,
+        None => return Ok(false),
+    };
+    let payload_sha256 = match header.get("payload_sha256").map(String::as_str) {
+        Some(v) => v,
+        None => return Ok(false),
+    };
+    let payload_encoding = match header
+        .get("payload_encoding")
+        .and_then(|v| parse_payload_encoding(v))
+    {
+        Some(v) => v,
+        None => return Ok(false),
+    };
+
+    let confidence = header
+        .get("confidence")
+        .and_then(|v| parse_confidence(v))
+        .unwrap_or(note::Confidence::ExactHashMatch);
+    let session_start = header
+        .get("session_start")
+        .and_then(|v| parse_rfc3339_unix(v));
+    let match_score = header
+        .get("match_score")
+        .and_then(|v| v.parse::<f64>().ok());
+    let match_reasons_storage = header
+        .get("match_reasons")
+        .map(|v| {
+            v.split(',')
+                .map(|part| part.trim())
+                .filter(|part| !part.is_empty())
+                .map(|part| part.to_string())
+                .collect::<Vec<_>>()
+        })
+        .filter(|v| !v.is_empty());
+    let match_reasons = match_reasons_storage.as_deref();
+
+    let refreshed = note::format_v2_with_match_details(
+        &agent,
+        session_id,
+        repo,
+        commit,
+        confidence,
+        session_start,
+        payload_blob,
+        payload_sha256,
+        payload_encoding,
+        match_score,
+        match_reasons,
+    )?;
+
+    git::add_note_force(commit, &refreshed)?;
+    Ok(true)
+}
+
 /// Maximum number of retry attempts before a pending record is abandoned.
 ///
 /// After this many attempts, the pending record is removed and a note
@@ -1141,12 +1315,100 @@ const MAX_RETRY_ATTEMPTS: u32 = 20;
 /// Backoff schedule for background retry (in seconds).
 /// Total wait: 1 + 2 + 4 + 8 + 16 + 32 = 63 seconds.
 const BACKGROUND_RETRY_DELAYS: &[u64] = &[1, 2, 4, 8, 16, 32];
+const POST_COMMIT_MATCH_WINDOW_SECS: i64 = 1_800;
+const DAILY_MATCH_WINDOW_SECS: i64 = 86_400;
 
 fn file_mtime_epoch(path: &std::path::Path) -> Option<i64> {
     let metadata = std::fs::metadata(path).ok()?;
     let mtime = metadata.modified().ok()?;
     let mtime_epoch = mtime.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64;
     Some(mtime_epoch)
+}
+
+fn commit_lookup_windows_for_session(file: &std::path::Path) -> Vec<(i64, i64)> {
+    if let Some((start, end)) = scanner::session_time_range(file) {
+        let (start, end) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        let tight = scanner::default_time_buffer_secs();
+        return vec![
+            (start.saturating_sub(tight), end.saturating_add(tight)),
+            (
+                start.saturating_sub(DAILY_MATCH_WINDOW_SECS),
+                end.saturating_add(DAILY_MATCH_WINDOW_SECS),
+            ),
+        ];
+    }
+
+    file_mtime_epoch(file)
+        .map(|mtime| {
+            vec![(
+                mtime.saturating_sub(DAILY_MATCH_WINDOW_SECS),
+                mtime.saturating_add(DAILY_MATCH_WINDOW_SECS),
+            )]
+        })
+        .unwrap_or_default()
+}
+
+fn commits_for_backfill_session(
+    repo_root: &std::path::Path,
+    file: &std::path::Path,
+) -> Result<Vec<String>> {
+    let windows = commit_lookup_windows_for_session(file);
+    if windows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    for (start_ts, end_ts) in windows {
+        let commits = git::commits_in_time_range(repo_root, start_ts, end_ts)?;
+        if !commits.is_empty() {
+            return Ok(commits);
+        }
+    }
+
+    Ok(Vec::new())
+}
+
+fn best_ranked_commit_for_session(
+    repo_root: &std::path::Path,
+    file: &std::path::Path,
+    commits: &[String],
+    time_window: i64,
+) -> Option<(String, scanner::SelectedSession)> {
+    let mut scored: Vec<(String, scanner::SelectedSession)> = Vec::new();
+    let candidate_file = file.to_path_buf();
+    for hash in commits {
+        let commit_time = match commit_timestamp_at(repo_root, hash) {
+            Some(ts) => ts,
+            None => continue,
+        };
+        if let Some(selected) = select_session_for_commit(
+            hash,
+            repo_root,
+            commit_time,
+            std::slice::from_ref(&candidate_file),
+            time_window,
+        ) {
+            scored.push((hash.clone(), selected));
+        }
+    }
+
+    scored.sort_by(|a, b| {
+        b.1.candidate
+            .score
+            .partial_cmp(&a.1.candidate.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    if scored.len() > 1
+        && (scored[0].1.candidate.score - scored[1].1.candidate.score) < scanner::min_margin_score()
+    {
+        return None;
+    }
+
+    scored.into_iter().next()
 }
 
 fn commit_timestamp_at(repo: &std::path::Path, commit: &str) -> Option<i64> {
@@ -1418,8 +1680,14 @@ fn run_hook_post_commit_retry(commit: &str, repo: &str, timestamp: i64) -> Resul
     for delay in BACKGROUND_RETRY_DELAYS {
         std::thread::sleep(std::time::Duration::from_secs(*delay));
 
-        match try_resolve_single_commit(commit, repo, repo_root, timestamp, 600, &encryption_method)
-        {
+        match try_resolve_single_commit(
+            commit,
+            repo,
+            repo_root,
+            timestamp,
+            DAILY_MATCH_WINDOW_SECS,
+            &encryption_method,
+        ) {
             ResolveResult::Attached => {
                 let _ = pending::remove(commit);
                 return Ok(());
@@ -1458,7 +1726,7 @@ enum ResolveResult {
 /// (background retry with exponential backoff).
 ///
 /// The `time_window` parameter controls how wide the candidate file mtime
-/// window is (in seconds). The initial hook uses 600s (±10 min), retries
+/// window is (in seconds). The initial hook uses 1800s (±30 min), retries
 /// use 86400s (±24 hours).
 ///
 /// The `method` parameter controls optional encryption. In the retry
@@ -1517,9 +1785,9 @@ fn try_resolve_single_commit(
     .is_ok()
     {
         output::success(
-            "Retry",
+            "[Cadence]",
             &format!(
-                "attached session {} to commit {}",
+                "Retry attached session {} to commit {}",
                 candidate.session_id,
                 &commit[..std::cmp::min(7, commit.len())]
             ),
@@ -1578,7 +1846,7 @@ fn retry_pending_for_repo(repo_str: &str, repo_root: &std::path::Path, method: &
             repo_str,
             repo_root,
             record.commit_time,
-            86_400,
+            DAILY_MATCH_WINDOW_SECS,
             method,
         ) {
             ResolveResult::Attached | ResolveResult::AlreadyExists => {
@@ -1782,20 +2050,8 @@ fn process_repo_backfill(
         stats.commits_found += commit_hashes.len();
 
         if commit_hashes.is_empty() {
-            let time_range = if let Some((start, end)) = scanner::session_time_range(&session.file)
-            {
-                Some((start, end))
-            } else {
-                file_mtime_epoch(&session.file).map(|mtime| (mtime - 86_400, mtime + 86_400))
-            };
-
-            let (start_ts, end_ts) = match time_range {
-                Some(r) => r,
-                None => continue,
-            };
-
-            let commits = match git::commits_in_time_range(&session.repo_root, start_ts, end_ts) {
-                Ok(c) => c,
+            let commits = match commits_for_backfill_session(&session.repo_root, &session.file) {
+                Ok(found) => found,
                 Err(_) => {
                     stats.errors += 1;
                     if let Some(pb) = &repo_progress {
@@ -1820,53 +2076,25 @@ fn process_repo_backfill(
                 continue;
             }
 
-            let mut scored: Vec<(String, scanner::SelectedSession)> = Vec::new();
-            for hash in &commits {
-                let commit_time = match commit_timestamp_at(&session.repo_root, hash) {
-                    Some(ts) => ts,
-                    None => continue,
-                };
-                if let Some(selected) = select_session_for_commit(
-                    hash,
-                    &session.repo_root,
-                    commit_time,
-                    std::slice::from_ref(&session.file),
-                    86_400,
-                ) {
-                    scored.push((hash.clone(), selected));
+            let (hash, selected) = match best_ranked_commit_for_session(
+                &session.repo_root,
+                &session.file,
+                &commits,
+                DAILY_MATCH_WINDOW_SECS,
+            ) {
+                Some(best) => best,
+                None => {
+                    if let Some(pb) = &repo_progress {
+                        pb.inc(1);
+                        pb.set_message(format!(
+                            "commits={}, attached={}, skipped={}",
+                            stats.commits_found, stats.attached, stats.skipped
+                        ));
+                    }
+                    continue;
                 }
-            }
-            scored.sort_by(|a, b| {
-                b.1.candidate
-                    .score
-                    .partial_cmp(&a.1.candidate.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            if scored.is_empty() {
-                if let Some(pb) = &repo_progress {
-                    pb.inc(1);
-                    pb.set_message(format!(
-                        "commits={}, attached={}, skipped={}",
-                        stats.commits_found, stats.attached, stats.skipped
-                    ));
-                }
-                continue;
-            }
-            if scored.len() > 1
-                && (scored[0].1.candidate.score - scored[1].1.candidate.score)
-                    < scanner::min_margin_score()
-            {
-                if let Some(pb) = &repo_progress {
-                    pb.inc(1);
-                    pb.set_message(format!(
-                        "commits={}, attached={}, skipped={}",
-                        stats.commits_found, stats.attached, stats.skipped
-                    ));
-                }
-                continue;
-            }
+            };
 
-            let (hash, selected) = scored.remove(0);
             if noted_commits.contains(&hash) {
                 stats.skipped += 1;
                 if let Some(pb) = &repo_progress {
@@ -3739,5 +3967,118 @@ mod tests {
         let absolute = hooks_dir.clone();
         let relative = repo.path().join(".git/./hooks");
         assert!(paths_equivalent(&absolute, &relative));
+    }
+
+    #[test]
+    fn match_window_defaults_are_stable() {
+        assert_eq!(POST_COMMIT_MATCH_WINDOW_SECS, 1_800);
+        assert_eq!(DAILY_MATCH_WINDOW_SECS, 86_400);
+    }
+
+    #[test]
+    fn parse_note_header_extracts_v2_fields() {
+        let note = "---\n\
+cadence_version: 2\n\
+agent: codex\n\
+session_id: abc\n\
+repo: /tmp/repo\n\
+commit: 1111111111111111111111111111111111111111\n\
+payload_blob: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
+payload_sha256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n\
+payload_encoding: zstd+pgp\n\
+---\n";
+        let header = parse_note_header(note);
+        assert_eq!(header.get("cadence_version").map(String::as_str), Some("2"));
+        assert_eq!(header.get("agent").map(String::as_str), Some("codex"));
+        assert_eq!(
+            header.get("commit").map(String::as_str),
+            Some("1111111111111111111111111111111111111111")
+        );
+    }
+
+    #[test]
+    fn parse_payload_encoding_supports_all_v2_values() {
+        assert_eq!(
+            parse_payload_encoding("plain"),
+            Some(note::PayloadEncoding::Plain)
+        );
+        assert_eq!(
+            parse_payload_encoding("zstd"),
+            Some(note::PayloadEncoding::Zstd)
+        );
+        assert_eq!(
+            parse_payload_encoding("pgp"),
+            Some(note::PayloadEncoding::Pgp)
+        );
+        assert_eq!(
+            parse_payload_encoding("zstd+pgp"),
+            Some(note::PayloadEncoding::ZstdPgp)
+        );
+        assert_eq!(parse_payload_encoding("unknown"), None);
+    }
+
+    #[test]
+    fn commit_lookup_windows_use_timestamp_primary_and_relaxed_fallback() {
+        let dir = TempDir::new().expect("tempdir");
+        let file = dir.path().join("session.jsonl");
+        std::fs::write(
+            &file,
+            r#"{"timestamp":"2026-02-10T01:00:00Z"}
+{"timestamp":"2026-02-10T01:10:00Z"}"#,
+        )
+        .expect("write session");
+
+        let windows = commit_lookup_windows_for_session(&file);
+        assert_eq!(windows.len(), 2);
+
+        let start = time::OffsetDateTime::parse(
+            "2026-02-10T01:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("parse start")
+        .unix_timestamp();
+        let end = time::OffsetDateTime::parse(
+            "2026-02-10T01:10:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("parse end")
+        .unix_timestamp();
+
+        assert_eq!(
+            windows[0],
+            (
+                start - scanner::default_time_buffer_secs(),
+                end + scanner::default_time_buffer_secs()
+            )
+        );
+        assert_eq!(
+            windows[1],
+            (
+                start - DAILY_MATCH_WINDOW_SECS,
+                end + DAILY_MATCH_WINDOW_SECS
+            )
+        );
+    }
+
+    #[test]
+    fn commit_lookup_windows_fall_back_to_mtime_when_no_timestamps() {
+        let dir = TempDir::new().expect("tempdir");
+        let file = dir.path().join("session.jsonl");
+        std::fs::write(
+            &file,
+            r#"{"type":"message","payload":{"text":"no timestamp"}}"#,
+        )
+        .expect("write session");
+
+        let windows = commit_lookup_windows_for_session(&file);
+        assert_eq!(windows.len(), 1);
+        let mtime = file_mtime_epoch(&file).expect("mtime");
+        assert_eq!(
+            windows[0],
+            (
+                mtime - DAILY_MATCH_WINDOW_SECS,
+                mtime + DAILY_MATCH_WINDOW_SECS
+            )
+        );
     }
 }
