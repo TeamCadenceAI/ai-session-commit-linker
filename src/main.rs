@@ -1785,9 +1785,9 @@ fn try_resolve_single_commit(
     .is_ok()
     {
         output::success(
-            "Retry",
+            "[Cadence]",
             &format!(
-                "attached session {} to commit {}",
+                "Retry attached session {} to commit {}",
                 candidate.session_id,
                 &commit[..std::cmp::min(7, commit.len())]
             ),
