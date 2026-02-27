@@ -2061,18 +2061,25 @@ also not json {{{{
             logs.path(),
             "wrong.jsonl",
             &format!(
-                "{{\"session_id\":\"wrong\",\"cwd\":\"/tmp/other\",\"content\":\"[main {}] x\"}}\n",
-                &commit_hash[..7]
+                "{}\n",
+                serde_json::json!({
+                    "session_id": "wrong",
+                    "cwd": "/tmp/other",
+                    "content": format!("[main {}] x", &commit_hash[..7])
+                })
             ),
         );
+        let good_header = serde_json::json!({
+            "session_id": "good",
+            "cwd": repo.path().to_string_lossy().to_string()
+        });
+        let good_event = serde_json::json!({
+            "content": format!("[main {}] commit", &commit_hash[..7])
+        });
         let good = write_temp_file(
             logs.path(),
             "good.jsonl",
-            &format!(
-                "{{\"session_id\":\"good\",\"cwd\":\"{}\"}}\n{{\"content\":\"[main {}] commit\"}}\n",
-                repo.path().to_string_lossy(),
-                &commit_hash[..7]
-            ),
+            &format!("{good_header}\n{good_event}\n"),
         );
 
         let ranked = rank_sessions_for_commit(

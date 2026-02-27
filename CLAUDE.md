@@ -8,7 +8,7 @@ It provides provenance and measurement of AI-assisted development without pollut
 ```bash
 cargo build                    # Debug build
 cargo build --release          # Release build
-cargo test                     # Run all tests
+cargo test --no-fail-fast     # Run all tests (do not stop after first failure)
 cargo nextest run              # Faster test runs (if installed)
 cargo test <test_name>         # Run a single test
 cargo clippy                   # Lint
