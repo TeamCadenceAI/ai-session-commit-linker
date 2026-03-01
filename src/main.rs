@@ -1,5 +1,6 @@
 mod agents;
 mod api_client;
+mod backfill_log;
 mod config;
 mod git;
 mod keychain;
@@ -1976,6 +1977,7 @@ fn process_repo_backfill(
     sync_remote_before_attach: bool,
     encryption_method: EncryptionMethod,
     repo_progress: Option<ProgressBar>,
+    backfill_logger: backfill_log::BackfillLogger,
 ) -> RepoBackfillStats {
     let mut stats = RepoBackfillStats::default();
     let planned_units: u64 = sessions
@@ -1997,16 +1999,44 @@ fn process_repo_backfill(
     let repo_root = match sessions.first() {
         Some(session) => session.repo_root.clone(),
         None => {
+            backfill_logger.event(
+                "repo_skipped",
+                serde_json::json!({
+                    "repo_display": repo_display.as_str(),
+                    "reason": "no_sessions",
+                }),
+            );
             if let Some(pb) = &repo_progress {
                 pb.finish_with_message("no sessions");
             }
             return stats;
         }
     };
+    let repo_root_str = repo_root.to_string_lossy().to_string();
+
+    backfill_logger.event(
+        "repo_started",
+        serde_json::json!({
+            "repo_display": repo_display.as_str(),
+            "repo_root": repo_root_str.as_str(),
+            "sessions": sessions.len(),
+            "planned_units": planned_units,
+            "sync_remote_before_attach": sync_remote_before_attach,
+            "do_push": do_push,
+        }),
+    );
 
     match git::repo_matches_org_filter(&repo_root) {
         Ok(true) => {}
         Ok(false) => {
+            backfill_logger.event(
+                "repo_skipped",
+                serde_json::json!({
+                    "repo_display": repo_display.as_str(),
+                    "repo_root": repo_root_str.as_str(),
+                    "reason": "org_filter",
+                }),
+            );
             if let Some(pb) = &repo_progress {
                 pb.finish_with_message("skipped (org filter)");
             }
@@ -2015,6 +2045,15 @@ fn process_repo_backfill(
         Err(e) => {
             output::detail(&format!("{}: org filter check failed: {}", repo_display, e));
             stats.errors += 1;
+            backfill_logger.event(
+                "repo_error",
+                serde_json::json!({
+                    "repo_display": repo_display.as_str(),
+                    "repo_root": repo_root_str.as_str(),
+                    "stage": "org_filter_check",
+                    "error": e.to_string(),
+                }),
+            );
             if let Some(pb) = &repo_progress {
                 pb.finish_with_message("error (org filter)");
             }
@@ -2024,6 +2063,14 @@ fn process_repo_backfill(
 
     let repo_enabled = git::check_enabled_at(&repo_root);
     if !repo_enabled {
+        backfill_logger.event(
+            "repo_skipped",
+            serde_json::json!({
+                "repo_display": repo_display.as_str(),
+                "repo_root": repo_root_str.as_str(),
+                "reason": "disabled",
+            }),
+        );
         if let Some(pb) = &repo_progress {
             pb.finish_with_message("skipped (disabled)");
         }
@@ -2031,29 +2078,125 @@ fn process_repo_backfill(
     }
 
     let repo_remote = if sync_remote_before_attach {
-        if let Ok(Some(remote)) = git::resolve_push_remote_at(&repo_root) {
-            let _ = push::fetch_merge_notes_for_remote_at(&repo_root, &remote);
-            Some(remote)
-        } else {
-            None
+        match git::resolve_push_remote_at(&repo_root) {
+            Ok(Some(remote)) => {
+                backfill_logger.event(
+                    "repo_remote_sync_started",
+                    serde_json::json!({
+                        "repo_display": repo_display.as_str(),
+                        "repo_root": repo_root_str.as_str(),
+                        "remote": remote.as_str(),
+                    }),
+                );
+                match push::fetch_merge_notes_for_remote_at(&repo_root, &remote) {
+                    Ok(()) => {
+                        backfill_logger.event(
+                            "repo_remote_sync_completed",
+                            serde_json::json!({
+                                "repo_display": repo_display.as_str(),
+                                "repo_root": repo_root_str.as_str(),
+                                "remote": remote.as_str(),
+                            }),
+                        );
+                    }
+                    Err(e) => {
+                        backfill_logger.event(
+                            "repo_remote_sync_error",
+                            serde_json::json!({
+                                "repo_display": repo_display.as_str(),
+                                "repo_root": repo_root_str.as_str(),
+                                "remote": remote.as_str(),
+                                "error": e.to_string(),
+                            }),
+                        );
+                    }
+                }
+                Some(remote)
+            }
+            Ok(None) => {
+                backfill_logger.event(
+                    "repo_remote_sync_skipped",
+                    serde_json::json!({
+                        "repo_display": repo_display.as_str(),
+                        "repo_root": repo_root_str.as_str(),
+                        "reason": "no_push_remote",
+                    }),
+                );
+                None
+            }
+            Err(e) => {
+                backfill_logger.event(
+                    "repo_remote_sync_skipped",
+                    serde_json::json!({
+                        "repo_display": repo_display.as_str(),
+                        "repo_root": repo_root_str.as_str(),
+                        "reason": "resolve_push_remote_failed",
+                        "error": e.to_string(),
+                    }),
+                );
+                None
+            }
         }
     } else {
         None
     };
 
-    let mut noted_commits: std::collections::HashSet<String> = git::list_notes_at(Some(&repo_root))
-        .map(|rows| rows.into_iter().map(|(_, commit)| commit).collect())
-        .unwrap_or_default();
+    let mut noted_commits: std::collections::HashSet<String> =
+        match git::list_notes_at(Some(&repo_root)) {
+            Ok(rows) => rows.into_iter().map(|(_, commit)| commit).collect(),
+            Err(e) => {
+                backfill_logger.event(
+                    "repo_error",
+                    serde_json::json!({
+                        "repo_display": repo_display.as_str(),
+                        "repo_root": repo_root_str.as_str(),
+                        "stage": "list_existing_notes",
+                        "error": e.to_string(),
+                    }),
+                );
+                std::collections::HashSet::new()
+            }
+        };
 
     for session in sessions {
         let commit_hashes = session.commit_hashes.clone();
         stats.commits_found += commit_hashes.len();
+        let session_file = session.file.to_string_lossy().to_string();
+        let agent_type = session
+            .metadata
+            .agent_type
+            .clone()
+            .unwrap_or(scanner::AgentType::Claude);
+        let agent_label = agent_type.to_string();
+
+        backfill_logger.event(
+            "repo_session_started",
+            serde_json::json!({
+                "repo_display": repo_display.as_str(),
+                "repo_root": repo_root_str.as_str(),
+                "session_id": session.session_id.as_str(),
+                "file": session_file,
+                "agent": agent_label,
+                "commit_hashes": commit_hashes.len(),
+            }),
+        );
 
         if commit_hashes.is_empty() {
             let commits = match commits_for_backfill_session(&session.repo_root, &session.file) {
                 Ok(found) => found,
-                Err(_) => {
+                Err(e) => {
                     stats.errors += 1;
+                    backfill_logger.event(
+                        "session_error",
+                        serde_json::json!({
+                            "repo_display": repo_display.as_str(),
+                            "repo_root": repo_root_str.as_str(),
+                            "session_id": session.session_id.as_str(),
+                            "file": session.file.to_string_lossy(),
+                            "stage": "discover_commits_from_session_window",
+                            "error": e.to_string(),
+                        }),
+                    );
                     if let Some(pb) = &repo_progress {
                         pb.inc(1);
                         pb.set_message(format!(
@@ -2065,7 +2208,27 @@ fn process_repo_backfill(
                 }
             };
             stats.commits_found += commits.len();
+            backfill_logger.event(
+                "session_window_commit_candidates",
+                serde_json::json!({
+                    "repo_display": repo_display.as_str(),
+                    "repo_root": repo_root_str.as_str(),
+                    "session_id": session.session_id.as_str(),
+                    "file": session.file.to_string_lossy(),
+                    "candidate_commits": commits.len(),
+                }),
+            );
             if commits.is_empty() {
+                backfill_logger.event(
+                    "session_skipped",
+                    serde_json::json!({
+                        "repo_display": repo_display.as_str(),
+                        "repo_root": repo_root_str.as_str(),
+                        "session_id": session.session_id.as_str(),
+                        "file": session.file.to_string_lossy(),
+                        "reason": "no_candidate_commits",
+                    }),
+                );
                 if let Some(pb) = &repo_progress {
                     pb.inc(1);
                     pb.set_message(format!(
@@ -2084,6 +2247,17 @@ fn process_repo_backfill(
             ) {
                 Some(best) => best,
                 None => {
+                    backfill_logger.event(
+                        "session_skipped",
+                        serde_json::json!({
+                            "repo_display": repo_display.as_str(),
+                            "repo_root": repo_root_str.as_str(),
+                            "session_id": session.session_id.as_str(),
+                            "file": session.file.to_string_lossy(),
+                            "reason": "no_ranked_commit_selected",
+                            "candidate_commits": commits.len(),
+                        }),
+                    );
                     if let Some(pb) = &repo_progress {
                         pb.inc(1);
                         pb.set_message(format!(
@@ -2097,6 +2271,17 @@ fn process_repo_backfill(
 
             if noted_commits.contains(&hash) {
                 stats.skipped += 1;
+                backfill_logger.event(
+                    "commit_skipped",
+                    serde_json::json!({
+                        "repo_display": repo_display.as_str(),
+                        "repo_root": repo_root_str.as_str(),
+                        "session_id": session.session_id.as_str(),
+                        "file": session.file.to_string_lossy(),
+                        "commit": hash.as_str(),
+                        "reason": "note_already_exists",
+                    }),
+                );
                 if let Some(pb) = &repo_progress {
                     pb.inc(1);
                     pb.set_message(format!(
@@ -2109,8 +2294,19 @@ fn process_repo_backfill(
 
             let session_log = match std::fs::read_to_string(&session.file) {
                 Ok(content) => content,
-                Err(_) => {
+                Err(e) => {
                     stats.errors += 1;
+                    backfill_logger.event(
+                        "session_error",
+                        serde_json::json!({
+                            "repo_display": repo_display.as_str(),
+                            "repo_root": repo_root_str.as_str(),
+                            "session_id": session.session_id.as_str(),
+                            "file": session.file.to_string_lossy(),
+                            "stage": "read_session_log",
+                            "error": e.to_string(),
+                        }),
+                    );
                     if let Some(pb) = &repo_progress {
                         pb.inc(1);
                         pb.set_message(format!(
@@ -2121,11 +2317,6 @@ fn process_repo_backfill(
                     continue;
                 }
             };
-            let agent_type = session
-                .metadata
-                .agent_type
-                .clone()
-                .unwrap_or(scanner::AgentType::Claude);
             let repo_str = session.repo_root.to_string_lossy().to_string();
             let session_start = scanner::session_time_range(&session.file).map(|(start, _)| start);
 
@@ -2145,13 +2336,42 @@ fn process_repo_backfill(
                 Some(&session.repo_root),
             ) {
                 Ok(()) => {
-                    noted_commits.insert(hash);
+                    backfill_logger.event(
+                        "commit_attached",
+                        serde_json::json!({
+                            "repo_display": repo_display.as_str(),
+                            "repo_root": repo_root_str.as_str(),
+                            "session_id": session.session_id.as_str(),
+                            "file": session.file.to_string_lossy(),
+                            "commit": hash.as_str(),
+                            "confidence": selected.confidence.to_string(),
+                            "score": selected.candidate.score,
+                            "reason_codes": selected.reason_codes,
+                            "fallback": selected.confidence == note::Confidence::TimeWindowMatch,
+                        }),
+                    );
+                    noted_commits.insert(hash.clone());
                     stats.attached += 1;
                     if selected.confidence == note::Confidence::TimeWindowMatch {
                         stats.fallback_attached += 1;
                     }
                 }
-                Err(_) => stats.errors += 1,
+                Err(e) => {
+                    stats.errors += 1;
+                    backfill_logger.event(
+                        "commit_attach_error",
+                        serde_json::json!({
+                            "repo_display": repo_display.as_str(),
+                            "repo_root": repo_root_str.as_str(),
+                            "session_id": session.session_id.as_str(),
+                            "file": session.file.to_string_lossy(),
+                            "commit": hash.as_str(),
+                            "confidence": selected.confidence.to_string(),
+                            "reason_codes": selected.reason_codes,
+                            "error": e.to_string(),
+                        }),
+                    );
+                }
             }
             if let Some(pb) = &repo_progress {
                 pb.inc(1);
@@ -2163,11 +2383,6 @@ fn process_repo_backfill(
             continue;
         }
 
-        let agent_type = session
-            .metadata
-            .agent_type
-            .clone()
-            .unwrap_or(scanner::AgentType::Claude);
         let repo_str = session.repo_root.to_string_lossy().to_string();
         let session_start = scanner::session_time_range(&session.file).map(|(start, _)| start);
         let mut payload_info: Option<PayloadInfo> = None;
@@ -2177,13 +2392,36 @@ fn process_repo_backfill(
             match git::commit_exists_at(&session.repo_root, hash) {
                 Ok(true) => {}
                 Ok(false) => {
+                    backfill_logger.event(
+                        "commit_skipped",
+                        serde_json::json!({
+                            "repo_display": repo_display.as_str(),
+                            "repo_root": repo_root_str.as_str(),
+                            "session_id": session.session_id.as_str(),
+                            "file": session.file.to_string_lossy(),
+                            "commit": hash.as_str(),
+                            "reason": "commit_missing_in_repo",
+                        }),
+                    );
                     if let Some(pb) = &repo_progress {
                         pb.inc(1);
                     }
                     continue;
                 }
-                Err(_) => {
+                Err(e) => {
                     stats.errors += 1;
+                    backfill_logger.event(
+                        "commit_error",
+                        serde_json::json!({
+                            "repo_display": repo_display.as_str(),
+                            "repo_root": repo_root_str.as_str(),
+                            "session_id": session.session_id.as_str(),
+                            "file": session.file.to_string_lossy(),
+                            "commit": hash.as_str(),
+                            "stage": "commit_exists_check",
+                            "error": e.to_string(),
+                        }),
+                    );
                     if let Some(pb) = &repo_progress {
                         pb.inc(1);
                     }
@@ -2192,6 +2430,17 @@ fn process_repo_backfill(
             }
             if noted_commits.contains(hash) {
                 stats.skipped += 1;
+                backfill_logger.event(
+                    "commit_skipped",
+                    serde_json::json!({
+                        "repo_display": repo_display.as_str(),
+                        "repo_root": repo_root_str.as_str(),
+                        "session_id": session.session_id.as_str(),
+                        "file": session.file.to_string_lossy(),
+                        "commit": hash.as_str(),
+                        "reason": "note_already_exists",
+                    }),
+                );
                 if let Some(pb) = &repo_progress {
                     pb.inc(1);
                     pb.set_message(format!(
@@ -2205,8 +2454,19 @@ fn process_repo_backfill(
             if payload_info.is_none() {
                 let session_log = match std::fs::read_to_string(&session.file) {
                     Ok(content) => content,
-                    Err(_) => {
+                    Err(e) => {
                         stats.errors += 1;
+                        backfill_logger.event(
+                            "session_error",
+                            serde_json::json!({
+                                "repo_display": repo_display.as_str(),
+                                "repo_root": repo_root_str.as_str(),
+                                "session_id": session.session_id.as_str(),
+                                "file": session.file.to_string_lossy(),
+                                "stage": "read_session_log",
+                                "error": e.to_string(),
+                            }),
+                        );
                         break;
                     }
                 };
@@ -2221,6 +2481,20 @@ fn process_repo_backfill(
                             payload_sha256: sha256,
                             encoding,
                         });
+                        if let Some(info) = payload_info.as_ref() {
+                            backfill_logger.event(
+                                "payload_prepared",
+                                serde_json::json!({
+                                    "repo_display": repo_display.as_str(),
+                                    "repo_root": repo_root_str.as_str(),
+                                    "session_id": session.session_id.as_str(),
+                                    "file": session.file.to_string_lossy(),
+                                    "payload_blob": info.blob_sha,
+                                    "payload_sha256": info.payload_sha256,
+                                    "payload_encoding": info.encoding.to_string(),
+                                }),
+                            );
+                        }
                         if let Some(info) = payload_info.as_ref()
                             && let Err(e) = git::ensure_payload_blob_referenced_at(
                                 &session.repo_root,
@@ -2228,12 +2502,45 @@ fn process_repo_backfill(
                             )
                         {
                             output::detail(&format!("could not anchor payload ref: {}", e));
+                            backfill_logger.event(
+                                "payload_anchor_error",
+                                serde_json::json!({
+                                    "repo_display": repo_display.as_str(),
+                                    "repo_root": repo_root_str.as_str(),
+                                    "session_id": session.session_id.as_str(),
+                                    "file": session.file.to_string_lossy(),
+                                    "payload_blob": info.blob_sha,
+                                    "error": e.to_string(),
+                                }),
+                            );
                         } else {
                             payload_anchored = true;
+                            if let Some(info) = payload_info.as_ref() {
+                                backfill_logger.event(
+                                    "payload_anchored",
+                                    serde_json::json!({
+                                        "repo_display": repo_display.as_str(),
+                                        "repo_root": repo_root_str.as_str(),
+                                        "session_id": session.session_id.as_str(),
+                                        "file": session.file.to_string_lossy(),
+                                        "payload_blob": info.blob_sha,
+                                    }),
+                                );
+                            }
                         }
                     }
-                    Err(_) => {
+                    Err(e) => {
                         stats.errors += 1;
+                        backfill_logger.event(
+                            "payload_prepare_error",
+                            serde_json::json!({
+                                "repo_display": repo_display.as_str(),
+                                "repo_root": repo_root_str.as_str(),
+                                "session_id": session.session_id.as_str(),
+                                "file": session.file.to_string_lossy(),
+                                "error": e.to_string(),
+                            }),
+                        );
                         if let Some(pb) = &repo_progress {
                             pb.inc(1);
                         }
@@ -2259,10 +2566,39 @@ fn process_repo_backfill(
                 Some(&session.repo_root),
             ) {
                 Ok(()) => {
+                    backfill_logger.event(
+                        "commit_attached",
+                        serde_json::json!({
+                            "repo_display": repo_display.as_str(),
+                            "repo_root": repo_root_str.as_str(),
+                            "session_id": session.session_id.as_str(),
+                            "file": session.file.to_string_lossy(),
+                            "commit": hash.as_str(),
+                            "confidence": note::Confidence::ExactHashMatch.to_string(),
+                            "payload_blob": info.blob_sha,
+                            "payload_encoding": info.encoding.to_string(),
+                            "payload_anchored": payload_anchored,
+                        }),
+                    );
                     noted_commits.insert(hash.clone());
                     stats.attached += 1;
                 }
-                Err(_) => stats.errors += 1,
+                Err(e) => {
+                    stats.errors += 1;
+                    backfill_logger.event(
+                        "commit_attach_error",
+                        serde_json::json!({
+                            "repo_display": repo_display.as_str(),
+                            "repo_root": repo_root_str.as_str(),
+                            "session_id": session.session_id.as_str(),
+                            "file": session.file.to_string_lossy(),
+                            "commit": hash.as_str(),
+                            "confidence": note::Confidence::ExactHashMatch.to_string(),
+                            "payload_blob": info.blob_sha,
+                            "error": e.to_string(),
+                        }),
+                    );
+                }
             }
             if let Some(pb) = &repo_progress {
                 pb.inc(1);
@@ -2275,7 +2611,23 @@ fn process_repo_backfill(
     }
 
     if do_push && let Some(ref remote) = repo_remote {
+        backfill_logger.event(
+            "repo_push_started",
+            serde_json::json!({
+                "repo_display": repo_display.as_str(),
+                "repo_root": repo_root_str.as_str(),
+                "remote": remote.as_str(),
+            }),
+        );
         push::attempt_push_remote_at_quiet(&repo_root, remote);
+        backfill_logger.event(
+            "repo_push_completed",
+            serde_json::json!({
+                "repo_display": repo_display.as_str(),
+                "repo_root": repo_root_str.as_str(),
+                "remote": remote.as_str(),
+            }),
+        );
     }
 
     if let Some(pb) = &repo_progress {
@@ -2284,6 +2636,19 @@ fn process_repo_backfill(
             stats.commits_found, stats.attached, stats.skipped, stats.errors
         ));
     }
+
+    backfill_logger.event(
+        "repo_completed",
+        serde_json::json!({
+            "repo_display": repo_display.as_str(),
+            "repo_root": repo_root_str.as_str(),
+            "commits_found": stats.commits_found,
+            "attached": stats.attached,
+            "fallback_attached": stats.fallback_attached,
+            "skipped": stats.skipped,
+            "errors": stats.errors,
+        }),
+    );
 
     stats
 }
@@ -2300,6 +2665,19 @@ async fn run_backfill_inner(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
+
+    let backfill_logger = match backfill_log::BackfillLogger::new() {
+        Ok(logger) => {
+            if let Some(path) = logger.path() {
+                output::detail(&format!("Backfill diagnostics: {}", path.display()));
+            }
+            logger
+        }
+        Err(e) => {
+            output::detail(&format!("Backfill diagnostics unavailable: {e}"));
+            backfill_log::BackfillLogger::disabled()
+        }
+    };
 
     // Resolve encryption method once for this backfill run
     let encryption_method = match resolve_encryption_method() {
@@ -2322,24 +2700,63 @@ async fn run_backfill_inner(
         None
     };
 
+    backfill_logger.event(
+        "backfill_started",
+        serde_json::json!({
+            "cli_version": env!("CARGO_PKG_VERSION"),
+            "since": since,
+            "since_secs": since_secs,
+            "since_days": since_days,
+            "do_push": do_push,
+            "sync_remote_before_attach": should_sync_remote_before_attach(do_push),
+            "repo_filter": repo_filter.map(|p| p.to_string_lossy().to_string()),
+            "use_progress": use_progress,
+        }),
+    );
+
     // Step 2: Find all session files modified within the --since window
-    let files = tokio::task::spawn_blocking(move || agents::all_recent_files(now, since_secs))
+    backfill_logger.event(
+        "scan_recent_files_started",
+        serde_json::json!({
+            "now_epoch": now,
+            "since_secs": since_secs,
+        }),
+    );
+    let files = match tokio::task::spawn_blocking(move || agents::all_recent_files(now, since_secs))
         .await
-        .context("failed to scan recent files")?;
+    {
+        Ok(files) => files,
+        Err(e) => {
+            backfill_logger.event(
+                "scan_recent_files_error",
+                serde_json::json!({
+                    "error": e.to_string(),
+                }),
+            );
+            return Err(e).context("failed to scan recent files");
+        }
+    };
     if let Some(pb) = spinner {
         pb.finish_and_clear();
     }
     output::action("Scanned", &format!("agent logs (last {} days)", since_days));
     output::detail(&format!("Found {} session logs", files.len()));
+    let mut agent_counts: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for file in &files {
+        let agent = scanner::agent_type_from_path(file).to_string();
+        *agent_counts.entry(agent).or_insert(0) += 1;
+    }
+    backfill_logger.event(
+        "scan_recent_files_completed",
+        serde_json::json!({
+            "files_found": files.len(),
+            "agent_counts": agent_counts,
+        }),
+    );
     if !files.is_empty() {
-        let mut counts: std::collections::BTreeMap<String, usize> =
-            std::collections::BTreeMap::new();
-        for file in &files {
-            let agent = scanner::agent_type_from_path(file).to_string();
-            *counts.entry(agent).or_insert(0) += 1;
-        }
-        let summary = counts
-            .into_iter()
+        let summary = agent_counts
+            .iter()
             .map(|(agent, count)| format!("{agent}={count}"))
             .collect::<Vec<_>>()
             .join(", ");
@@ -2377,17 +2794,41 @@ async fn run_backfill_inner(
     };
 
     for file in &files {
+        let file_path = file.to_string_lossy().to_string();
         let metadata = scanner::parse_session_metadata(file);
 
         // Skip files with no session metadata (e.g., file-history-snapshot files)
         if metadata.session_id.is_none() && metadata.cwd.is_none() {
+            backfill_logger.event(
+                "session_discovery_skipped",
+                serde_json::json!({
+                    "file": file_path.as_str(),
+                    "reason": "missing_session_metadata",
+                }),
+            );
+            if let Some(ref pb) = progress {
+                pb.inc(1);
+            }
             continue;
         }
 
         // Skip sessions with no cwd silently — we can't determine the repo
         let cwd = match &metadata.cwd {
             Some(c) => c.clone(),
-            None => continue,
+            None => {
+                backfill_logger.event(
+                    "session_discovery_skipped",
+                    serde_json::json!({
+                        "file": file_path.as_str(),
+                        "session_id": metadata.session_id,
+                        "reason": "missing_cwd",
+                    }),
+                );
+                if let Some(ref pb) = progress {
+                    pb.inc(1);
+                }
+                continue;
+            }
         };
 
         let repo_root = if let Some(cached) = repo_root_cache.get(&cwd) {
@@ -2396,7 +2837,22 @@ async fn run_backfill_inner(
             let cwd_path = std::path::Path::new(&cwd);
             let resolved = match git::repo_root_at(cwd_path) {
                 Ok(r) => r,
-                Err(_) => continue,
+                Err(e) => {
+                    backfill_logger.event(
+                        "session_discovery_skipped",
+                        serde_json::json!({
+                            "file": file_path.as_str(),
+                            "session_id": metadata.session_id,
+                            "cwd": cwd,
+                            "reason": "repo_root_lookup_failed",
+                            "error": e.to_string(),
+                        }),
+                    );
+                    if let Some(ref pb) = progress {
+                        pb.inc(1);
+                    }
+                    continue;
+                }
             };
             repo_root_cache.insert(cwd.clone(), resolved.clone());
             resolved
@@ -2406,6 +2862,20 @@ async fn run_backfill_inner(
         if let Some(filter) = repo_filter
             && repo_root != filter
         {
+            backfill_logger.event(
+                "session_discovery_skipped",
+                serde_json::json!({
+                    "file": file_path.as_str(),
+                    "session_id": metadata.session_id,
+                    "cwd": cwd,
+                    "repo_root": repo_root.to_string_lossy(),
+                    "reason": "repo_filter_mismatch",
+                    "repo_filter": filter.to_string_lossy(),
+                }),
+            );
+            if let Some(ref pb) = progress {
+                pb.inc(1);
+            }
             continue;
         }
 
@@ -2421,6 +2891,21 @@ async fn run_backfill_inner(
         } else {
             let resolved = match git::first_remote_url_at(&repo_root) {
                 Ok(Some(url)) => url,
+                Err(e) => {
+                    backfill_logger.event(
+                        "repo_display_fallback",
+                        serde_json::json!({
+                            "file": file_path.as_str(),
+                            "session_id": session_id.as_str(),
+                            "repo_root": repo_root.to_string_lossy(),
+                            "error": e.to_string(),
+                        }),
+                    );
+                    repo_root
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "unknown".to_string())
+                }
                 _ => repo_root
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
@@ -2430,6 +2915,25 @@ async fn run_backfill_inner(
             resolved
         };
 
+        let commit_hashes = scanner::extract_commit_hashes(file);
+        let agent_label = metadata
+            .agent_type
+            .clone()
+            .unwrap_or(scanner::AgentType::Claude)
+            .to_string();
+        backfill_logger.event(
+            "session_enqueued",
+            serde_json::json!({
+                "file": file_path.as_str(),
+                "session_id": session_id.as_str(),
+                "cwd": cwd,
+                "repo_root": repo_root.to_string_lossy(),
+                "repo_display": repo_display.as_str(),
+                "agent": agent_label,
+                "commit_hashes": commit_hashes.len(),
+            }),
+        );
+
         sessions_by_repo
             .entry(repo_display.clone())
             .or_default()
@@ -2438,7 +2942,7 @@ async fn run_backfill_inner(
                 session_id,
                 repo_root,
                 metadata,
-                commit_hashes: scanner::extract_commit_hashes(file),
+                commit_hashes,
             });
 
         if let Some(ref pb) = progress {
@@ -2456,6 +2960,13 @@ async fn run_backfill_inner(
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
     let mut join_set = tokio::task::JoinSet::new();
     let multi = use_progress.then(MultiProgress::new);
+    backfill_logger.event(
+        "repo_workers_started",
+        serde_json::json!({
+            "total_repos": total_repos,
+            "concurrency": concurrency,
+        }),
+    );
     if let Some(mp) = &multi {
         mp.set_draw_target(ProgressDrawTarget::stderr());
         mp.set_move_cursor(true);
@@ -2464,6 +2975,13 @@ async fn run_backfill_inner(
     for (repo_display, sessions) in sessions_by_repo {
         let permit = semaphore.clone().acquire_owned().await?;
         let method = encryption_method.clone();
+        backfill_logger.event(
+            "repo_worker_queued",
+            serde_json::json!({
+                "repo_display": repo_display.as_str(),
+                "sessions": sessions.len(),
+            }),
+        );
         let per_repo_bar = if let Some(mp) = &multi {
             let total_units: u64 = sessions
                 .iter()
@@ -2495,6 +3013,7 @@ async fn run_backfill_inner(
         } else {
             None
         };
+        let backfill_logger = backfill_logger.clone();
         join_set.spawn(async move {
             let _permit = permit;
             tokio::task::spawn_blocking(move || {
@@ -2505,6 +3024,7 @@ async fn run_backfill_inner(
                     sync_remote_before_attach,
                     method,
                     per_repo_bar,
+                    backfill_logger,
                 )
             })
             .await
@@ -2518,14 +3038,36 @@ async fn run_backfill_inner(
                 skipped += repo_stats.skipped;
                 errors += repo_stats.errors;
                 fallback_attached += repo_stats.fallback_attached;
+                backfill_logger.event(
+                    "repo_worker_result",
+                    serde_json::json!({
+                        "attached": repo_stats.attached,
+                        "fallback_attached": repo_stats.fallback_attached,
+                        "skipped": repo_stats.skipped,
+                        "errors": repo_stats.errors,
+                        "commits_found": repo_stats.commits_found,
+                    }),
+                );
             }
             Ok(Err(e)) => {
                 errors += 1;
                 output::detail(&format!("repo worker failed: {}", e));
+                backfill_logger.event(
+                    "repo_worker_error",
+                    serde_json::json!({
+                        "error": e.to_string(),
+                    }),
+                );
             }
             Err(e) => {
                 errors += 1;
                 output::detail(&format!("repo task join failed: {}", e));
+                backfill_logger.event(
+                    "repo_worker_join_error",
+                    serde_json::json!({
+                        "error": e.to_string(),
+                    }),
+                );
             }
         }
     }
@@ -2551,6 +3093,18 @@ async fn run_backfill_inner(
             issues,
             repos_scanned: total_repos as i32,
         },
+    );
+    backfill_logger.event(
+        "backfill_completed",
+        serde_json::json!({
+            "attached": attached,
+            "fallback_attached": fallback_attached,
+            "skipped": skipped,
+            "errors": errors,
+            "repos_scanned": total_repos,
+            "since_days": since_days,
+            "do_push": do_push,
+        }),
     );
     Ok(())
 }
