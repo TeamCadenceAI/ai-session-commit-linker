@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.2](https://github.com/TeamCadenceAI/cadence-cli/compare/v0.8.1...v0.8.2) (2026-03-01)
+
+
+### Bug Fixes
+
+* **backfill:** treat existing notes as skipped during backfill ([f30f2a5](https://github.com/TeamCadenceAI/cadence-cli/commit/f30f2a5dc9e1ce0ebdb998a081b5e685ec033a36))
+
 ## [0.8.1](https://github.com/TeamCadenceAI/cadence-cli/compare/v0.8.0...v0.8.1) (2026-03-01)
 
 
