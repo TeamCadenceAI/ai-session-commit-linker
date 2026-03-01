@@ -1970,6 +1970,11 @@ fn backfill_repo_concurrency() -> usize {
         .unwrap_or(adaptive)
 }
 
+fn is_note_already_exists_error(err: &anyhow::Error) -> bool {
+    err.to_string()
+        .contains("Cannot add notes. Found existing notes for object")
+}
+
 fn process_repo_backfill(
     repo_display: String,
     sessions: Vec<SessionInfo>,
@@ -2269,8 +2274,11 @@ fn process_repo_backfill(
                 }
             };
 
-            if noted_commits.contains(&hash) {
+            if noted_commits.contains(&hash)
+                || git::note_exists_at(&session.repo_root, &hash).unwrap_or(false)
+            {
                 stats.skipped += 1;
+                noted_commits.insert(hash.clone());
                 backfill_logger.event(
                     "commit_skipped",
                     serde_json::json!({
@@ -2356,6 +2364,21 @@ fn process_repo_backfill(
                         stats.fallback_attached += 1;
                     }
                 }
+                Err(e) if is_note_already_exists_error(&e) => {
+                    stats.skipped += 1;
+                    noted_commits.insert(hash.clone());
+                    backfill_logger.event(
+                        "commit_skipped",
+                        serde_json::json!({
+                            "repo_display": repo_display.as_str(),
+                            "repo_root": repo_root_str.as_str(),
+                            "session_id": session.session_id.as_str(),
+                            "file": session.file.to_string_lossy(),
+                            "commit": hash.as_str(),
+                            "reason": "note_already_exists",
+                        }),
+                    );
+                }
                 Err(e) => {
                     stats.errors += 1;
                     backfill_logger.event(
@@ -2389,7 +2412,30 @@ fn process_repo_backfill(
         let mut payload_anchored = false;
 
         for hash in &commit_hashes {
-            match git::commit_exists_at(&session.repo_root, hash) {
+            let commit = match git::rev_parse_at(Some(&session.repo_root), hash) {
+                Ok(full) => full,
+                Err(e) => {
+                    stats.errors += 1;
+                    backfill_logger.event(
+                        "commit_error",
+                        serde_json::json!({
+                            "repo_display": repo_display.as_str(),
+                            "repo_root": repo_root_str.as_str(),
+                            "session_id": session.session_id.as_str(),
+                            "file": session.file.to_string_lossy(),
+                            "commit": hash.as_str(),
+                            "stage": "commit_rev_parse",
+                            "error": e.to_string(),
+                        }),
+                    );
+                    if let Some(pb) = &repo_progress {
+                        pb.inc(1);
+                    }
+                    continue;
+                }
+            };
+
+            match git::commit_exists_at(&session.repo_root, &commit) {
                 Ok(true) => {}
                 Ok(false) => {
                     backfill_logger.event(
@@ -2399,7 +2445,7 @@ fn process_repo_backfill(
                             "repo_root": repo_root_str.as_str(),
                             "session_id": session.session_id.as_str(),
                             "file": session.file.to_string_lossy(),
-                            "commit": hash.as_str(),
+                            "commit": commit.as_str(),
                             "reason": "commit_missing_in_repo",
                         }),
                     );
@@ -2417,7 +2463,7 @@ fn process_repo_backfill(
                             "repo_root": repo_root_str.as_str(),
                             "session_id": session.session_id.as_str(),
                             "file": session.file.to_string_lossy(),
-                            "commit": hash.as_str(),
+                            "commit": commit.as_str(),
                             "stage": "commit_exists_check",
                             "error": e.to_string(),
                         }),
@@ -2428,8 +2474,11 @@ fn process_repo_backfill(
                     continue;
                 }
             }
-            if noted_commits.contains(hash) {
+            if noted_commits.contains(&commit)
+                || git::note_exists_at(&session.repo_root, &commit).unwrap_or(false)
+            {
                 stats.skipped += 1;
+                noted_commits.insert(commit.clone());
                 backfill_logger.event(
                     "commit_skipped",
                     serde_json::json!({
@@ -2437,7 +2486,7 @@ fn process_repo_backfill(
                         "repo_root": repo_root_str.as_str(),
                         "session_id": session.session_id.as_str(),
                         "file": session.file.to_string_lossy(),
-                        "commit": hash.as_str(),
+                        "commit": commit.as_str(),
                         "reason": "note_already_exists",
                     }),
                 );
@@ -2554,7 +2603,7 @@ fn process_repo_backfill(
                 &agent_type,
                 &session.session_id,
                 &repo_str,
-                hash,
+                &commit,
                 "",
                 note::Confidence::ExactHashMatch,
                 &encryption_method,
@@ -2573,15 +2622,30 @@ fn process_repo_backfill(
                             "repo_root": repo_root_str.as_str(),
                             "session_id": session.session_id.as_str(),
                             "file": session.file.to_string_lossy(),
-                            "commit": hash.as_str(),
+                            "commit": commit.as_str(),
                             "confidence": note::Confidence::ExactHashMatch.to_string(),
                             "payload_blob": info.blob_sha,
                             "payload_encoding": info.encoding.to_string(),
                             "payload_anchored": payload_anchored,
                         }),
                     );
-                    noted_commits.insert(hash.clone());
+                    noted_commits.insert(commit.clone());
                     stats.attached += 1;
+                }
+                Err(e) if is_note_already_exists_error(&e) => {
+                    stats.skipped += 1;
+                    noted_commits.insert(commit.clone());
+                    backfill_logger.event(
+                        "commit_skipped",
+                        serde_json::json!({
+                            "repo_display": repo_display.as_str(),
+                            "repo_root": repo_root_str.as_str(),
+                            "session_id": session.session_id.as_str(),
+                            "file": session.file.to_string_lossy(),
+                            "commit": commit.as_str(),
+                            "reason": "note_already_exists",
+                        }),
+                    );
                 }
                 Err(e) => {
                     stats.errors += 1;
@@ -2592,7 +2656,7 @@ fn process_repo_backfill(
                             "repo_root": repo_root_str.as_str(),
                             "session_id": session.session_id.as_str(),
                             "file": session.file.to_string_lossy(),
-                            "commit": hash.as_str(),
+                            "commit": commit.as_str(),
                             "confidence": note::Confidence::ExactHashMatch.to_string(),
                             "payload_blob": info.blob_sha,
                             "error": e.to_string(),
@@ -4321,6 +4385,17 @@ mod tests {
     fn backfill_remote_sync_depends_on_push_flag() {
         assert!(should_sync_remote_before_attach(true));
         assert!(!should_sync_remote_before_attach(false));
+    }
+
+    #[test]
+    fn note_already_exists_error_is_not_treated_as_issue() {
+        let err = anyhow::anyhow!(
+            "git notes add failed: error: Cannot add notes. Found existing notes for object abcdef"
+        );
+        assert!(is_note_already_exists_error(&err));
+
+        let other = anyhow::anyhow!("git notes add failed: some other git error");
+        assert!(!is_note_already_exists_error(&other));
     }
 
     // -----------------------------------------------------------------------
