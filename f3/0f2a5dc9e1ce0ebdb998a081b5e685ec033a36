@@ -12,3 +12,18 @@ payload_encoding: zstd+pgp
 match_score: 1.800
 match_reasons: time_distance
 ---
+
+---
+cadence_version: 2
+agent: codex
+session_id: 019ca750-1d02-7083-bf63-8766e626459b
+repo: /Users/daveslutzkin/dev/cadence-cli
+commit: c062aac17cf6ef1e38da6c2ed58fb929e4a8e3f6
+confidence: time_window_match
+session_start: 2026-03-01T02:52:51Z
+payload_blob: 711ff3526fbc786b53fabc7599321151335b3131
+payload_sha256: 761cec82f5373c1ca23fe41797f2df7b3ae2d03acb3da12669b393b8fbf3f872
+payload_encoding: zstd+pgp
+match_score: 1.800
+match_reasons: time_distance
+---
