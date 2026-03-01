@@ -1,0 +1,14 @@
+---
+cadence_version: 2
+agent: codex
+session_id: 019ca750-1d02-7083-bf63-8766e626459b
+repo: /Users/daveslutzkin/dev/cadence-cli
+commit: f30f2a5dc9e1ce0ebdb998a081b5e685ec033a36
+confidence: time_window_match
+session_start: 2026-03-01T02:52:51Z
+payload_blob: bb647ac60f5ff0a8134d813bc641e09370c3b1b7
+payload_sha256: 221b0e6f1010bc26d825f68f72ad3ccdbdbe0be913e26f4a0c792c551aa574eb
+payload_encoding: zstd+pgp
+match_score: 1.800
+match_reasons: time_distance
+---
