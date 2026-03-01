@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.1](https://github.com/TeamCadenceAI/cadence-cli/compare/v0.8.0...v0.8.1) (2026-03-01)
+
+
+### Bug Fixes
+
+* **backfill:** add per-run diagnostic JSONL logs ([66884a0](https://github.com/TeamCadenceAI/cadence-cli/commit/66884a0fe24476168992322683b84b3ff80d94f4))
+
 ## [0.8.0](https://github.com/TeamCadenceAI/cadence-cli/compare/v0.7.0...v0.8.0) (2026-02-27)
 
 
