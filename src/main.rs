@@ -951,19 +951,26 @@ fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
         HookError::Soft(e)
     })?;
 
-    let scanned = block_on_io(ingest_recent_sessions_for_repo(
+    let storing_progress = hook_status_spinner_start("Storing AI sessions");
+    let scanned = match block_on_io(ingest_recent_sessions_for_repo(
         &repo_root,
         &repo_root_str,
         POST_COMMIT_MATCH_WINDOW_SECS,
         &encryption_method,
-    ))
-    .map_err(|e| {
-        if encryption_method.is_configured() {
-            HookError::EncryptionFailed(format!("{:#}", e))
-        } else {
-            HookError::Soft(e)
+    )) {
+        Ok(scanned) => {
+            hook_status_spinner_finish_ok(storing_progress, "Storing AI sessions");
+            scanned
         }
-    })?;
+        Err(e) => {
+            hook_status_spinner_finish_err(storing_progress, "Storing AI sessions");
+            return Err(if encryption_method.is_configured() {
+                HookError::EncryptionFailed(format!("{:#}", e))
+            } else {
+                HookError::Soft(e)
+            });
+        }
+    };
     if output::is_verbose() {
         output::detail(&format!("ingested {} recent sessions", scanned));
     }
@@ -989,8 +996,10 @@ fn hook_pre_push_inner(remote: &str, _url: &str) -> Result<()> {
         )) {
             output::note(&format!("Pre-push ingest issue: {}", e));
         }
+        let pushing_progress = hook_status_spinner_start("Pushing AI sessions");
         let sync_start = std::time::Instant::now();
         push::sync_notes_for_remote(remote);
+        hook_status_spinner_finish_ok(pushing_progress, "Pushing AI sessions");
         if output::is_verbose() {
             output::detail(&format!(
                 "Pre-push sync in {} ms",
@@ -1013,6 +1022,48 @@ struct SessionIngestInfo {
 
 const INDEX_TARGET_SIZE_BYTES: usize = 128 * 1024;
 const INDEX_HARD_SIZE_BYTES: usize = 256 * 1024;
+
+fn cadence_hook_label(is_tty: bool) -> String {
+    if is_tty {
+        console::style("[Cadence]")
+            .bold()
+            .fg(console::Color::Cyan)
+            .to_string()
+    } else {
+        "[Cadence]".to_string()
+    }
+}
+
+fn hook_status_spinner_start(task: &str) -> Option<ProgressBar> {
+    if !output::is_stderr_tty() {
+        eprintln!("{} {}", cadence_hook_label(false), task);
+        return None;
+    }
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::with_template("{spinner} {msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+    );
+    pb.enable_steady_tick(std::time::Duration::from_millis(100));
+    pb.set_message(format!("{} {}", cadence_hook_label(true), task));
+    Some(pb)
+}
+
+fn hook_status_spinner_finish_ok(pb: Option<ProgressBar>, task: &str) {
+    if let Some(pb) = pb {
+        let check = console::style("✓").fg(console::Color::Green).to_string();
+        pb.finish_with_message(format!("{} {} {}", check, cadence_hook_label(true), task));
+    } else {
+        eprintln!("✓ {} {}", cadence_hook_label(false), task);
+    }
+}
+
+fn hook_status_spinner_finish_err(pb: Option<ProgressBar>, task: &str) {
+    if let Some(pb) = pb {
+        let cross = console::style("✗").fg(console::Color::Red).to_string();
+        pb.finish_with_message(format!("{} {} {}", cross, cadence_hook_label(true), task));
+    }
+}
 
 fn format_unix_rfc3339(epoch: i64) -> Option<String> {
     let dt = time::OffsetDateTime::from_unix_timestamp(epoch).ok()?;
