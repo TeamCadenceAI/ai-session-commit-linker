@@ -1037,6 +1037,7 @@ fn cadence_hook_label(is_tty: bool) -> String {
 fn hook_status_spinner_start(task: &str) -> Option<ProgressBar> {
     if !output::is_stderr_tty() {
         eprintln!("{} {}", cadence_hook_label(false), task);
+        eprintln!();
         return None;
     }
     let pb = ProgressBar::new_spinner();
