@@ -22,8 +22,8 @@ use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process;
-use tokio::sync::OnceCell;
 use std::time::Duration;
+use tokio::sync::OnceCell;
 
 use crate::keychain::KeychainStore;
 
@@ -3698,8 +3698,7 @@ trait Prompter {
     ) -> Result<Option<bool>>;
 }
 
-struct DialoguerPrompter {
-}
+struct DialoguerPrompter {}
 
 impl DialoguerPrompter {
     fn new() -> Self {
@@ -3905,6 +3904,12 @@ async fn run_update(check: bool, yes: bool) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 async fn run_gc(since: &str, confirm: bool) -> Result<()> {
+    let session_refs = [
+        git::SESSION_DATA_REF,
+        git::SESSION_INDEX_BRANCH_REF,
+        git::SESSION_INDEX_COMMITTER_REF,
+    ];
+
     // Validate the --since value early so we fail before any destructive work.
     let since_secs = parse_since_duration(since)?;
     let since_days = since_secs / 86_400;
@@ -3915,8 +3920,10 @@ async fn run_gc(since: &str, confirm: bool) -> Result<()> {
         output::note("This will DELETE all local and remote AI session refs for this repo,");
         output::note("then re-backfill them in the optimized v2 format.");
         output::detail(&format!("Re-backfill window: last {} days", since_days));
-        output::detail("Local ref:  refs/cadence/sessions/data  → deleted");
-        output::detail("Remote ref: refs/cadence/sessions/data  → deleted");
+        for ref_name in &session_refs {
+            output::detail(&format!("Local ref:  {}  → deleted", ref_name));
+            output::detail(&format!("Remote ref: {}  → deleted", ref_name));
+        }
         output::detail("Then: cadence backfill --since <window>");
         eprintln!();
         output::fail("Aborted", "pass --confirm to proceed.");
@@ -3926,25 +3933,39 @@ async fn run_gc(since: &str, confirm: bool) -> Result<()> {
     // Resolve push remote (e.g. "origin").
     let remote = git::resolve_push_remote_at(&repo_root).await?;
 
-    // Step 1: Delete remote notes ref.
+    // Step 1: Delete remote session refs.
     if let Some(ref remote_name) = remote {
         output::action(
             "GC",
-            &format!("Deleting remote session ref on '{}'", remote_name),
+            &format!("Deleting remote session refs on '{}'", remote_name),
         );
-        match git::delete_remote_ref_at(Some(&repo_root), remote_name, git::NOTES_REF).await {
-            Ok(()) => output::detail("Remote session ref deleted (or did not exist)."),
-            Err(e) => output::detail(&format!("Could not delete remote ref (continuing): {e}")),
+        for ref_name in &session_refs {
+            match git::delete_remote_ref_at(Some(&repo_root), remote_name, ref_name).await {
+                Ok(()) => output::detail(&format!(
+                    "Remote session ref deleted (or did not exist): {ref_name}"
+                )),
+                Err(e) => output::detail(&format!(
+                    "Could not delete remote ref (continuing): {} ({})",
+                    ref_name, e
+                )),
+            }
         }
     } else {
         output::detail("No push remote found; skipping remote ref deletion.");
     }
 
-    // Step 2: Delete local notes ref.
-    output::action("GC", "Deleting local session ref");
-    match git::delete_local_ref_at(Some(&repo_root), git::NOTES_REF).await {
-        Ok(()) => output::detail("Local session ref deleted (or did not exist)."),
-        Err(e) => output::detail(&format!("Could not delete local ref (continuing): {e}")),
+    // Step 2: Delete local session refs.
+    output::action("GC", "Deleting local session refs");
+    for ref_name in &session_refs {
+        match git::delete_local_ref_at(Some(&repo_root), ref_name).await {
+            Ok(()) => output::detail(&format!(
+                "Local session ref deleted (or did not exist): {ref_name}"
+            )),
+            Err(e) => output::detail(&format!(
+                "Could not delete local ref (continuing): {} ({})",
+                ref_name, e
+            )),
+        }
     }
 
     // Step 3: Re-backfill in v2 format with push enabled (scoped to this repo).

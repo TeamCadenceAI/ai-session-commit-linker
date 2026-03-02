@@ -218,8 +218,7 @@ async fn extract_tar_gz_integration() {
         let file = tokio::fs::File::create(&archive_path).await.unwrap();
         let std_file = file.into_std().await;
         tokio::task::spawn_blocking(move || {
-            let encoder =
-                flate2::write::GzEncoder::new(std_file, flate2::Compression::default());
+            let encoder = flate2::write::GzEncoder::new(std_file, flate2::Compression::default());
             let mut tar_builder = tar::Builder::new(encoder);
 
             let content = b"#!/bin/sh\necho test binary\n";
