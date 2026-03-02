@@ -194,8 +194,24 @@ fn sync_ref_for_remote_inner(
 
 fn merge_ref_maps(repo: &Path, local_ref: &str, remote_temp_ref: &str) -> Result<Option<String>> {
     let mut merged = ref_map_from_ref(repo, local_ref)?;
-    for (path, sha) in ref_map_from_ref(repo, remote_temp_ref)? {
-        merged.entry(path).or_insert(sha);
+    let remote_map = ref_map_from_ref(repo, remote_temp_ref)?;
+    let merge_index_shards =
+        local_ref == git::SESSION_INDEX_BRANCH_REF || local_ref == git::SESSION_INDEX_COMMITTER_REF;
+    for (path, remote_sha) in remote_map {
+        match merged.get(&path).cloned() {
+            None => {
+                merged.insert(path, remote_sha);
+            }
+            Some(local_sha) => {
+                if local_sha == remote_sha {
+                    continue;
+                }
+                if merge_index_shards {
+                    let merged_sha = merge_index_shard_blobs(repo, &local_sha, &remote_sha)?;
+                    merged.insert(path, merged_sha);
+                }
+            }
+        }
     }
 
     if merged.is_empty() {
@@ -218,6 +234,32 @@ fn merge_ref_maps(repo: &Path, local_ref: &str, remote_temp_ref: &str) -> Result
         current_tip.as_deref(),
     )?;
     Ok(Some(commit))
+}
+
+fn merge_index_shard_blobs(repo: &Path, local_sha: &str, remote_sha: &str) -> Result<String> {
+    let local_blob = git::read_blob_at(Some(repo), local_sha)?;
+    let remote_blob = git::read_blob_at(Some(repo), remote_sha)?;
+    let local_text = String::from_utf8(local_blob)?;
+    let remote_text = String::from_utf8(remote_blob)?;
+
+    let mut seen = std::collections::BTreeSet::<String>::new();
+    let mut merged_lines = Vec::<String>::new();
+    for line in local_text.lines().chain(remote_text.lines()) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if seen.insert(trimmed.to_string()) {
+            merged_lines.push(trimmed.to_string());
+        }
+    }
+
+    if merged_lines.is_empty() {
+        return git::store_blob_at(Some(repo), b"");
+    }
+
+    let merged_text = format!("{}\n", merged_lines.join("\n"));
+    git::store_blob_at(Some(repo), merged_text.as_bytes())
 }
 
 fn ref_map_from_ref(repo: &Path, ref_name: &str) -> Result<BTreeMap<String, String>> {
@@ -318,4 +360,95 @@ pub fn check_org_filter_remote(remote: &str) -> bool {
     };
 
     remote_org.eq_ignore_ascii_case(&configured_org)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::process::Command as ProcessCommand;
+    use tempfile::TempDir;
+
+    fn run_git(repo: &Path, args: &[&str]) -> String {
+        let out = ProcessCommand::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout)
+            .expect("utf8")
+            .trim()
+            .to_string()
+    }
+
+    fn init_repo() -> TempDir {
+        let dir = TempDir::new().expect("tempdir");
+        run_git(dir.path(), &["init", "-q"]);
+        run_git(dir.path(), &["config", "user.name", "Test User"]);
+        run_git(dir.path(), &["config", "user.email", "test@example.com"]);
+        std::fs::write(dir.path().join("README.md"), "hello").expect("write");
+        run_git(dir.path(), &["add", "README.md"]);
+        run_git(dir.path(), &["commit", "-m", "init"]);
+        dir
+    }
+
+    fn write_ref_map(repo: &Path, ref_name: &str, map: &BTreeMap<String, String>) {
+        let tree = build_tree_from_map(repo, map).expect("build tree");
+        let parent = git::rev_parse_at(Some(repo), ref_name).ok();
+        let commit = git::commit_tree_at(Some(repo), &tree, "test ref map", parent.as_deref())
+            .expect("commit tree");
+        git::update_ref_at(Some(repo), ref_name, &commit).expect("update ref");
+    }
+
+    #[test]
+    fn merge_ref_maps_unions_conflicting_index_shards() {
+        let repo = init_repo();
+        let path = "aa/bb--0001.ndjson".to_string();
+        let local_blob = git::store_blob_at(
+            Some(repo.path()),
+            br#"{"session_uid":"local","session_blob_sha":"a","agent":"claude","ingested_at":"1"}
+"#,
+        )
+        .expect("store local blob");
+        let remote_blob = git::store_blob_at(
+            Some(repo.path()),
+            br#"{"session_uid":"remote","session_blob_sha":"b","agent":"codex","ingested_at":"2"}
+"#,
+        )
+        .expect("store remote blob");
+
+        let mut local_map = BTreeMap::new();
+        local_map.insert(path.clone(), local_blob);
+        write_ref_map(repo.path(), git::SESSION_INDEX_BRANCH_REF, &local_map);
+
+        let remote_temp_ref = "refs/cadence/tmp/test/index-branch";
+        let mut remote_map = BTreeMap::new();
+        remote_map.insert(path.clone(), remote_blob);
+        write_ref_map(repo.path(), remote_temp_ref, &remote_map);
+
+        let merged_tip =
+            merge_ref_maps(repo.path(), git::SESSION_INDEX_BRANCH_REF, remote_temp_ref)
+                .expect("merge ref maps")
+                .expect("merged tip");
+        git::update_ref_at(
+            Some(repo.path()),
+            git::SESSION_INDEX_BRANCH_REF,
+            &merged_tip,
+        )
+        .expect("update merged tip");
+
+        let merged_map =
+            ref_map_from_ref(repo.path(), git::SESSION_INDEX_BRANCH_REF).expect("read merged map");
+        let merged_sha = merged_map.get(&path).expect("merged shard exists");
+        let merged_blob = git::read_blob_at(Some(repo.path()), merged_sha).expect("read blob");
+        let merged_text = String::from_utf8(merged_blob).expect("utf8");
+        assert!(merged_text.contains("\"session_uid\":\"local\""));
+        assert!(merged_text.contains("\"session_uid\":\"remote\""));
+    }
 }

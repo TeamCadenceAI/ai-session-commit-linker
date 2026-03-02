@@ -1242,6 +1242,7 @@ async fn ingest_recent_sessions_for_repo(
             .unwrap_or(scanner::AgentType::Claude);
         let session_start = scanner::session_time_range(&file).map(|(start, _)| start);
         let observed_commits = scanner::extract_commit_hashes(&file);
+        let explicit_branch_keys = branch_keys_for_repo_and_commits(repo_root, &observed_commits);
         let session_log = match tokio::fs::read_to_string(&file).await {
             Ok(content) => content,
             Err(_) => continue,
@@ -1259,7 +1260,7 @@ async fn ingest_recent_sessions_for_repo(
             None,
             None,
             Some(repo_root),
-            None,
+            Some(&explicit_branch_keys),
         )?;
         ingested += 1;
         if output::is_verbose() {
@@ -2398,11 +2399,7 @@ fn jsonl_prompt_excerpt(text: &str, max_chars: usize) -> Option<String> {
         }
 
         let out = truncate_with_ellipsis(trimmed, max_chars);
-        if out.is_empty() {
-            None
-        } else {
-            Some(out)
-        }
+        if out.is_empty() { None } else { Some(out) }
     }
 
     let mut latest_prompt: Option<String> = None;
@@ -2422,7 +2419,8 @@ fn jsonl_prompt_excerpt(text: &str, max_chars: usize) -> Option<String> {
             }
         }
 
-        let is_user_message = value.pointer("/payload/type").and_then(|v| v.as_str()) == Some("message")
+        let is_user_message = value.pointer("/payload/type").and_then(|v| v.as_str())
+            == Some("message")
             && value.pointer("/payload/role").and_then(|v| v.as_str()) == Some("user");
         if is_user_message
             && let Some(items) = value.pointer("/payload/content").and_then(|v| v.as_array())
@@ -2467,7 +2465,8 @@ fn load_decrypted_session_blob(blob: &[u8]) -> Option<Vec<u8>> {
     let fingerprint = pgp_keys::get_user_fingerprint().ok().flatten()?;
     let keychain = keychain::KeyringStore::new(KEYCHAIN_SERVICE);
     let passphrase = keychain.get(&fingerprint).ok().flatten()?;
-    let decrypted = pgp_keys::decrypt_with_private_key_binary(blob, &private_key, &passphrase).ok()?;
+    let decrypted =
+        pgp_keys::decrypt_with_private_key_binary(blob, &private_key, &passphrase).ok()?;
 
     if let Ok(decoded) = zstd::decode_all(std::io::Cursor::new(&decrypted))
         && serde_json::from_slice::<note::SessionEnvelope>(&decoded).is_ok()
@@ -2480,7 +2479,9 @@ fn load_decrypted_session_blob(blob: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-fn build_local_session_labels_for_repo(repo: &std::path::Path) -> std::collections::HashMap<String, String> {
+fn build_local_session_labels_for_repo(
+    repo: &std::path::Path,
+) -> std::collections::HashMap<String, String> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -2663,11 +2664,11 @@ fn repo_local_branches(repo: &std::path::Path) -> Vec<String> {
 
 fn sessions_audit_repo(repo: &std::path::Path, show_ok: bool) -> Result<()> {
     let repo_label = repo.to_string_lossy().to_string();
-    let remote = git::resolve_push_remote_at(repo)?
-        .unwrap_or_else(|| "origin".to_string());
+    let remote = git::resolve_push_remote_at(repo)?.unwrap_or_else(|| "origin".to_string());
     let branches = repo_local_branches(repo);
     let local_labels = build_local_session_labels_for_repo(repo);
-    let mut contains_cache: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    let mut contains_cache: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
 
     output::action("Audit", &repo_label);
     output::detail(&format!(
@@ -2685,14 +2686,19 @@ fn sessions_audit_repo(repo: &std::path::Path, show_ok: bool) -> Result<()> {
     for branch in branches {
         let branch_key = format!("{remote}/{branch}");
         let key_hash = note::hash_key(&branch_key);
-        let mut entries = list_index_entries_for_key(repo, git::SESSION_INDEX_BRANCH_REF, &key_hash)?;
+        let mut entries =
+            list_index_entries_for_key(repo, git::SESSION_INDEX_BRANCH_REF, &key_hash)?;
         entries.sort_by(|a, b| b.session_start.cmp(&a.session_start));
         entries.dedup_by(|a, b| a.session_uid == b.session_uid);
         if entries.is_empty() {
             continue;
         }
 
-        output::detail(&format!("branch={} indexed_sessions={}", branch, entries.len()));
+        output::detail(&format!(
+            "branch={} indexed_sessions={}",
+            branch,
+            entries.len()
+        ));
         for entry in entries {
             total_sessions += 1;
             let label = session_display_label(repo, &entry, &local_labels);
@@ -2714,12 +2720,14 @@ fn sessions_audit_repo(repo: &std::path::Path, show_ok: bool) -> Result<()> {
 
             let mut branch_match = false;
             let mut any_resolution = false;
-            let mut resolved_branches: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            let mut resolved_branches: std::collections::BTreeSet<String> =
+                std::collections::BTreeSet::new();
             for commit in &observed_commits {
                 let containing = if let Some(cached) = contains_cache.get(commit) {
                     cached.clone()
                 } else {
-                    let resolved = git::branches_containing_commit_at(repo, commit).unwrap_or_default();
+                    let resolved =
+                        git::branches_containing_commit_at(repo, commit).unwrap_or_default();
                     contains_cache.insert(commit.clone(), resolved.clone());
                     resolved
                 };
@@ -2787,8 +2795,9 @@ fn run_sessions_audit(all: bool, show_ok: bool) -> Result<()> {
         }
         return Ok(());
     }
-    let repo = git::repo_root()
-        .map_err(|_| anyhow::anyhow!("not in a git repository. Use `cadence sessions audit --all`."))?;
+    let repo = git::repo_root().map_err(|_| {
+        anyhow::anyhow!("not in a git repository. Use `cadence sessions audit --all`.")
+    })?;
     sessions_audit_repo(&repo, show_ok)
 }
 
@@ -2796,11 +2805,11 @@ fn run_sessions_inspect(query: &str, all: bool) -> Result<()> {
     let repos = if all {
         discovered_repos_for_sessions()
     } else {
-        vec![
-            git::repo_root().map_err(|_| {
-                anyhow::anyhow!("not in a git repository. Use `cadence sessions inspect --all <query>`.")
-            })?,
-        ]
+        vec![git::repo_root().map_err(|_| {
+            anyhow::anyhow!(
+                "not in a git repository. Use `cadence sessions inspect --all <query>`."
+            )
+        })?]
     };
     if repos.is_empty() {
         output::note("No repositories discovered from recent sessions.");
@@ -2817,8 +2826,7 @@ fn run_sessions_inspect(query: &str, all: bool) -> Result<()> {
         user_entries.sort_by(|a, b| b.session_start.cmp(&a.session_start));
         user_entries.dedup_by(|a, b| a.session_uid == b.session_uid);
 
-        let remote = git::resolve_push_remote_at(&repo)?
-            .unwrap_or_else(|| "origin".to_string());
+        let remote = git::resolve_push_remote_at(&repo)?.unwrap_or_else(|| "origin".to_string());
         let branches = repo_local_branches(&repo);
 
         for entry in user_entries {
@@ -2851,7 +2859,10 @@ fn run_sessions_inspect(query: &str, all: bool) -> Result<()> {
                     list_index_entries_for_key(&repo, git::SESSION_INDEX_BRANCH_REF, &key_hash)?;
                 branch_entries.sort_by(|a, b| b.session_start.cmp(&a.session_start));
                 branch_entries.dedup_by(|a, b| a.session_uid == b.session_uid);
-                if branch_entries.iter().any(|e| e.session_uid == entry.session_uid) {
+                if branch_entries
+                    .iter()
+                    .any(|e| e.session_uid == entry.session_uid)
+                {
                     branch_hits.push(branch.clone());
                 }
             }
@@ -4098,7 +4109,10 @@ mod tests {
                 assert!(!all);
                 assert!(matches!(
                     command,
-                    Some(SessionsCommand::Audit { all: true, show_ok: false })
+                    Some(SessionsCommand::Audit {
+                        all: true,
+                        show_ok: false
+                    })
                 ));
             }
             _ => panic!("expected Sessions command"),
@@ -4126,10 +4140,7 @@ mod tests {
         match cli.command {
             Command::Sessions { command, all } => {
                 assert!(!all);
-                assert!(matches!(
-                    command,
-                    Some(SessionsCommand::List { all: true })
-                ));
+                assert!(matches!(command, Some(SessionsCommand::List { all: true })));
             }
             _ => panic!("expected Sessions command"),
         }
@@ -4248,6 +4259,49 @@ mod tests {
             git::ref_exists_at(Some(repo.path()), git::SESSION_INDEX_COMMITTER_REF)
                 .expect("committer index ref exists")
         );
+    }
+
+    #[tokio::test]
+    async fn ingest_session_with_explicit_branch_keys_indexes_each_branch() {
+        let repo = init_repo();
+        run_git(
+            repo.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:example-org/example-repo.git",
+            ],
+        );
+
+        let branch_keys = vec!["origin/main".to_string(), "origin/feature/test".to_string()];
+        let session_log = include_str!("../tests/fixtures/backfill/session_no_ranked.jsonl");
+        let info = ingest_session_from_log(
+            &scanner::AgentType::Claude,
+            "multi-branch",
+            &repo.path().to_string_lossy(),
+            None,
+            session_log,
+            note::Confidence::TimeWindowMatch,
+            &EncryptionMethod::None,
+            Some(1_707_526_800),
+            None,
+            None,
+            Some(repo.path()),
+            Some(&branch_keys),
+        )
+        .expect("ingest");
+
+        for key in branch_keys {
+            let mut entries = list_index_entries_for_key(
+                repo.path(),
+                git::SESSION_INDEX_BRANCH_REF,
+                &note::hash_key(&key),
+            )
+            .expect("list branch entries");
+            entries.sort_by(|a, b| b.ingested_at.cmp(&a.ingested_at));
+            assert!(entries.iter().any(|e| e.session_uid == info.session_uid));
+        }
     }
 
     #[tokio::test]
@@ -4393,7 +4447,8 @@ mod tests {
 
     #[test]
     fn jsonl_prompt_excerpt_extracts_payload_title() {
-        let content = r#"{"type":"event","payload":{"title":"Fix session list labels for codex logs"}}"#;
+        let content =
+            r#"{"type":"event","payload":{"title":"Fix session list labels for codex logs"}}"#;
         let excerpt = jsonl_prompt_excerpt(content, 72).expect("extract title");
         assert_eq!(excerpt, "Fix session list labels for codex logs");
     }
