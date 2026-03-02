@@ -54,9 +54,14 @@ async fn collect_dirs_with_exts(root: &Path, results: &mut Vec<PathBuf>, exts: &
         let mut has_match = false;
         while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
-            if path.is_dir() {
+            let file_type = match entry.file_type().await {
+                Ok(file_type) => file_type,
+                Err(_) => continue,
+            };
+            if file_type.is_dir() {
                 stack.push(path);
-            } else if !has_match
+            } else if file_type.is_file()
+                && !has_match
                 && let Some(ext) = path.extension().and_then(|e| e.to_str())
                 && exts.iter().any(|allowed| allowed.eq_ignore_ascii_case(ext))
             {

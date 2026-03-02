@@ -3,7 +3,7 @@
 //! Records are scoped by `(repo_root, scope_type, scope_key_hash)` and stored under:
 //! `~/.cadence/cli/sync-cursors/<repo-hash>--<scope>--<key-hash>.json`
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -78,8 +78,13 @@ pub async fn load_cursor(
 ) -> Result<Option<SyncCursorRecord>> {
     let dir = cursor_dir().await?;
     let path = record_path(&dir, repo_root, scope_type, scope_key_hash);
-    if tokio::fs::metadata(&path).await.is_err() {
-        return Ok(None);
+    match tokio::fs::metadata(&path).await {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("failed to stat sync cursor at {}", path.display()));
+        }
     }
     let content = tokio::fs::read_to_string(&path).await?;
     let record: SyncCursorRecord = serde_json::from_str(&content)?;

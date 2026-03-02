@@ -68,9 +68,16 @@ async fn collect_dirs_with_jsonl(root: &Path, results: &mut Vec<PathBuf>) {
         let mut has_jsonl = false;
         while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
-            if path.is_dir() {
+            let file_type = match entry.file_type().await {
+                Ok(file_type) => file_type,
+                Err(_) => continue,
+            };
+            if file_type.is_dir() {
                 stack.push(path);
-            } else if !has_jsonl && path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+            } else if file_type.is_file()
+                && !has_jsonl
+                && path.extension().and_then(|e| e.to_str()) == Some("jsonl")
+            {
                 has_jsonl = true;
             }
         }

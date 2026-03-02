@@ -71,6 +71,9 @@ impl BackfillLogger {
                         if writer.write_all(b"\n").await.is_err() {
                             break;
                         }
+                        if writer.flush().await.is_err() {
+                            break;
+                        }
                     }
                     #[cfg(test)]
                     LogMessage::Flush(ack) => {

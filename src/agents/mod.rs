@@ -123,7 +123,11 @@ pub async fn find_chat_session_dirs(root: &Path) -> Vec<PathBuf> {
 
         while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
-            if path.is_dir() {
+            let file_type = match entry.file_type().await {
+                Ok(file_type) => file_type,
+                Err(_) => continue,
+            };
+            if file_type.is_dir() {
                 if path.file_name().and_then(|n| n.to_str()) == Some("chatSessions") {
                     results.push(path);
                 } else {

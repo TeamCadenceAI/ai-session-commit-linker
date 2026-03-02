@@ -162,3 +162,102 @@ pub fn serialize_index_entry_line(entry: &IndexEntry) -> Result<String> {
 pub fn compress_bytes(data: &[u8]) -> Result<Vec<u8>> {
     Ok(zstd::encode_all(std::io::Cursor::new(data), 3)?)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_record() -> SessionRecord {
+        SessionRecord {
+            session_uid: "uid-1".to_string(),
+            agent: "codex".to_string(),
+            session_id: "session-abc".to_string(),
+            repo_root: "/tmp/repo".to_string(),
+            repo_remote_url: None,
+            branch_key: "main".to_string(),
+            committer_key_hash: "committer-hash".to_string(),
+            session_start: Some(1_700_000_000),
+            session_end: Some(1_700_000_100),
+            content_sha256: "content-sha".to_string(),
+            observed_commits: vec!["abc123".to_string()],
+            time_window: Some(TimeWindow {
+                start: 1_700_000_000,
+                end: 1_700_000_100,
+            }),
+            cwd: Some("/tmp/repo".to_string()),
+            touched_paths: vec!["src/main.rs".to_string()],
+            match_signals: Some(MatchSignals {
+                confidence: "scored_match".to_string(),
+                score: Some(0.9),
+                reasons: vec!["contains_commit_hash".to_string()],
+            }),
+            ingested_at: "2026-03-02T00:00:00Z".to_string(),
+            cli_version: "1.0.0".to_string(),
+        }
+    }
+
+    #[test]
+    fn compute_session_uid_is_deterministic() {
+        let content_sha = content_sha256("session content");
+        let uid1 = compute_session_uid(
+            &AgentType::Codex,
+            "session-abc",
+            "/tmp/repo",
+            Some(1_700_000_000),
+            &content_sha,
+        );
+        let uid2 = compute_session_uid(
+            &AgentType::Codex,
+            "session-abc",
+            "/tmp/repo",
+            Some(1_700_000_000),
+            &content_sha,
+        );
+        assert_eq!(uid1, uid2);
+
+        let uid_with_different_start = compute_session_uid(
+            &AgentType::Codex,
+            "session-abc",
+            "/tmp/repo",
+            Some(1_700_000_001),
+            &content_sha,
+        );
+        assert_ne!(uid1, uid_with_different_start);
+    }
+
+    #[test]
+    fn serialize_session_object_round_trips() {
+        let record = sample_record();
+        let bytes = serialize_session_object(record.clone(), "line1\nline2".to_string())
+            .expect("serialize session object");
+        let envelope: SessionEnvelope =
+            serde_json::from_slice(&bytes).expect("deserialize session envelope");
+
+        assert_eq!(envelope.record.session_uid, record.session_uid);
+        assert_eq!(envelope.record.agent, record.agent);
+        assert_eq!(envelope.record.session_id, record.session_id);
+        assert_eq!(envelope.record.repo_root, record.repo_root);
+        assert_eq!(envelope.record.content_sha256, record.content_sha256);
+        assert_eq!(envelope.session_content, "line1\nline2");
+    }
+
+    #[test]
+    fn serialize_index_entry_line_is_stable_and_omits_none() {
+        let entry = IndexEntry {
+            session_uid: "uid-1".to_string(),
+            session_blob_sha: "blob-sha".to_string(),
+            session_start: None,
+            agent: "codex".to_string(),
+            ingested_at: "2026-03-02T00:00:00Z".to_string(),
+        };
+
+        let line = serialize_index_entry_line(&entry).expect("serialize index entry");
+        assert_eq!(
+            line,
+            r#"{"session_uid":"uid-1","session_blob_sha":"blob-sha","agent":"codex","ingested_at":"2026-03-02T00:00:00Z"}"#
+        );
+
+        let parsed: serde_json::Value = serde_json::from_str(&line).expect("parse line");
+        assert!(parsed.get("session_start").is_none());
+    }
+}
