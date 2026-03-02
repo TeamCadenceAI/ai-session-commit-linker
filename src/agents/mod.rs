@@ -143,7 +143,7 @@ pub async fn all_recent_files(now: i64, since_secs: i64) -> Vec<PathBuf> {
     let claude_dirs = claude::all_log_dirs().await;
     results.extend(recent_files_with_exts(&claude_dirs, now, since_secs, &["jsonl"]).await);
 
-    let codex_dirs = codex::all_log_dirs_async().await;
+    let codex_dirs = codex::all_log_dirs().await;
     results.extend(recent_files_with_exts(&codex_dirs, now, since_secs, &["jsonl"]).await);
 
     let cursor_dirs = cursor::all_log_dirs().await;

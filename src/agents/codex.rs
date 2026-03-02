@@ -17,28 +17,7 @@ use super::home_dir;
 ///
 /// Used by the `backfill` command to scan all sessions regardless of repo.
 #[allow(dead_code)]
-pub fn all_log_dirs() -> Vec<PathBuf> {
-    block_on_io(async {
-        let home = match home_dir() {
-            Some(h) => h,
-            None => return Vec::new(),
-        };
-        log_dirs_in(&home).await
-    })
-}
-
-#[allow(dead_code)]
-fn block_on_io<T>(fut: impl std::future::Future<Output = T>) -> T {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        tokio::task::block_in_place(|| handle.block_on(fut))
-    } else {
-        tokio::runtime::Runtime::new()
-            .expect("failed to create tokio runtime")
-            .block_on(fut)
-    }
-}
-
-pub async fn all_log_dirs_async() -> Vec<PathBuf> {
+pub async fn all_log_dirs() -> Vec<PathBuf> {
     let home = match home_dir() {
         Some(h) => h,
         None => return Vec::new(),
@@ -109,91 +88,102 @@ async fn collect_dirs_with_jsonl(root: &Path, results: &mut Vec<PathBuf>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use tempfile::TempDir;
 
-    #[test]
-    fn test_log_dirs_finds_directories_with_jsonl_files() {
+    #[tokio::test]
+    async fn test_log_dirs_finds_directories_with_jsonl_files() {
         let home = TempDir::new().unwrap();
         let sessions_dir = home.path().join(".codex").join("sessions");
 
         // Create Codex-style date hierarchy with .jsonl files
         let day1 = sessions_dir.join("2026").join("02").join("10");
         let day2 = sessions_dir.join("2026").join("02").join("09");
-        fs::create_dir_all(&day1).unwrap();
-        fs::create_dir_all(&day2).unwrap();
-        fs::write(day1.join("session-abc.jsonl"), "{}").unwrap();
-        fs::write(day2.join("session-def.jsonl"), "{}").unwrap();
+        tokio::fs::create_dir_all(&day1).await.unwrap();
+        tokio::fs::create_dir_all(&day2).await.unwrap();
+        tokio::fs::write(day1.join("session-abc.jsonl"), "{}")
+            .await
+            .unwrap();
+        tokio::fs::write(day2.join("session-def.jsonl"), "{}")
+            .await
+            .unwrap();
 
-        let result = block_on_io(log_dirs_in(home.path()));
+        let result = log_dirs_in(home.path()).await;
 
         assert_eq!(result.len(), 2);
         assert!(result.contains(&day1));
         assert!(result.contains(&day2));
     }
 
-    #[test]
-    fn test_log_dirs_skips_empty_directories() {
+    #[tokio::test]
+    async fn test_log_dirs_skips_empty_directories() {
         let home = TempDir::new().unwrap();
         let sessions_dir = home.path().join(".codex").join("sessions");
 
         // Directory with jsonl file
         let day1 = sessions_dir.join("2026").join("02").join("10");
-        fs::create_dir_all(&day1).unwrap();
-        fs::write(day1.join("session.jsonl"), "{}").unwrap();
+        tokio::fs::create_dir_all(&day1).await.unwrap();
+        tokio::fs::write(day1.join("session.jsonl"), "{}")
+            .await
+            .unwrap();
 
         // Empty directory (no jsonl files)
         let day2 = sessions_dir.join("2026").join("02").join("09");
-        fs::create_dir_all(&day2).unwrap();
+        tokio::fs::create_dir_all(&day2).await.unwrap();
 
-        let result = block_on_io(log_dirs_in(home.path()));
+        let result = log_dirs_in(home.path()).await;
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], day1);
     }
 
-    #[test]
-    fn test_log_dirs_returns_empty_when_sessions_dir_missing() {
+    #[tokio::test]
+    async fn test_log_dirs_returns_empty_when_sessions_dir_missing() {
         let home = TempDir::new().unwrap();
         // Don't create .codex/sessions/
 
-        let result = block_on_io(log_dirs_in(home.path()));
+        let result = log_dirs_in(home.path()).await;
 
         assert!(result.is_empty());
     }
 
-    #[test]
-    fn test_log_dirs_ignores_non_jsonl_files() {
+    #[tokio::test]
+    async fn test_log_dirs_ignores_non_jsonl_files() {
         let home = TempDir::new().unwrap();
         let sessions_dir = home.path().join(".codex").join("sessions");
         let day_dir = sessions_dir.join("2026").join("01").join("01");
-        fs::create_dir_all(&day_dir).unwrap();
+        tokio::fs::create_dir_all(&day_dir).await.unwrap();
 
         // Only a .txt file, no .jsonl
-        fs::write(day_dir.join("not-a-session.txt"), "content").unwrap();
+        tokio::fs::write(day_dir.join("not-a-session.txt"), "content")
+            .await
+            .unwrap();
 
-        let result = block_on_io(log_dirs_in(home.path()));
+        let result = log_dirs_in(home.path()).await;
 
         assert!(result.is_empty());
     }
 
-    #[test]
-    fn test_log_dirs_finds_flat_and_nested_dirs() {
+    #[tokio::test]
+    async fn test_log_dirs_finds_flat_and_nested_dirs() {
         // Handles both flat directories and date-based hierarchy
         let home = TempDir::new().unwrap();
         let sessions_dir = home.path().join(".codex").join("sessions");
 
         // Nested date directory
         let nested = sessions_dir.join("2026").join("02").join("10");
-        fs::create_dir_all(&nested).unwrap();
-        fs::write(nested.join("session.jsonl"), "{}").unwrap();
+        tokio::fs::create_dir_all(&nested).await.unwrap();
+        tokio::fs::write(nested.join("session.jsonl"), "{}")
+            .await
+            .unwrap();
 
         // Flat directory at top level (in case Codex format changes)
         let flat = sessions_dir.join("flat-session");
-        fs::create_dir_all(&flat).unwrap();
-        fs::write(flat.join("session.jsonl"), "{}").unwrap();
+        tokio::fs::create_dir_all(&flat).await.unwrap();
+        tokio::fs::write(flat.join("session.jsonl"), "{}")
+            .await
+            .unwrap();
 
-        let result = block_on_io(log_dirs_in(home.path()));
+        let result = log_dirs_in(home.path()).await;
 
         assert_eq!(result.len(), 2);
         assert!(result.contains(&nested));
@@ -204,31 +194,31 @@ mod tests {
     // Phase 12 hardening: missing ~/.codex/ directory
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_log_dirs_graceful_when_codex_dir_missing() {
+    #[tokio::test]
+    async fn test_log_dirs_graceful_when_codex_dir_missing() {
         // If ~/.codex/ does not exist at all, log_dirs should return
         // an empty Vec, not error.
         let home = TempDir::new().unwrap();
         // Don't create .codex/ at all
 
-        let result = block_on_io(log_dirs_in(home.path()));
+        let result = log_dirs_in(home.path()).await;
         assert!(result.is_empty());
     }
 
-    #[test]
-    fn test_log_dirs_empty_sessions_directory() {
+    #[tokio::test]
+    async fn test_log_dirs_empty_sessions_directory() {
         let home = TempDir::new().unwrap();
         let sessions_dir = home.path().join(".codex").join("sessions");
-        fs::create_dir_all(&sessions_dir).unwrap();
+        tokio::fs::create_dir_all(&sessions_dir).await.unwrap();
         // Sessions dir exists but is empty
 
-        let result = block_on_io(log_dirs_in(home.path()));
+        let result = log_dirs_in(home.path()).await;
 
         assert!(result.is_empty());
     }
 
-    #[test]
-    fn test_log_dirs_supports_codex_home_override() {
+    #[tokio::test]
+    async fn test_log_dirs_supports_codex_home_override() {
         let home = TempDir::new().unwrap();
         let codex_home = TempDir::new().unwrap();
         let override_day = codex_home
@@ -237,19 +227,18 @@ mod tests {
             .join("2026")
             .join("02")
             .join("10");
-        fs::create_dir_all(&override_day).unwrap();
-        fs::write(override_day.join("zed-session.jsonl"), "{}").unwrap();
+        tokio::fs::create_dir_all(&override_day).await.unwrap();
+        tokio::fs::write(override_day.join("zed-session.jsonl"), "{}")
+            .await
+            .unwrap();
 
-        let result = block_on_io(log_dirs_in_with_codex_home(
-            home.path(),
-            Some(codex_home.path()),
-        ));
+        let result = log_dirs_in_with_codex_home(home.path(), Some(codex_home.path())).await;
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], override_day);
     }
 
-    #[test]
-    fn test_log_dirs_dedupes_default_and_override_roots() {
+    #[tokio::test]
+    async fn test_log_dirs_dedupes_default_and_override_roots() {
         let home = TempDir::new().unwrap();
         let shared_home = home.path().join(".codex");
         let day = shared_home
@@ -257,10 +246,12 @@ mod tests {
             .join("2026")
             .join("02")
             .join("10");
-        fs::create_dir_all(&day).unwrap();
-        fs::write(day.join("session.jsonl"), "{}").unwrap();
+        tokio::fs::create_dir_all(&day).await.unwrap();
+        tokio::fs::write(day.join("session.jsonl"), "{}")
+            .await
+            .unwrap();
 
-        let result = block_on_io(log_dirs_in_with_codex_home(home.path(), Some(&shared_home)));
+        let result = log_dirs_in_with_codex_home(home.path(), Some(&shared_home)).await;
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], day);
     }

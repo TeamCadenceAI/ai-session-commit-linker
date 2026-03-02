@@ -252,9 +252,9 @@ pub fn parse_duration_string(s: &str) -> Result<Duration> {
 /// Trims whitespace and strips a leading `v`/`V` prefix if present.
 /// Returns `None` if the file is absent, empty, or not valid UTF-8.
 #[cfg(test)]
-pub fn read_cached_latest_version_from_dir(dir: &Path) -> Option<String> {
+pub async fn read_cached_latest_version_from_dir(dir: &Path) -> Option<String> {
     let path = dir.join(LATEST_VERSION_CACHE_FILE);
-    let content = std::fs::read_to_string(&path).ok()?;
+    let content = tokio::fs::read_to_string(&path).await.ok()?;
     let trimmed = content.trim();
     if trimmed.is_empty() {
         return None;
@@ -1260,7 +1260,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_cached_latest_version_missing_file() {
         let tmp = TempDir::new().unwrap();
-        assert_eq!(read_cached_latest_version_from_dir(tmp.path()), None);
+        assert_eq!(read_cached_latest_version_from_dir(tmp.path()).await, None);
     }
 
     #[tokio::test]
@@ -1269,7 +1269,7 @@ mod tests {
         tokio::fs::write(tmp.path().join(LATEST_VERSION_CACHE_FILE), "")
             .await
             .unwrap();
-        assert_eq!(read_cached_latest_version_from_dir(tmp.path()), None);
+        assert_eq!(read_cached_latest_version_from_dir(tmp.path()).await, None);
     }
 
     #[tokio::test]
@@ -1278,7 +1278,7 @@ mod tests {
         tokio::fs::write(tmp.path().join(LATEST_VERSION_CACHE_FILE), "  \n  ")
             .await
             .unwrap();
-        assert_eq!(read_cached_latest_version_from_dir(tmp.path()), None);
+        assert_eq!(read_cached_latest_version_from_dir(tmp.path()).await, None);
     }
 
     #[tokio::test]
@@ -1288,7 +1288,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            read_cached_latest_version_from_dir(tmp.path()),
+            read_cached_latest_version_from_dir(tmp.path()).await,
             Some("0.3.0".to_string())
         );
     }
@@ -1300,7 +1300,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            read_cached_latest_version_from_dir(tmp.path()),
+            read_cached_latest_version_from_dir(tmp.path()).await,
             Some("0.3.0".to_string())
         );
     }
@@ -1311,7 +1311,7 @@ mod tests {
         tokio::fs::write(tmp.path().join(LATEST_VERSION_CACHE_FILE), "v")
             .await
             .unwrap();
-        assert_eq!(read_cached_latest_version_from_dir(tmp.path()), None);
+        assert_eq!(read_cached_latest_version_from_dir(tmp.path()).await, None);
     }
 
     // -----------------------------------------------------------------------
@@ -1336,7 +1336,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            read_cached_latest_version_from_dir(tmp.path()),
+            read_cached_latest_version_from_dir(tmp.path()).await,
             Some("0.4.0".to_string())
         );
     }
@@ -1349,7 +1349,7 @@ mod tests {
             .unwrap();
         // Reader strips the v prefix
         assert_eq!(
-            read_cached_latest_version_from_dir(tmp.path()),
+            read_cached_latest_version_from_dir(tmp.path()).await,
             Some("0.4.0".to_string())
         );
     }
@@ -1362,7 +1362,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            read_cached_latest_version_from_dir(&sub),
+            read_cached_latest_version_from_dir(&sub).await,
             Some("1.0.0".to_string())
         );
     }
@@ -1393,7 +1393,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            read_cached_latest_version_from_dir(tmp.path()),
+            read_cached_latest_version_from_dir(tmp.path()).await,
             Some("0.4.0".to_string())
         );
     }

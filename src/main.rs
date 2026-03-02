@@ -253,7 +253,7 @@ impl EncryptionMethod {
 /// If `ai.cadence.keys.userFingerprint` is unset, returns `None`.
 /// If set but keys are unavailable, returns `Unavailable` with a reason.
 async fn resolve_encryption_method() -> Result<EncryptionMethod> {
-    let Some(user_fingerprint) = pgp_keys::get_user_fingerprint()? else {
+    let Some(user_fingerprint) = pgp_keys::get_user_fingerprint().await? else {
         return Ok(EncryptionMethod::None);
     };
 
@@ -289,7 +289,7 @@ async fn resolve_encryption_method() -> Result<EncryptionMethod> {
 /// (binary, not armored), then store as a git blob.
 ///
 /// Returns `(blob_sha, encoding)`.
-fn encode_and_store_session_object_at(
+async fn encode_and_store_session_object_at(
     repo: Option<&std::path::Path>,
     session_object_bytes: &[u8],
     method: &EncryptionMethod,
@@ -313,8 +313,9 @@ fn encode_and_store_session_object_at(
         EncryptionMethod::None => (compressed, note::ContentEncoding::Zstd),
     };
 
-    let blob_sha =
-        git::store_blob_at(repo, &encoded).context("failed to store canonical session blob")?;
+    let blob_sha = git::store_blob_at(repo, &encoded)
+        .await
+        .context("failed to store canonical session blob")?;
 
     Ok((blob_sha, encoding))
 }
@@ -366,7 +367,9 @@ async fn resolve_api_public_key_cache(force_refresh: bool) -> Result<Option<Stri
     };
     pgp_keys::save_api_public_key_cache(&api_key.armored_public_key, &meta).await?;
 
-    if let Err(e) = git::config_set_global(pgp_keys::API_FINGERPRINT_KEY, &api_key.fingerprint) {
+    if let Err(e) =
+        git::config_set_global(pgp_keys::API_FINGERPRINT_KEY, &api_key.fingerprint).await
+    {
         output::note(&format!(
             "Could not save API fingerprint to git config: {e}"
         ));
@@ -494,7 +497,7 @@ async fn run_install_inner(
     let mut had_errors = false;
 
     // Step 1: Set git config --global core.hooksPath ~/.git-hooks
-    match git::config_set_global("core.hooksPath", &hooks_dir_str) {
+    match git::config_set_global("core.hooksPath", &hooks_dir_str).await {
         Ok(()) => {
             output::success("Updated", &format!("core.hooksPath = {}", hooks_dir_str));
         }
@@ -681,7 +684,7 @@ async fn run_install_inner(
 
     // Step 5: Persist org filter if provided
     if let Some(ref org_value) = org {
-        match git::config_set_global("ai.cadence.org", org_value) {
+        match git::config_set_global("ai.cadence.org", org_value).await {
             Ok(()) => {
                 output::success("Updated", &format!("org filter = {}", org_value));
             }
@@ -926,16 +929,16 @@ async fn run_hook_pre_push(remote: &str, url: &str) -> Result<()> {
 /// errors are wrapped in `HookError::Soft` and swallowed by the caller.
 async fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
     // Step 0: Per-repo enabled check — if disabled, skip EVERYTHING
-    if !git::check_enabled() {
+    if !git::check_enabled().await {
         return Ok(());
     }
 
     // Step 1: Get repo root
-    let repo_root = git::repo_root()?;
+    let repo_root = git::repo_root().await?;
     let repo_root_str = repo_root.to_string_lossy().to_string();
 
     // Step 1.25: Org filter gating — skip all attachment if mismatched
-    match git::repo_matches_org_filter(&repo_root) {
+    match git::repo_matches_org_filter(&repo_root).await {
         Ok(true) => {}
         Ok(false) => return Ok(()),
         Err(e) => return Err(HookError::Soft(e)),
@@ -978,12 +981,12 @@ async fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
 
 /// Inner implementation of the pre-push hook.
 async fn hook_pre_push_inner(remote: &str, _url: &str) -> Result<()> {
-    if !git::check_enabled() {
+    if !git::check_enabled().await {
         return Ok(());
     }
 
-    if push::should_push_remote(remote) {
-        let repo_root = git::repo_root()?;
+    if push::should_push_remote(remote).await {
+        let repo_root = git::repo_root().await?;
         let repo_root_str = repo_root.to_string_lossy().to_string();
         let encryption_method = resolve_encryption_method()
             .await
@@ -996,7 +999,7 @@ async fn hook_pre_push_inner(remote: &str, _url: &str) -> Result<()> {
         }
         let pushing_progress = hook_status_spinner_start("Pushing AI sessions");
         let sync_start = std::time::Instant::now();
-        push::sync_notes_for_remote(remote);
+        push::sync_notes_for_remote(remote).await;
         hook_status_spinner_finish_ok(pushing_progress, "Pushing AI sessions");
         if output::is_verbose() {
             output::detail(&format!(
@@ -1070,27 +1073,33 @@ fn format_unix_rfc3339(epoch: i64) -> Option<String> {
         .ok()
 }
 
-fn branch_key_for_repo(repo: &std::path::Path) -> String {
+async fn branch_key_for_repo(repo: &std::path::Path) -> String {
     let remote = git::resolve_push_remote_at(repo)
+        .await
         .ok()
         .flatten()
         .unwrap_or_else(|| "origin".to_string());
     let branch = git::current_branch_at(repo)
+        .await
         .ok()
         .flatten()
         .unwrap_or_else(|| "detached/unknown".to_string());
     format!("{remote}/{branch}")
 }
 
-fn branch_keys_for_repo_and_commits(repo: &std::path::Path, commits: &[String]) -> Vec<String> {
+async fn branch_keys_for_repo_and_commits(
+    repo: &std::path::Path,
+    commits: &[String],
+) -> Vec<String> {
     let remote = git::resolve_push_remote_at(repo)
+        .await
         .ok()
         .flatten()
         .unwrap_or_else(|| "origin".to_string());
     let mut branch_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
     for commit in commits {
-        if let Ok(branches) = git::branches_containing_commit_at(repo, commit) {
+        if let Ok(branches) = git::branches_containing_commit_at(repo, commit).await {
             for branch in branches {
                 if !branch.is_empty() {
                     branch_names.insert(branch);
@@ -1100,7 +1109,7 @@ fn branch_keys_for_repo_and_commits(repo: &std::path::Path, commits: &[String]) 
     }
 
     if branch_names.is_empty()
-        && let Ok(Some(current)) = git::current_branch_at(repo)
+        && let Ok(Some(current)) = git::current_branch_at(repo).await
     {
         branch_names.insert(current);
     }
@@ -1115,8 +1124,9 @@ fn branch_keys_for_repo_and_commits(repo: &std::path::Path, commits: &[String]) 
         .collect()
 }
 
-fn committer_key_hash_for_repo(repo: &std::path::Path) -> String {
+async fn committer_key_hash_for_repo(repo: &std::path::Path) -> String {
     let email = git::config_get_at(repo, "user.email")
+        .await
         .ok()
         .flatten()
         .unwrap_or_else(|| "unknown".to_string());
@@ -1136,7 +1146,7 @@ fn normalize_observed_commits(commits: Option<&[String]>) -> Vec<String> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn ingest_session_from_log(
+async fn ingest_session_from_log(
     agent_type: &scanner::AgentType,
     session_id: &str,
     repo_str: &str,
@@ -1152,7 +1162,7 @@ fn ingest_session_from_log(
 ) -> Result<SessionIngestInfo> {
     let repo_path = match repo {
         Some(r) => r.to_path_buf(),
-        None => git::repo_root()?,
+        None => git::repo_root().await?,
     };
     let content_sha256 = note::content_sha256(session_log);
     let session_uid = note::compute_session_uid(
@@ -1169,18 +1179,21 @@ fn ingest_session_from_log(
     let touched_paths = Vec::new();
     let mut branch_keys: Vec<String> = explicit_branch_keys
         .map(|keys| keys.to_vec())
-        .unwrap_or_else(|| vec![branch_key_for_repo(&repo_path)]);
+        .unwrap_or_default();
+    if branch_keys.is_empty() {
+        branch_keys.push(branch_key_for_repo(&repo_path).await);
+    }
     branch_keys.sort();
     branch_keys.dedup();
     let branch_key = branch_keys
         .first()
         .cloned()
-        .unwrap_or_else(|| branch_key_for_repo(&repo_path));
-    let committer_key_hash = committer_key_hash_for_repo(&repo_path);
-    let repo_remote_url = git::resolve_push_remote_at(&repo_path)
-        .ok()
-        .flatten()
-        .and_then(|remote| git::remote_url_at(&repo_path, &remote).ok().flatten());
+        .unwrap_or_else(|| "detached/unknown".to_string());
+    let committer_key_hash = committer_key_hash_for_repo(&repo_path).await;
+    let repo_remote_url = match git::resolve_push_remote_at(&repo_path).await {
+        Ok(Some(remote)) => git::remote_url_at(&repo_path, &remote).await.ok().flatten(),
+        _ => None,
+    };
 
     let record = note::SessionRecord {
         session_uid: session_uid.clone(),
@@ -1208,7 +1221,7 @@ fn ingest_session_from_log(
 
     let session_bytes = note::serialize_session_object(record, session_log.to_string())?;
     let (blob_sha, encoding) =
-        encode_and_store_session_object_at(Some(&repo_path), &session_bytes, method)?;
+        encode_and_store_session_object_at(Some(&repo_path), &session_bytes, method).await?;
     let fanout_path = git::fanout_path_for_key_hash(&session_uid)?;
     git::ensure_blob_referenced_in_ref_at(
         &repo_path,
@@ -1216,7 +1229,8 @@ fn ingest_session_from_log(
         &fanout_path,
         &blob_sha,
         "cadence session data",
-    )?;
+    )
+    .await?;
 
     let index_entry = note::IndexEntry {
         session_uid: session_uid.clone(),
@@ -1235,7 +1249,8 @@ fn ingest_session_from_log(
             INDEX_TARGET_SIZE_BYTES,
             INDEX_HARD_SIZE_BYTES,
             "cadence branch index",
-        )?;
+        )
+        .await?;
     }
     git::append_index_entry_at(
         &repo_path,
@@ -1245,7 +1260,8 @@ fn ingest_session_from_log(
         INDEX_TARGET_SIZE_BYTES,
         INDEX_HARD_SIZE_BYTES,
         "cadence committer index",
-    )?;
+    )
+    .await?;
 
     Ok(SessionIngestInfo {
         session_uid,
@@ -1272,7 +1288,7 @@ async fn ingest_recent_sessions_for_repo(
         let Some(cwd) = metadata.cwd else {
             continue;
         };
-        let Ok(resolved_repo) = git::repo_root_at(std::path::Path::new(&cwd)) else {
+        let Ok(resolved_repo) = git::repo_root_at(std::path::Path::new(&cwd)).await else {
             continue;
         };
         if resolved_repo != repo_root {
@@ -1292,7 +1308,8 @@ async fn ingest_recent_sessions_for_repo(
             .await
             .map(|(start, _)| start);
         let observed_commits = scanner::extract_commit_hashes(&file).await;
-        let explicit_branch_keys = branch_keys_for_repo_and_commits(repo_root, &observed_commits);
+        let explicit_branch_keys =
+            branch_keys_for_repo_and_commits(repo_root, &observed_commits).await;
         let session_log = match tokio::fs::read_to_string(&file).await {
             Ok(content) => content,
             Err(_) => continue,
@@ -1311,7 +1328,8 @@ async fn ingest_recent_sessions_for_repo(
             None,
             Some(repo_root),
             Some(&explicit_branch_keys),
-        )?;
+        )
+        .await?;
         ingested += 1;
         if output::is_verbose() {
             output::detail(&format!(
@@ -1337,13 +1355,14 @@ async fn ingest_incremental_sessions_for_repo(
     method: &EncryptionMethod,
 ) -> Result<usize> {
     let remote = git::resolve_push_remote_at(repo_root)
+        .await
         .ok()
         .flatten()
         .unwrap_or_else(|| "origin".to_string());
-    let committer_hash = committer_key_hash_for_repo(repo_root);
-    let mut local_branches = git::local_branches_at(repo_root).unwrap_or_default();
+    let committer_hash = committer_key_hash_for_repo(repo_root).await;
+    let mut local_branches = git::local_branches_at(repo_root).await.unwrap_or_default();
     if local_branches.is_empty()
-        && let Ok(Some(current)) = git::current_branch_at(repo_root)
+        && let Ok(Some(current)) = git::current_branch_at(repo_root).await
     {
         local_branches.push(current);
     }
@@ -1401,7 +1420,7 @@ async fn ingest_incremental_sessions_for_repo(
         let Some(cwd) = metadata.cwd else {
             continue;
         };
-        let Ok(resolved_repo) = git::repo_root_at(std::path::Path::new(&cwd)) else {
+        let Ok(resolved_repo) = git::repo_root_at(std::path::Path::new(&cwd)).await else {
             continue;
         };
         if resolved_repo != repo_root {
@@ -1418,7 +1437,8 @@ async fn ingest_incremental_sessions_for_repo(
             .clone()
             .unwrap_or(scanner::AgentType::Claude);
         let observed_commits = scanner::extract_commit_hashes(&file).await;
-        let explicit_branch_keys = branch_keys_for_repo_and_commits(repo_root, &observed_commits);
+        let explicit_branch_keys =
+            branch_keys_for_repo_and_commits(repo_root, &observed_commits).await;
         let session_start = scanner::session_time_range(&file)
             .await
             .map(|(start, _)| start);
@@ -1440,7 +1460,8 @@ async fn ingest_incremental_sessions_for_repo(
             None,
             Some(repo_root),
             Some(&explicit_branch_keys),
-        )?;
+        )
+        .await?;
         ingested += 1;
         if output::is_verbose() {
             output::detail(&format!(
@@ -1635,7 +1656,7 @@ async fn process_repo_backfill(
         }),
     );
 
-    match git::repo_matches_org_filter(&repo_root) {
+    match git::repo_matches_org_filter(&repo_root).await {
         Ok(true) => {}
         Ok(false) => {
             backfill_logger.event(
@@ -1670,7 +1691,7 @@ async fn process_repo_backfill(
         }
     }
 
-    let repo_enabled = git::check_enabled_at(&repo_root);
+    let repo_enabled = git::check_enabled_at(&repo_root).await;
     if !repo_enabled {
         backfill_logger.event(
             "repo_skipped",
@@ -1687,7 +1708,7 @@ async fn process_repo_backfill(
     }
 
     let repo_remote = {
-        let remote = match git::resolve_push_remote_at(&repo_root) {
+        let remote = match git::resolve_push_remote_at(&repo_root).await {
             Ok(Some(remote)) => remote,
             _ => "origin".to_string(),
         };
@@ -1699,7 +1720,7 @@ async fn process_repo_backfill(
                 "remote": remote.as_str(),
             }),
         );
-        match push::fetch_merge_notes_for_remote_at(&repo_root, &remote) {
+        match push::fetch_merge_notes_for_remote_at(&repo_root, &remote).await {
             Ok(()) => {
                 backfill_logger.event(
                     "repo_remote_sync_completed",
@@ -1773,7 +1794,8 @@ async fn process_repo_backfill(
             .await
             .map(|(start, _)| start);
 
-        let branch_keys = branch_keys_for_repo_and_commits(&session.repo_root, &commit_hashes);
+        let branch_keys =
+            branch_keys_for_repo_and_commits(&session.repo_root, &commit_hashes).await;
         match ingest_session_from_log(
             &agent_type,
             &session.session_id,
@@ -1787,7 +1809,9 @@ async fn process_repo_backfill(
             None,
             Some(&session.repo_root),
             Some(&branch_keys),
-        ) {
+        )
+        .await
+        {
             Ok(info) => {
                 stats.attached += 1;
                 backfill_logger.event(
@@ -1833,7 +1857,7 @@ async fn process_repo_backfill(
             "remote": repo_remote.as_str(),
         }),
     );
-    push::attempt_push_remote_at_quiet(&repo_root, &repo_remote);
+    push::attempt_push_remote_at_quiet(&repo_root, &repo_remote).await;
     backfill_logger.event(
         "repo_push_completed",
         serde_json::json!({
@@ -2027,7 +2051,7 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
             cached.clone()
         } else {
             let cwd_path = std::path::Path::new(&cwd);
-            let resolved = match git::repo_root_at(cwd_path) {
+            let resolved = match git::repo_root_at(cwd_path).await {
                 Ok(r) => r,
                 Err(e) => {
                     backfill_logger.event(
@@ -2081,7 +2105,7 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
         let repo_display = if let Some(cached) = repo_display_cache.get(&repo_root) {
             cached.clone()
         } else {
-            let resolved = match git::first_remote_url_at(&repo_root) {
+            let resolved = match git::first_remote_url_at(&repo_root).await {
                 Ok(Some(url)) => url,
                 Err(e) => {
                     backfill_logger.event(
@@ -2310,12 +2334,12 @@ fn parse_ls_tree_line(line: &str) -> Option<(String, String, String)> {
     Some((kind, sha, name.to_string()))
 }
 
-fn list_index_entries_for_key(
+async fn list_index_entries_for_key(
     repo: &std::path::Path,
     ref_name: &str,
     key_hash: &str,
 ) -> Result<Vec<note::IndexEntry>> {
-    if !git::ref_exists_at(Some(repo), ref_name)? {
+    if !git::ref_exists_at(Some(repo), ref_name).await? {
         return Ok(Vec::new());
     }
     let fanout = git::fanout_path_for_key_hash(key_hash)?;
@@ -2328,7 +2352,7 @@ fn list_index_entries_for_key(
 
     let root_tree = format!("{ref_name}^{{tree}}");
     let mut dir_tree_sha: Option<String> = None;
-    for line in git::list_tree_entries_at(Some(repo), &root_tree)? {
+    for line in git::list_tree_entries_at(Some(repo), &root_tree).await? {
         if let Some((kind, sha, name)) = parse_ls_tree_line(&line)
             && kind == "tree"
             && name == dir
@@ -2342,7 +2366,7 @@ fn list_index_entries_for_key(
     };
 
     let mut shard_blobs: Vec<(String, String)> = Vec::new();
-    for line in git::list_tree_entries_at(Some(repo), &tree_sha)? {
+    for line in git::list_tree_entries_at(Some(repo), &tree_sha).await? {
         if let Some((kind, sha, name)) = parse_ls_tree_line(&line)
             && kind == "blob"
             && name.starts_with(&format!("{file_prefix}--"))
@@ -2355,7 +2379,7 @@ fn list_index_entries_for_key(
 
     let mut entries = Vec::new();
     for (_name, sha) in shard_blobs {
-        let data = git::read_blob_at(Some(repo), &sha)?;
+        let data = git::read_blob_at(Some(repo), &sha).await?;
         let text = String::from_utf8_lossy(&data);
         for line in text.lines() {
             let trimmed = line.trim();
@@ -2505,7 +2529,7 @@ async fn load_decrypted_session_blob(blob: &[u8]) -> Option<Vec<u8>> {
         .await
         .ok()
         .flatten()?;
-    let fingerprint = pgp_keys::get_user_fingerprint().ok().flatten()?;
+    let fingerprint = pgp_keys::get_user_fingerprint().await.ok().flatten()?;
     let keychain = keychain::KeyringStore::new(KEYCHAIN_SERVICE);
     let passphrase = keychain.get(&fingerprint).ok().flatten()?;
     let decrypted =
@@ -2535,7 +2559,7 @@ async fn build_local_session_labels_for_repo(
         let Some(cwd) = metadata.cwd else {
             continue;
         };
-        let Ok(file_repo_root) = git::repo_root_at(std::path::Path::new(&cwd)) else {
+        let Ok(file_repo_root) = git::repo_root_at(std::path::Path::new(&cwd)).await else {
             continue;
         };
         if file_repo_root != repo {
@@ -2576,7 +2600,7 @@ async fn session_display_label(
         return local.clone();
     }
     let fallback = format!("session {}", short_session_uid(&entry.session_uid));
-    let blob = match git::read_blob_at(Some(repo), &entry.session_blob_sha) {
+    let blob = match git::read_blob_at(Some(repo), &entry.session_blob_sha).await {
         Ok(data) => data,
         Err(_) => return fallback,
     };
@@ -2616,7 +2640,7 @@ async fn discovered_repos_for_sessions() -> Vec<std::path::PathBuf> {
             continue;
         };
         let cwd_path = std::path::Path::new(&cwd);
-        if let Ok(repo_root) = git::repo_root_at(cwd_path) {
+        if let Ok(repo_root) = git::repo_root_at(cwd_path).await {
             repos.insert(repo_root);
         }
     }
@@ -2625,16 +2649,16 @@ async fn discovered_repos_for_sessions() -> Vec<std::path::PathBuf> {
 
 async fn print_sessions_for_repo(repo: &std::path::Path) -> Result<()> {
     let repo_str = repo.to_string_lossy();
-    let branch_key_hash = note::hash_key(&branch_key_for_repo(repo));
-    let committer_hash = committer_key_hash_for_repo(repo);
+    let branch_key_hash = note::hash_key(&branch_key_for_repo(repo).await);
+    let committer_hash = committer_key_hash_for_repo(repo).await;
 
     let mut branch_entries =
-        list_index_entries_for_key(repo, git::SESSION_INDEX_BRANCH_REF, &branch_key_hash)?;
+        list_index_entries_for_key(repo, git::SESSION_INDEX_BRANCH_REF, &branch_key_hash).await?;
     branch_entries.sort_by(|a, b| b.session_start.cmp(&a.session_start));
     branch_entries.dedup_by(|a, b| a.session_uid == b.session_uid);
 
     let mut user_entries =
-        list_index_entries_for_key(repo, git::SESSION_INDEX_COMMITTER_REF, &committer_hash)?;
+        list_index_entries_for_key(repo, git::SESSION_INDEX_COMMITTER_REF, &committer_hash).await?;
     user_entries.sort_by(|a, b| b.session_start.cmp(&a.session_start));
     user_entries.dedup_by(|a, b| a.session_uid == b.session_uid);
     let local_labels = build_local_session_labels_for_repo(repo).await;
@@ -2682,6 +2706,7 @@ async fn run_sessions_list(all: bool) -> Result<()> {
     }
 
     let repo = git::repo_root()
+        .await
         .map_err(|_| anyhow::anyhow!("not in a git repository. Use `cadence sessions --all`."))?;
     print_sessions_for_repo(&repo).await
 }
@@ -2690,15 +2715,17 @@ async fn load_session_envelope_for_entry(
     repo: &std::path::Path,
     entry: &note::IndexEntry,
 ) -> Option<note::SessionEnvelope> {
-    let blob = git::read_blob_at(Some(repo), &entry.session_blob_sha).ok()?;
+    let blob = git::read_blob_at(Some(repo), &entry.session_blob_sha)
+        .await
+        .ok()?;
     let decoded = load_decrypted_session_blob(&blob).await?;
     serde_json::from_slice::<note::SessionEnvelope>(&decoded).ok()
 }
 
-fn repo_local_branches(repo: &std::path::Path) -> Vec<String> {
-    let mut branches = git::local_branches_at(repo).unwrap_or_default();
+async fn repo_local_branches(repo: &std::path::Path) -> Vec<String> {
+    let mut branches = git::local_branches_at(repo).await.unwrap_or_default();
     if branches.is_empty()
-        && let Ok(Some(current)) = git::current_branch_at(repo)
+        && let Ok(Some(current)) = git::current_branch_at(repo).await
     {
         branches.push(current);
     }
@@ -2709,8 +2736,10 @@ fn repo_local_branches(repo: &std::path::Path) -> Vec<String> {
 
 async fn sessions_audit_repo(repo: &std::path::Path, show_ok: bool) -> Result<()> {
     let repo_label = repo.to_string_lossy().to_string();
-    let remote = git::resolve_push_remote_at(repo)?.unwrap_or_else(|| "origin".to_string());
-    let branches = repo_local_branches(repo);
+    let remote = git::resolve_push_remote_at(repo)
+        .await?
+        .unwrap_or_else(|| "origin".to_string());
+    let branches = repo_local_branches(repo).await;
     let local_labels = build_local_session_labels_for_repo(repo).await;
     let mut contains_cache: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
@@ -2732,7 +2761,7 @@ async fn sessions_audit_repo(repo: &std::path::Path, show_ok: bool) -> Result<()
         let branch_key = format!("{remote}/{branch}");
         let key_hash = note::hash_key(&branch_key);
         let mut entries =
-            list_index_entries_for_key(repo, git::SESSION_INDEX_BRANCH_REF, &key_hash)?;
+            list_index_entries_for_key(repo, git::SESSION_INDEX_BRANCH_REF, &key_hash).await?;
         entries.sort_by(|a, b| b.session_start.cmp(&a.session_start));
         entries.dedup_by(|a, b| a.session_uid == b.session_uid);
         if entries.is_empty() {
@@ -2772,8 +2801,9 @@ async fn sessions_audit_repo(repo: &std::path::Path, show_ok: bool) -> Result<()
                 let containing = if let Some(cached) = contains_cache.get(commit) {
                     cached.clone()
                 } else {
-                    let resolved =
-                        git::branches_containing_commit_at(repo, commit).unwrap_or_default();
+                    let resolved = git::branches_containing_commit_at(repo, commit)
+                        .await
+                        .unwrap_or_default();
                     contains_cache.insert(commit.clone(), resolved.clone());
                     resolved
                 };
@@ -2841,7 +2871,7 @@ async fn run_sessions_audit(all: bool, show_ok: bool) -> Result<()> {
         }
         return Ok(());
     }
-    let repo = git::repo_root().map_err(|_| {
+    let repo = git::repo_root().await.map_err(|_| {
         anyhow::anyhow!("not in a git repository. Use `cadence sessions audit --all`.")
     })?;
     sessions_audit_repo(&repo, show_ok).await
@@ -2851,7 +2881,7 @@ async fn run_sessions_inspect(query: &str, all: bool) -> Result<()> {
     let repos = if all {
         discovered_repos_for_sessions().await
     } else {
-        vec![git::repo_root().map_err(|_| {
+        vec![git::repo_root().await.map_err(|_| {
             anyhow::anyhow!(
                 "not in a git repository. Use `cadence sessions inspect --all <query>`."
             )
@@ -2866,14 +2896,17 @@ async fn run_sessions_inspect(query: &str, all: bool) -> Result<()> {
     let mut matches = 0usize;
     for repo in repos {
         let local_labels = build_local_session_labels_for_repo(&repo).await;
-        let committer_hash = committer_key_hash_for_repo(&repo);
+        let committer_hash = committer_key_hash_for_repo(&repo).await;
         let mut user_entries =
-            list_index_entries_for_key(&repo, git::SESSION_INDEX_COMMITTER_REF, &committer_hash)?;
+            list_index_entries_for_key(&repo, git::SESSION_INDEX_COMMITTER_REF, &committer_hash)
+                .await?;
         user_entries.sort_by(|a, b| b.session_start.cmp(&a.session_start));
         user_entries.dedup_by(|a, b| a.session_uid == b.session_uid);
 
-        let remote = git::resolve_push_remote_at(&repo)?.unwrap_or_else(|| "origin".to_string());
-        let branches = repo_local_branches(&repo);
+        let remote = git::resolve_push_remote_at(&repo)
+            .await?
+            .unwrap_or_else(|| "origin".to_string());
+        let branches = repo_local_branches(&repo).await;
 
         for entry in user_entries {
             let envelope = load_session_envelope_for_entry(&repo, &entry).await;
@@ -2902,7 +2935,8 @@ async fn run_sessions_inspect(query: &str, all: bool) -> Result<()> {
             for branch in &branches {
                 let key_hash = note::hash_key(&format!("{remote}/{branch}"));
                 let mut branch_entries =
-                    list_index_entries_for_key(&repo, git::SESSION_INDEX_BRANCH_REF, &key_hash)?;
+                    list_index_entries_for_key(&repo, git::SESSION_INDEX_BRANCH_REF, &key_hash)
+                        .await?;
                 branch_entries.sort_by(|a, b| b.session_start.cmp(&a.session_start));
                 branch_entries.dedup_by(|a, b| a.session_uid == b.session_uid);
                 if branch_entries
@@ -2957,7 +2991,7 @@ async fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
     output::action_to_with_tty(w, "Status", "", false);
 
     // --- Repo root ---
-    let repo_root = match git::repo_root() {
+    let repo_root = match git::repo_root().await {
         Ok(root) => {
             output::detail_to_with_tty(w, &format!("Repo: {}", root.to_string_lossy()), false);
             Some(root)
@@ -2969,9 +3003,16 @@ async fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
     };
 
     // --- Hooks path and shim status ---
-    let global_hooks_path = git::config_get_global("core.hooksPath").ok().flatten();
+    let global_hooks_path = git::config_get_global("core.hooksPath")
+        .await
+        .ok()
+        .flatten();
     if let Some(ref root) = repo_root {
-        match git::config_get_at(root, "core.hooksPath").ok().flatten() {
+        match git::config_get_at(root, "core.hooksPath")
+            .await
+            .ok()
+            .flatten()
+        {
             Some(path) => {
                 let hooks_dir = resolve_hooks_path(Some(root), &path);
                 let (post_installed, pre_installed) = cadence_hooks_installed(&hooks_dir).await;
@@ -2999,7 +3040,7 @@ async fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
             }
         }
 
-        if let Ok(Some(local_hooks_path)) = git::config_get_local_at(root, "core.hooksPath")
+        if let Ok(Some(local_hooks_path)) = git::config_get_local_at(root, "core.hooksPath").await
             && let Some(global_path) = &global_hooks_path
         {
             let local_resolved = resolve_hooks_path(Some(root), &local_hooks_path);
@@ -3038,11 +3079,15 @@ async fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
     }
 
     if let Some(ref root) = repo_root {
-        let has_data_ref = git::ref_exists_at(Some(root), git::SESSION_DATA_REF).unwrap_or(false);
-        let has_branch_ref =
-            git::ref_exists_at(Some(root), git::SESSION_INDEX_BRANCH_REF).unwrap_or(false);
-        let has_committer_ref =
-            git::ref_exists_at(Some(root), git::SESSION_INDEX_COMMITTER_REF).unwrap_or(false);
+        let has_data_ref = git::ref_exists_at(Some(root), git::SESSION_DATA_REF)
+            .await
+            .unwrap_or(false);
+        let has_branch_ref = git::ref_exists_at(Some(root), git::SESSION_INDEX_BRANCH_REF)
+            .await
+            .unwrap_or(false);
+        let has_committer_ref = git::ref_exists_at(Some(root), git::SESSION_INDEX_COMMITTER_REF)
+            .await
+            .unwrap_or(false);
         output::detail_to_with_tty(
             w,
             &format!(
@@ -3056,7 +3101,7 @@ async fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
     }
 
     // --- Org filter ---
-    match git::config_get_global("ai.cadence.org") {
+    match git::config_get_global("ai.cadence.org").await {
         Ok(Some(org)) => {
             output::detail_to_with_tty(w, &format!("Org filter: {}", org), false);
         }
@@ -3067,7 +3112,7 @@ async fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
 
     // --- Per-repo enabled/disabled ---
     if repo_root.is_some() {
-        let enabled = git::check_enabled();
+        let enabled = git::check_enabled().await;
         if enabled {
             output::detail_to_with_tty(w, "Repo enabled: yes", false);
         } else {
@@ -3089,7 +3134,7 @@ async fn run_doctor_inner(w: &mut dyn std::io::Write) -> Result<()> {
 
     let mut issues = 0usize;
 
-    let repo_root = match git::repo_root() {
+    let repo_root = match git::repo_root().await {
         Ok(root) => {
             output::detail_to_with_tty(w, &format!("Repo: {}", root.to_string_lossy()), false);
             Some(root)
@@ -3100,7 +3145,7 @@ async fn run_doctor_inner(w: &mut dyn std::io::Write) -> Result<()> {
         }
     };
 
-    let global_hooks_path = match git::config_get_global("core.hooksPath") {
+    let global_hooks_path = match git::config_get_global("core.hooksPath").await {
         Ok(path) => path,
         Err(e) => {
             output::fail_to_with_tty(
@@ -3147,7 +3192,7 @@ async fn run_doctor_inner(w: &mut dyn std::io::Write) -> Result<()> {
     }
 
     if let Some(ref root) = repo_root {
-        match git::config_get_at(root, "core.hooksPath") {
+        match git::config_get_at(root, "core.hooksPath").await {
             Ok(Some(active_path)) => {
                 let hooks_dir = resolve_hooks_path(Some(root), &active_path);
                 let (post_installed, pre_installed) = cadence_hooks_installed(&hooks_dir).await;
@@ -3193,7 +3238,7 @@ async fn run_doctor_inner(w: &mut dyn std::io::Write) -> Result<()> {
         }
 
         if let (Ok(Some(local_hooks_path)), Some(global_path)) = (
-            git::config_get_local_at(root, "core.hooksPath"),
+            git::config_get_local_at(root, "core.hooksPath").await,
             global_hooks_path.as_ref(),
         ) {
             let local_resolved = resolve_hooks_path(Some(root), &local_hooks_path);
@@ -3225,11 +3270,15 @@ async fn run_doctor_inner(w: &mut dyn std::io::Write) -> Result<()> {
     }
 
     if let Some(root) = repo_root.as_ref() {
-        let has_data_ref = git::ref_exists_at(Some(root), git::SESSION_DATA_REF).unwrap_or(false);
-        let has_branch_ref =
-            git::ref_exists_at(Some(root), git::SESSION_INDEX_BRANCH_REF).unwrap_or(false);
-        let has_committer_ref =
-            git::ref_exists_at(Some(root), git::SESSION_INDEX_COMMITTER_REF).unwrap_or(false);
+        let has_data_ref = git::ref_exists_at(Some(root), git::SESSION_DATA_REF)
+            .await
+            .unwrap_or(false);
+        let has_branch_ref = git::ref_exists_at(Some(root), git::SESSION_INDEX_BRANCH_REF)
+            .await
+            .unwrap_or(false);
+        let has_committer_ref = git::ref_exists_at(Some(root), git::SESSION_INDEX_COMMITTER_REF)
+            .await
+            .unwrap_or(false);
         output::detail_to_with_tty(
             w,
             &format!(
@@ -3266,10 +3315,11 @@ struct KeysStatusReport {
 
 impl KeysStatusReport {
     async fn collect() -> Self {
-        let (user_fingerprint, user_fingerprint_error) = match pgp_keys::get_user_fingerprint() {
-            Ok(v) => (v, None),
-            Err(e) => (None, Some(format!("{}", e))),
-        };
+        let (user_fingerprint, user_fingerprint_error) =
+            match pgp_keys::get_user_fingerprint().await {
+                Ok(v) => (v, None),
+                Err(e) => (None, Some(format!("{}", e))),
+            };
         let user_public_key_cached = pgp_keys::load_cached_user_public_key()
             .await
             .ok()
@@ -3447,8 +3497,8 @@ async fn run_keys_refresh() -> Result<()> {
 }
 
 async fn run_keys_disable() -> Result<()> {
-    let _ = git::config_unset_global(pgp_keys::USER_FINGERPRINT_KEY);
-    let _ = git::config_unset_global(pgp_keys::API_FINGERPRINT_KEY);
+    let _ = git::config_unset_global(pgp_keys::USER_FINGERPRINT_KEY).await;
+    let _ = git::config_unset_global(pgp_keys::API_FINGERPRINT_KEY).await;
 
     if let Some(path) = pgp_keys::user_public_key_cache_path() {
         let _ = tokio::fs::remove_file(path).await;
@@ -3511,6 +3561,7 @@ async fn run_install_encryption_setup() -> Result<()> {
     }
 
     let recipient = git::config_get_global(pgp_keys::USER_FINGERPRINT_KEY)
+        .await
         .ok()
         .flatten()
         .unwrap_or_default();
@@ -3650,8 +3701,8 @@ impl Prompter for DialoguerPrompter {
     }
 }
 
-fn required_git_value(key: &str, label: &str) -> Result<String> {
-    let value = git::config_get_global(key)?.unwrap_or_default();
+async fn required_git_value(key: &str, label: &str) -> Result<String> {
+    let value = git::config_get_global(key).await?.unwrap_or_default();
     let trimmed = value.trim();
     if trimmed.is_empty() {
         anyhow::bail!("Missing git {}. Run `git config --global {}`", label, key);
@@ -3702,8 +3753,8 @@ async fn run_keys_setup_inner(
         writeln!(writer)?;
     }
 
-    let name = required_git_value("user.name", "user.name")?;
-    let email = required_git_value("user.email", "user.email")?;
+    let name = required_git_value("user.name", "user.name").await?;
+    let email = required_git_value("user.email", "user.email").await?;
     let cadence_email = cadence_email(&email)?;
     let identity = format!("{} <{}>", name.trim(), cadence_email.trim());
     output::detail_to_with_tty(writer, &format!("Using Git identity: {identity}"), is_tty);
@@ -3760,10 +3811,11 @@ async fn run_keys_setup_inner(
     };
 
     git::config_set_global(pgp_keys::USER_FINGERPRINT_KEY, &fingerprint)
+        .await
         .context("failed to save user fingerprint to git config")?;
 
     writeln!(writer, "Local key fingerprint: {}", fingerprint)?;
-    if let Ok(Some(api_fpr)) = pgp_keys::get_api_fingerprint() {
+    if let Ok(Some(api_fpr)) = pgp_keys::get_api_fingerprint().await {
         writeln!(writer, "API key fingerprint: {}", api_fpr)?;
     }
     output::success_to_with_tty(writer, "Encryption", "ready.", is_tty);
@@ -3823,7 +3875,7 @@ async fn run_gc(since: &str, confirm: bool) -> Result<()> {
     let since_secs = parse_since_duration(since)?;
     let since_days = since_secs / 86_400;
 
-    let repo_root = git::repo_root()?;
+    let repo_root = git::repo_root().await?;
 
     if !confirm {
         output::note("This will DELETE all local and remote AI session refs for this repo,");
@@ -3838,7 +3890,7 @@ async fn run_gc(since: &str, confirm: bool) -> Result<()> {
     }
 
     // Resolve push remote (e.g. "origin").
-    let remote = git::resolve_push_remote_at(&repo_root)?;
+    let remote = git::resolve_push_remote_at(&repo_root).await?;
 
     // Step 1: Delete remote notes ref.
     if let Some(ref remote_name) = remote {
@@ -3846,7 +3898,7 @@ async fn run_gc(since: &str, confirm: bool) -> Result<()> {
             "GC",
             &format!("Deleting remote session ref on '{}'", remote_name),
         );
-        match git::delete_remote_ref_at(Some(&repo_root), remote_name, git::NOTES_REF) {
+        match git::delete_remote_ref_at(Some(&repo_root), remote_name, git::NOTES_REF).await {
             Ok(()) => output::detail("Remote session ref deleted (or did not exist)."),
             Err(e) => output::detail(&format!("Could not delete remote ref (continuing): {e}")),
         }
@@ -3856,7 +3908,7 @@ async fn run_gc(since: &str, confirm: bool) -> Result<()> {
 
     // Step 2: Delete local notes ref.
     output::action("GC", "Deleting local session ref");
-    match git::delete_local_ref_at(Some(&repo_root), git::NOTES_REF) {
+    match git::delete_local_ref_at(Some(&repo_root), git::NOTES_REF).await {
         Ok(()) => output::detail("Local session ref deleted (or did not exist)."),
         Err(e) => output::detail(&format!("Could not delete local ref (continuing): {e}")),
     }
@@ -3934,8 +3986,10 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn run_git(repo: &std::path::Path, args: &[&str]) -> String {
-        let out = crate::git::run_git_output_at(Some(repo), args, &[]).expect("run git");
+    async fn run_git(repo: &std::path::Path, args: &[&str]) -> String {
+        let out = crate::git::run_git_output_at(Some(repo), args, &[])
+            .await
+            .expect("run git");
         assert!(
             out.status.success(),
             "git failed: {}",
@@ -3947,14 +4001,16 @@ mod tests {
             .to_string()
     }
 
-    fn init_repo() -> TempDir {
+    async fn init_repo() -> TempDir {
         let dir = TempDir::new().expect("tempdir");
-        run_git(dir.path(), &["init", "-q"]);
-        run_git(dir.path(), &["config", "user.name", "Test User"]);
-        run_git(dir.path(), &["config", "user.email", "test@example.com"]);
-        std::fs::write(dir.path().join("README.md"), "hello").expect("write");
-        run_git(dir.path(), &["add", "README.md"]);
-        run_git(dir.path(), &["commit", "-m", "init"]);
+        run_git(dir.path(), &["init", "-q"]).await;
+        run_git(dir.path(), &["config", "user.name", "Test User"]).await;
+        run_git(dir.path(), &["config", "user.email", "test@example.com"]).await;
+        tokio::fs::write(dir.path().join("README.md"), "hello")
+            .await
+            .expect("write");
+        run_git(dir.path(), &["add", "README.md"]).await;
+        run_git(dir.path(), &["commit", "-m", "init"]).await;
         dir
     }
 
@@ -4245,7 +4301,9 @@ mod tests {
     async fn paths_equivalent_matches_relative_and_absolute_same_target() {
         let repo = TempDir::new().expect("tempdir");
         let hooks_dir = repo.path().join(".git/hooks");
-        std::fs::create_dir_all(&hooks_dir).expect("create hooks dir");
+        tokio::fs::create_dir_all(&hooks_dir)
+            .await
+            .expect("create hooks dir");
 
         let absolute = hooks_dir.clone();
         let relative = repo.path().join(".git/./hooks");
@@ -4271,7 +4329,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn ingest_session_without_commit_writes_data_and_indexes() {
-        let repo = init_repo();
+        let repo = init_repo().await;
         run_git(
             repo.path(),
             &[
@@ -4280,7 +4338,8 @@ mod tests {
                 "origin",
                 "git@github.com:example-org/example-repo.git",
             ],
-        );
+        )
+        .await;
 
         let session_log = include_str!("../tests/fixtures/backfill/session_no_ranked.jsonl");
         let info = ingest_session_from_log(
@@ -4297,25 +4356,30 @@ mod tests {
             Some(repo.path()),
             None,
         )
+        .await
         .expect("ingest");
 
         assert_eq!(info.blob_sha.len(), 40);
         assert!(
-            git::ref_exists_at(Some(repo.path()), git::SESSION_DATA_REF).expect("data ref exists")
+            git::ref_exists_at(Some(repo.path()), git::SESSION_DATA_REF)
+                .await
+                .expect("data ref exists")
         );
         assert!(
             git::ref_exists_at(Some(repo.path()), git::SESSION_INDEX_BRANCH_REF)
+                .await
                 .expect("branch index ref exists")
         );
         assert!(
             git::ref_exists_at(Some(repo.path()), git::SESSION_INDEX_COMMITTER_REF)
+                .await
                 .expect("committer index ref exists")
         );
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn ingest_session_with_explicit_branch_keys_indexes_each_branch() {
-        let repo = init_repo();
+        let repo = init_repo().await;
         run_git(
             repo.path(),
             &[
@@ -4324,7 +4388,8 @@ mod tests {
                 "origin",
                 "git@github.com:example-org/example-repo.git",
             ],
-        );
+        )
+        .await;
 
         let branch_keys = vec!["origin/main".to_string(), "origin/feature/test".to_string()];
         let session_log = include_str!("../tests/fixtures/backfill/session_no_ranked.jsonl");
@@ -4342,6 +4407,7 @@ mod tests {
             Some(repo.path()),
             Some(&branch_keys),
         )
+        .await
         .expect("ingest");
 
         for key in branch_keys {
@@ -4350,6 +4416,7 @@ mod tests {
                 git::SESSION_INDEX_BRANCH_REF,
                 &note::hash_key(&key),
             )
+            .await
             .expect("list branch entries");
             entries.sort_by(|a, b| b.ingested_at.cmp(&a.ingested_at));
             assert!(entries.iter().any(|e| e.session_uid == info.session_uid));
@@ -4358,7 +4425,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn ingest_session_is_stable_across_commit_hints_when_observed_commits_match() {
-        let repo = init_repo();
+        let repo = init_repo().await;
         run_git(
             repo.path(),
             &[
@@ -4367,13 +4434,16 @@ mod tests {
                 "origin",
                 "git@github.com:example-org/example-repo.git",
             ],
-        );
-        std::fs::write(repo.path().join("file2.txt"), "x").expect("write file2");
-        run_git(repo.path(), &["add", "file2.txt"]);
-        run_git(repo.path(), &["commit", "-m", "second"]);
+        )
+        .await;
+        tokio::fs::write(repo.path().join("file2.txt"), "x")
+            .await
+            .expect("write file2");
+        run_git(repo.path(), &["add", "file2.txt"]).await;
+        run_git(repo.path(), &["commit", "-m", "second"]).await;
 
-        let first = run_git(repo.path(), &["rev-list", "--max-count=1", "HEAD~1"]);
-        let second = run_git(repo.path(), &["rev-parse", "HEAD"]);
+        let first = run_git(repo.path(), &["rev-list", "--max-count=1", "HEAD~1"]).await;
+        let second = run_git(repo.path(), &["rev-parse", "HEAD"]).await;
         let observed = vec![first.clone(), second.clone()];
         let session_log = include_str!("../tests/fixtures/backfill/session_no_ranked.jsonl");
 
@@ -4391,6 +4461,7 @@ mod tests {
             Some(repo.path()),
             None,
         )
+        .await
         .expect("first ingest");
 
         let second_info = ingest_session_from_log(
@@ -4407,6 +4478,7 @@ mod tests {
             Some(repo.path()),
             None,
         )
+        .await
         .expect("second ingest");
 
         assert_eq!(first_info.blob_sha, second_info.blob_sha);
@@ -4415,12 +4487,13 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn backfill_uploads_session_when_no_candidate_commits() {
-        let repo = init_repo();
+        let repo = init_repo().await;
         let session_file = repo.path().join("session-no-candidate.jsonl");
-        std::fs::write(
+        tokio::fs::write(
             &session_file,
             r#"{"timestamp":"2001-01-01T00:00:00Z","session_id":"no-candidate","cwd":"/tmp/repo"}"#,
         )
+        .await
         .expect("write session file");
         let metadata = scanner::SessionMetadata {
             session_id: Some("no-candidate".to_string()),
@@ -4444,18 +4517,21 @@ mod tests {
 
         assert_eq!(stats.attached, 1);
         assert!(
-            git::ref_exists_at(Some(repo.path()), git::SESSION_DATA_REF).expect("data ref exists")
+            git::ref_exists_at(Some(repo.path()), git::SESSION_DATA_REF)
+                .await
+                .expect("data ref exists")
         );
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn backfill_uploads_session_when_explicit_commits_are_unavailable() {
-        let repo = init_repo();
+        let repo = init_repo().await;
         let session_file = repo.path().join("session-missing-commit.jsonl");
-        std::fs::write(
+        tokio::fs::write(
             &session_file,
             r#"{"timestamp":"2026-02-10T01:00:00Z","session_id":"missing-commit","cwd":"/tmp/repo"}"#,
         )
+        .await
         .expect("write session file");
         let metadata = scanner::SessionMetadata {
             session_id: Some("missing-commit".to_string()),
@@ -4479,14 +4555,18 @@ mod tests {
 
         assert_eq!(stats.attached, 1);
         assert!(
-            git::ref_exists_at(Some(repo.path()), git::SESSION_DATA_REF).expect("data ref exists")
+            git::ref_exists_at(Some(repo.path()), git::SESSION_DATA_REF)
+                .await
+                .expect("data ref exists")
         );
         assert!(
             git::ref_exists_at(Some(repo.path()), git::SESSION_INDEX_BRANCH_REF)
+                .await
                 .expect("branch index ref exists")
         );
         assert!(
             git::ref_exists_at(Some(repo.path()), git::SESSION_INDEX_COMMITTER_REF)
+                .await
                 .expect("committer index ref exists")
         );
     }

@@ -78,8 +78,8 @@ fn fingerprint_to_string(fingerprint: &pgp::types::Fingerprint) -> String {
 ///
 /// Reads `ai.cadence.keys.userFingerprint`. Returns `Ok(None)` if the
 /// key is not set or is blank/whitespace-only. Propagates real git errors.
-pub fn get_user_fingerprint() -> Result<Option<String>> {
-    let value = git::config_get_global(USER_FINGERPRINT_KEY)?;
+pub async fn get_user_fingerprint() -> Result<Option<String>> {
+    let value = git::config_get_global(USER_FINGERPRINT_KEY).await?;
     match value {
         Some(v) if !v.trim().is_empty() => Ok(Some(v.trim().to_string())),
         _ => Ok(None),
@@ -87,8 +87,8 @@ pub fn get_user_fingerprint() -> Result<Option<String>> {
 }
 
 /// Read the configured API fingerprint from **global** git config.
-pub fn get_api_fingerprint() -> Result<Option<String>> {
-    let value = git::config_get_global(API_FINGERPRINT_KEY)?;
+pub async fn get_api_fingerprint() -> Result<Option<String>> {
+    let value = git::config_get_global(API_FINGERPRINT_KEY).await?;
     match value {
         Some(v) if !v.trim().is_empty() => Ok(Some(v.trim().to_string())),
         _ => Ok(None),
