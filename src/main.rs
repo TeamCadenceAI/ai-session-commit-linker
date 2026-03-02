@@ -23,7 +23,6 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::OnceLock;
 use std::time::Duration;
-use tokio::runtime::Handle;
 
 use crate::keychain::KeychainStore;
 
@@ -253,12 +252,12 @@ impl EncryptionMethod {
 ///
 /// If `ai.cadence.keys.userFingerprint` is unset, returns `None`.
 /// If set but keys are unavailable, returns `Unavailable` with a reason.
-fn resolve_encryption_method() -> Result<EncryptionMethod> {
+async fn resolve_encryption_method() -> Result<EncryptionMethod> {
     let Some(user_fingerprint) = pgp_keys::get_user_fingerprint()? else {
         return Ok(EncryptionMethod::None);
     };
 
-    let user_key = match pgp_keys::load_cached_user_public_key() {
+    let user_key = match pgp_keys::load_cached_user_public_key().await {
         Ok(Some(key)) => Some(key),
         Ok(None) => None,
         Err(e) => {
@@ -268,7 +267,7 @@ fn resolve_encryption_method() -> Result<EncryptionMethod> {
         }
     };
 
-    let api_key = match resolve_api_public_key_cache(false) {
+    let api_key = match resolve_api_public_key_cache(false).await {
         Ok(Some(key)) => Some(key),
         Ok(None) => None,
         Err(e) => {
@@ -333,25 +332,12 @@ fn api_url_override() -> Option<&'static str> {
     API_URL_OVERRIDE.get().map(String::as_str)
 }
 
-fn block_on_io<F>(fut: F) -> F::Output
-where
-    F: std::future::Future,
-{
-    if let Ok(handle) = Handle::try_current() {
-        tokio::task::block_in_place(|| handle.block_on(fut))
-    } else {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("failed to create Tokio runtime")
-            .block_on(fut)
-    }
-}
-
 /// Resolve the cached API public key, refreshing if needed.
-fn resolve_api_public_key_cache(force_refresh: bool) -> Result<Option<String>> {
-    let cached_key = pgp_keys::load_cached_api_public_key().unwrap_or(None);
-    let metadata = pgp_keys::load_api_public_key_metadata().unwrap_or(None);
+async fn resolve_api_public_key_cache(force_refresh: bool) -> Result<Option<String>> {
+    let cached_key = pgp_keys::load_cached_api_public_key().await.unwrap_or(None);
+    let metadata = pgp_keys::load_api_public_key_metadata()
+        .await
+        .unwrap_or(None);
 
     let stale = metadata
         .as_ref()
@@ -362,11 +348,13 @@ fn resolve_api_public_key_cache(force_refresh: bool) -> Result<Option<String>> {
         return Ok(cached_key);
     }
 
-    let cfg = config::CliConfig::load()?;
+    let cfg = config::CliConfig::load().await?;
     let resolved = cfg.resolve_api_url(api_url_override());
     let client = api_client::ApiClient::new(&resolved.url);
     let keys_url = format!("{}/api/keys/public", resolved.url.trim_end_matches('/'));
-    let api_key = block_on_io(client.get_api_public_key())
+    let api_key = client
+        .get_api_public_key()
+        .await
         .with_context(|| format!("failed to fetch API public key from {keys_url}"))?;
 
     let meta = pgp_keys::ApiPublicKeyMetadata {
@@ -376,7 +364,7 @@ fn resolve_api_public_key_cache(force_refresh: bool) -> Result<Option<String>> {
         rotated_at: api_key.rotated_at.clone(),
         version: api_key.version.clone(),
     };
-    pgp_keys::save_api_public_key_cache(&api_key.armored_public_key, &meta)?;
+    pgp_keys::save_api_public_key_cache(&api_key.armored_public_key, &meta).await?;
 
     if let Err(e) = git::config_set_global(pgp_keys::API_FINGERPRINT_KEY, &api_key.fingerprint) {
         output::note(&format!(
@@ -403,8 +391,8 @@ fn resolve_api_public_key_cache(force_refresh: bool) -> Result<Option<String>> {
 ///
 /// Errors at each step are reported but do not prevent subsequent steps
 /// from being attempted.
-fn run_install(org: Option<String>) -> Result<()> {
-    run_install_inner(org, None)
+async fn run_install(org: Option<String>) -> Result<()> {
+    run_install_inner(org, None).await
 }
 
 fn is_cadence_hook(content: &str) -> bool {
@@ -467,15 +455,15 @@ fn paths_equivalent(left: &Path, right: &Path) -> bool {
     left_norm == right_norm
 }
 
-fn cadence_hooks_installed(hooks_dir: &Path) -> (bool, bool) {
+async fn cadence_hooks_installed(hooks_dir: &Path) -> (bool, bool) {
     let post_path = hooks_dir.join("post-commit");
-    let post_installed = match std::fs::read_to_string(&post_path) {
+    let post_installed = match tokio::fs::read_to_string(&post_path).await {
         Ok(content) => is_cadence_hook(&content),
         Err(_) => false,
     };
 
     let pre_path = hooks_dir.join("pre-push");
-    let pre_installed = match std::fs::read_to_string(&pre_path) {
+    let pre_installed = match tokio::fs::read_to_string(&pre_path).await {
         Ok(content) => is_cadence_hook(&content),
         Err(_) => false,
     };
@@ -485,7 +473,10 @@ fn cadence_hooks_installed(hooks_dir: &Path) -> (bool, bool) {
 
 /// Inner implementation of install, accepting an optional home directory override
 /// for testability. If `home_override` is `None`, uses the real home directory.
-fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path>) -> Result<()> {
+async fn run_install_inner(
+    org: Option<String>,
+    home_override: Option<&std::path::Path>,
+) -> Result<()> {
     println!();
     output::action("Installing", "hooks");
     let install_start = std::time::Instant::now();
@@ -514,8 +505,8 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
     }
 
     // Step 2: Create ~/.git-hooks/ directory if missing
-    if !hooks_dir.exists() {
-        match std::fs::create_dir_all(&hooks_dir) {
+    if !tokio::fs::try_exists(&hooks_dir).await.unwrap_or(false) {
+        match tokio::fs::create_dir_all(&hooks_dir).await {
             Ok(()) => {
                 output::success("Created", &hooks_dir_str);
             }
@@ -536,8 +527,8 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
     let shim_content = post_commit_hook_content();
 
     // Check if hook already exists
-    let should_write = if shim_path.exists() {
-        match std::fs::read_to_string(&shim_path) {
+    let should_write = if tokio::fs::try_exists(&shim_path).await.unwrap_or(false) {
+        match tokio::fs::read_to_string(&shim_path).await {
             Ok(existing) => {
                 if is_cadence_hook(&existing) {
                     output::detail("Post-commit hook already installed; updating");
@@ -545,7 +536,7 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
                 } else {
                     // Back up the existing hook before overwriting
                     let backup_path = hooks_dir.join("post-commit.pre-cadence");
-                    match std::fs::copy(&shim_path, &backup_path) {
+                    match tokio::fs::copy(&shim_path, &backup_path).await {
                         Ok(_) => {
                             output::note(&format!(
                                 "Existing post-commit hook saved to {}",
@@ -575,7 +566,7 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
     };
 
     if should_write {
-        match std::fs::write(&shim_path, shim_content) {
+        match tokio::fs::write(&shim_path, shim_content).await {
             Ok(()) => {
                 output::success(
                     "Wrote",
@@ -587,7 +578,7 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
                 {
                     use std::os::unix::fs::PermissionsExt;
                     let perms = std::fs::Permissions::from_mode(0o755);
-                    match std::fs::set_permissions(&shim_path, perms) {
+                    match tokio::fs::set_permissions(&shim_path, perms).await {
                         Ok(()) => {
                             output::detail(&format!("Made {} executable", shim_path.display()));
                         }
@@ -615,15 +606,15 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
     let pre_push_path = hooks_dir.join("pre-push");
     let pre_push_content = pre_push_hook_content();
 
-    let should_write_pre_push = if pre_push_path.exists() {
-        match std::fs::read_to_string(&pre_push_path) {
+    let should_write_pre_push = if tokio::fs::try_exists(&pre_push_path).await.unwrap_or(false) {
+        match tokio::fs::read_to_string(&pre_push_path).await {
             Ok(existing) => {
                 if is_cadence_hook(&existing) {
                     output::detail("Pre-push hook already installed; updating");
                     true
                 } else {
                     let backup_path = hooks_dir.join("pre-push.pre-cadence");
-                    match std::fs::copy(&pre_push_path, &backup_path) {
+                    match tokio::fs::copy(&pre_push_path, &backup_path).await {
                         Ok(_) => {
                             output::note(&format!(
                                 "Existing pre-push hook saved to {}",
@@ -653,7 +644,7 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
     };
 
     if should_write_pre_push {
-        match std::fs::write(&pre_push_path, pre_push_content) {
+        match tokio::fs::write(&pre_push_path, pre_push_content).await {
             Ok(()) => {
                 output::success(
                     "Wrote",
@@ -664,7 +655,7 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
                 {
                     use std::os::unix::fs::PermissionsExt;
                     let perms = std::fs::Permissions::from_mode(0o755);
-                    match std::fs::set_permissions(&pre_push_path, perms) {
+                    match tokio::fs::set_permissions(&pre_push_path, perms).await {
                         Ok(()) => {
                             output::detail(&format!("Made {} executable", pre_push_path.display()));
                         }
@@ -703,13 +694,13 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
 
     // Step 5.5: Optional encryption setup
     println!();
-    if let Err(e) = run_install_encryption_setup() {
+    if let Err(e) = run_install_encryption_setup().await {
         output::fail("Install", &format!("stopped ({})", e));
         return Err(e);
     }
 
     // Step 5.6: Optional auto-update preference prompt
-    run_install_auto_update_prompt();
+    run_install_auto_update_prompt().await;
 
     println!();
     if had_errors {
@@ -725,8 +716,8 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
     Ok(())
 }
 
-fn run_login() -> Result<()> {
-    let mut cfg = config::CliConfig::load()?;
+async fn run_login() -> Result<()> {
+    let mut cfg = config::CliConfig::load().await?;
     let resolved = cfg.resolve_api_url(api_url_override());
     output::detail(&format!("Using API URL: {}", resolved.url));
     if resolved.is_non_https {
@@ -737,16 +728,14 @@ fn run_login() -> Result<()> {
     }
 
     output::action("Login", "opening browser for authentication");
-    let exchanged = block_on_io(login::login_via_browser(
-        &resolved.url,
-        Duration::from_secs(LOGIN_TIMEOUT_SECS),
-    ))?;
+    let exchanged =
+        login::login_via_browser(&resolved.url, Duration::from_secs(LOGIN_TIMEOUT_SECS)).await?;
 
     cfg.api_url = Some(resolved.url.clone());
     cfg.token = Some(exchanged.token.clone());
     cfg.github_login = Some(exchanged.login.clone());
     cfg.expires_at = Some(exchanged.expires_at.clone());
-    cfg.save()?;
+    cfg.save().await?;
 
     let keychain = keychain::KeyringStore::new(KEYCHAIN_SERVICE);
     if let Err(e) = keychain.set(KEYCHAIN_AUTH_TOKEN_ACCOUNT, &exchanged.token) {
@@ -760,13 +749,16 @@ fn run_login() -> Result<()> {
     Ok(())
 }
 
-fn run_logout() -> Result<()> {
-    let mut cfg = config::CliConfig::load()?;
+async fn run_logout() -> Result<()> {
+    let mut cfg = config::CliConfig::load().await?;
     let resolved = cfg.resolve_api_url(api_url_override());
 
     if let Some(token) = resolve_cli_auth_token(&cfg) {
         let client = api_client::ApiClient::new(&resolved.url);
-        match block_on_io(client.revoke_token(&token, Duration::from_secs(API_TIMEOUT_SECS))) {
+        match client
+            .revoke_token(&token, Duration::from_secs(API_TIMEOUT_SECS))
+            .await
+        {
             Ok(()) => output::detail("Revoked token on server."),
             Err(api_client::AuthenticatedRequestError::Unauthorized) => {
                 output::note("Token was already invalid or expired.");
@@ -784,7 +776,7 @@ fn run_logout() -> Result<()> {
         output::note(&format!("Could not clear OS keychain token: {e}"));
     }
 
-    cfg.clear_token()?;
+    cfg.clear_token().await?;
     output::success("Logout", "authentication cleared");
     Ok(())
 }
@@ -805,8 +797,8 @@ fn resolve_cli_auth_token(cfg: &config::CliConfig) -> Option<String> {
     }
 }
 
-fn report_backfill_completion(window_days: i32, stats: BackfillSyncStats) {
-    let cfg = match config::CliConfig::load() {
+async fn report_backfill_completion(window_days: i32, stats: BackfillSyncStats) {
+    let cfg = match config::CliConfig::load().await {
         Ok(cfg) => cfg,
         Err(_) => return,
     };
@@ -834,11 +826,10 @@ fn report_backfill_completion(window_days: i32, stats: BackfillSyncStats) {
         cli_version: env!("CARGO_PKG_VERSION").to_string(),
     };
 
-    match block_on_io(client.report_backfill_complete(
-        &token,
-        &request,
-        Duration::from_secs(API_TIMEOUT_SECS),
-    )) {
+    match client
+        .report_backfill_complete(&token, &request, Duration::from_secs(API_TIMEOUT_SECS))
+        .await
+    {
         Ok(response) => {
             if response.recorded {
                 output::detail(&format!(
@@ -877,11 +868,9 @@ fn report_backfill_completion(window_days: i32, stats: BackfillSyncStats) {
 /// The outer wrapper uses `std::panic::catch_unwind` to catch panics, and
 /// pattern-matches on `HookError` to distinguish commit-blocking
 /// failures from soft failures that should be swallowed.
-fn run_hook_post_commit() -> Result<()> {
+async fn run_hook_post_commit() -> Result<()> {
     // Catch-all: catch panics
-    let result = std::panic::catch_unwind(|| -> std::result::Result<(), HookError> {
-        hook_post_commit_inner()
-    });
+    let result = tokio::spawn(async { hook_post_commit_inner().await }).await;
 
     let final_result = match result {
         Ok(Ok(())) => Ok(()),
@@ -893,8 +882,12 @@ fn run_hook_post_commit() -> Result<()> {
             output::note(&format!("Hook issue: {}", e));
             Ok(())
         }
-        Err(_) => {
-            output::note("Hook panicked (please report this issue)");
+        Err(e) => {
+            if e.is_panic() {
+                output::note("Hook panicked (please report this issue)");
+            } else {
+                output::note(&format!("Hook task failed: {}", e));
+            }
             Ok(())
         }
     };
@@ -904,17 +897,20 @@ fn run_hook_post_commit() -> Result<()> {
 }
 
 /// The pre-push hook handler. Must never block the push.
-fn run_hook_pre_push(remote: &str, url: &str) -> Result<()> {
+async fn run_hook_pre_push(remote: &str, url: &str) -> Result<()> {
     let remote = remote.to_string();
     let url = url.to_string();
-    let result = std::panic::catch_unwind(|| -> Result<()> { hook_pre_push_inner(&remote, &url) });
+    let result = tokio::spawn(async move { hook_pre_push_inner(&remote, &url).await }).await;
 
     match result {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
             output::note(&format!("Hook issue: {}", e));
         }
-        Err(_) => {
+        Err(e) => {
+            if !e.is_panic() {
+                output::note(&format!("Hook task failed: {}", e));
+            }
             output::note("Hook panicked (please report this issue)");
         }
     }
@@ -928,7 +924,7 @@ fn run_hook_pre_push(remote: &str, url: &str) -> Result<()> {
 /// Returns `HookError::EncryptionFailed` if encryption is configured but
 /// fails — this is the only case where the hook blocks the commit. All other
 /// errors are wrapped in `HookError::Soft` and swallowed by the caller.
-fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
+async fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
     // Step 0: Per-repo enabled check — if disabled, skip EVERYTHING
     if !git::check_enabled() {
         return Ok(());
@@ -946,18 +942,20 @@ fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
     }
 
     // Step 1.5: Resolve encryption method once for this invocation
-    let encryption_method = resolve_encryption_method().map_err(|e| {
+    let encryption_method = resolve_encryption_method().await.map_err(|e| {
         // Config read failure is a soft error — don't block commit
         HookError::Soft(e)
     })?;
 
     let storing_progress = hook_status_spinner_start("Storing AI sessions");
-    let scanned = match block_on_io(ingest_recent_sessions_for_repo(
+    let scanned = match ingest_recent_sessions_for_repo(
         &repo_root,
         &repo_root_str,
         POST_COMMIT_MATCH_WINDOW_SECS,
         &encryption_method,
-    )) {
+    )
+    .await
+    {
         Ok(scanned) => {
             hook_status_spinner_finish_ok(storing_progress, "Storing AI sessions");
             scanned
@@ -979,7 +977,7 @@ fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
 }
 
 /// Inner implementation of the pre-push hook.
-fn hook_pre_push_inner(remote: &str, _url: &str) -> Result<()> {
+async fn hook_pre_push_inner(remote: &str, _url: &str) -> Result<()> {
     if !git::check_enabled() {
         return Ok(());
     }
@@ -988,12 +986,12 @@ fn hook_pre_push_inner(remote: &str, _url: &str) -> Result<()> {
         let repo_root = git::repo_root()?;
         let repo_root_str = repo_root.to_string_lossy().to_string();
         let encryption_method = resolve_encryption_method()
+            .await
             .unwrap_or_else(|e| EncryptionMethod::Unavailable(format!("{e}")));
-        if let Err(e) = block_on_io(ingest_incremental_sessions_for_repo(
-            &repo_root,
-            &repo_root_str,
-            &encryption_method,
-        )) {
+        if let Err(e) =
+            ingest_incremental_sessions_for_repo(&repo_root, &repo_root_str, &encryption_method)
+                .await
+        {
             output::note(&format!("Pre-push ingest issue: {}", e));
         }
         let pushing_progress = hook_status_spinner_start("Pushing AI sessions");
@@ -1266,13 +1264,11 @@ async fn ingest_recent_sessions_for_repo(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
-    let files = tokio::task::spawn_blocking(move || agents::all_recent_files(now, since_secs))
-        .await
-        .context("failed to scan recent files for post-commit ingest")?;
+    let files = agents::all_recent_files(now, since_secs).await;
     let mut ingested = 0usize;
 
     for file in files {
-        let metadata = scanner::parse_session_metadata(&file);
+        let metadata = scanner::parse_session_metadata(&file).await;
         let Some(cwd) = metadata.cwd else {
             continue;
         };
@@ -1292,8 +1288,8 @@ async fn ingest_recent_sessions_for_repo(
             .agent_type
             .clone()
             .unwrap_or(scanner::AgentType::Claude);
-        let session_start = scanner::session_time_range(&file).map(|(start, _)| start);
-        let observed_commits = scanner::extract_commit_hashes(&file);
+        let session_start = scanner::session_time_range(&file).await.map(|(start, _)| start);
+        let observed_commits = scanner::extract_commit_hashes(&file).await;
         let explicit_branch_keys = branch_keys_for_repo_and_commits(repo_root, &observed_commits);
         let session_log = match tokio::fs::read_to_string(&file).await {
             Ok(content) => content,
@@ -1384,9 +1380,7 @@ async fn ingest_incremental_sessions_for_repo(
     let fallback_since = now - 30 * 86_400;
     let min_cursor = cursor_values.into_iter().min().unwrap_or(fallback_since);
     let since_secs = (now - min_cursor).max(0);
-    let files = tokio::task::spawn_blocking(move || agents::all_recent_files(now, since_secs))
-        .await
-        .context("failed to scan recent files for pre-push incremental ingest")?;
+    let files = agents::all_recent_files(now, since_secs).await;
 
     let mut ingested = 0usize;
     let mut max_mtime = min_cursor;
@@ -1401,7 +1395,7 @@ async fn ingest_incremental_sessions_for_repo(
             max_mtime = mtime;
         }
 
-        let metadata = scanner::parse_session_metadata(&file);
+        let metadata = scanner::parse_session_metadata(&file).await;
         let Some(cwd) = metadata.cwd else {
             continue;
         };
@@ -1421,9 +1415,9 @@ async fn ingest_incremental_sessions_for_repo(
             .agent_type
             .clone()
             .unwrap_or(scanner::AgentType::Claude);
-        let observed_commits = scanner::extract_commit_hashes(&file);
+        let observed_commits = scanner::extract_commit_hashes(&file).await;
         let explicit_branch_keys = branch_keys_for_repo_and_commits(repo_root, &observed_commits);
-        let session_start = scanner::session_time_range(&file).map(|(start, _)| start);
+        let session_start = scanner::session_time_range(&file).await.map(|(start, _)| start);
         let session_log = match tokio::fs::read_to_string(&file).await {
             Ok(content) => content,
             Err(_) => continue,
@@ -1583,7 +1577,7 @@ fn backfill_repo_concurrency() -> usize {
         .unwrap_or(adaptive)
 }
 
-fn process_repo_backfill(
+async fn process_repo_backfill(
     repo_display: String,
     sessions: Vec<SessionInfo>,
     encryption_method: EncryptionMethod,
@@ -1749,7 +1743,7 @@ fn process_repo_backfill(
             }),
         );
 
-        let session_log = match std::fs::read_to_string(&session.file) {
+        let session_log = match tokio::fs::read_to_string(&session.file).await {
             Ok(content) => content,
             Err(e) => {
                 stats.errors += 1;
@@ -1771,7 +1765,7 @@ fn process_repo_backfill(
             }
         };
         let repo_str = session.repo_root.to_string_lossy().to_string();
-        let session_start = scanner::session_time_range(&session.file).map(|(start, _)| start);
+        let session_start = scanner::session_time_range(&session.file).await.map(|(start, _)| start);
 
         let branch_keys = branch_keys_for_repo_and_commits(&session.repo_root, &commit_hashes);
         match ingest_session_from_log(
@@ -1876,7 +1870,7 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
         .unwrap_or_default()
         .as_secs() as i64;
 
-    let backfill_logger = match backfill_log::BackfillLogger::new() {
+    let backfill_logger = match backfill_log::BackfillLogger::new().await {
         Ok(logger) => {
             if let Some(path) = logger.path() {
                 output::detail(&format!("Backfill diagnostics: {}", path.display()));
@@ -1890,7 +1884,7 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
     };
 
     // Resolve encryption method once for this backfill run
-    let encryption_method = match resolve_encryption_method() {
+    let encryption_method = match resolve_encryption_method().await {
         Ok(method) => method,
         Err(e) => EncryptionMethod::Unavailable(format!("{e}")),
     };
@@ -1932,20 +1926,7 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
             "since_secs": since_secs,
         }),
     );
-    let files = match tokio::task::spawn_blocking(move || agents::all_recent_files(now, since_secs))
-        .await
-    {
-        Ok(files) => files,
-        Err(e) => {
-            backfill_logger.event(
-                "scan_recent_files_error",
-                serde_json::json!({
-                    "error": e.to_string(),
-                }),
-            );
-            return Err(e).context("failed to scan recent files");
-        }
-    };
+    let files = agents::all_recent_files(now, since_secs).await;
     if let Some(pb) = spinner {
         pb.finish_and_clear();
     }
@@ -2000,7 +1981,7 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
 
     for file in &files {
         let file_path = file.to_string_lossy().to_string();
-        let metadata = scanner::parse_session_metadata(file);
+        let metadata = scanner::parse_session_metadata(file).await;
 
         // Skip files with no session metadata (e.g., file-history-snapshot files)
         if metadata.session_id.is_none() && metadata.cwd.is_none() {
@@ -2120,7 +2101,7 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
             resolved
         };
 
-        let commit_hashes = scanner::extract_commit_hashes(file);
+        let commit_hashes = scanner::extract_commit_hashes(file).await;
         let agent_label = metadata
             .agent_type
             .clone()
@@ -2221,7 +2202,7 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
         let backfill_logger = backfill_logger.clone();
         join_set.spawn(async move {
             let _permit = permit;
-            tokio::task::spawn_blocking(move || {
+            Ok::<RepoBackfillStats, tokio::task::JoinError>(
                 process_repo_backfill(
                     repo_display,
                     sessions,
@@ -2229,8 +2210,8 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
                     per_repo_bar,
                     backfill_logger,
                 )
-            })
-            .await
+                .await,
+            )
         });
     }
 
@@ -2297,7 +2278,8 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
             issues,
             repos_scanned: total_repos as i32,
         },
-    );
+    )
+    .await;
     backfill_logger.event(
         "backfill_completed",
         serde_json::json!({
@@ -2502,7 +2484,7 @@ fn jsonl_prompt_excerpt(text: &str, max_chars: usize) -> Option<String> {
     latest_prompt
 }
 
-fn load_decrypted_session_blob(blob: &[u8]) -> Option<Vec<u8>> {
+async fn load_decrypted_session_blob(blob: &[u8]) -> Option<Vec<u8>> {
     if serde_json::from_slice::<note::SessionEnvelope>(blob).is_ok() {
         return Some(blob.to_vec());
     }
@@ -2513,7 +2495,10 @@ fn load_decrypted_session_blob(blob: &[u8]) -> Option<Vec<u8>> {
         return Some(decoded);
     }
 
-    let private_key = pgp_keys::load_cached_user_private_key().ok().flatten()?;
+    let private_key = pgp_keys::load_cached_user_private_key()
+        .await
+        .ok()
+        .flatten()?;
     let fingerprint = pgp_keys::get_user_fingerprint().ok().flatten()?;
     let keychain = keychain::KeyringStore::new(KEYCHAIN_SERVICE);
     let passphrase = keychain.get(&fingerprint).ok().flatten()?;
@@ -2531,7 +2516,7 @@ fn load_decrypted_session_blob(blob: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-fn build_local_session_labels_for_repo(
+async fn build_local_session_labels_for_repo(
     repo: &std::path::Path,
 ) -> std::collections::HashMap<String, String> {
     let now = std::time::SystemTime::now()
@@ -2539,8 +2524,8 @@ fn build_local_session_labels_for_repo(
         .unwrap_or_default()
         .as_secs() as i64;
     let mut labels = std::collections::HashMap::new();
-    for file in agents::all_recent_files(now, 90 * 86_400) {
-        let metadata = scanner::parse_session_metadata(&file);
+    for file in agents::all_recent_files(now, 90 * 86_400).await {
+        let metadata = scanner::parse_session_metadata(&file).await;
         let Some(cwd) = metadata.cwd else {
             continue;
         };
@@ -2550,13 +2535,13 @@ fn build_local_session_labels_for_repo(
         if file_repo_root != repo {
             continue;
         }
-        let session_log = match std::fs::read_to_string(&file) {
+        let session_log = match tokio::fs::read_to_string(&file).await {
             Ok(content) => content,
             Err(_) => continue,
         };
         let session_id = metadata.session_id.as_deref().unwrap_or("unknown");
         let agent = metadata.agent_type.unwrap_or(scanner::AgentType::Claude);
-        let session_start = scanner::session_time_range(&file).map(|(start, _)| start);
+        let session_start = scanner::session_time_range(&file).await.map(|(start, _)| start);
         let content_sha256 = note::content_sha256(&session_log);
         let session_uid = note::compute_session_uid(
             &agent,
@@ -2574,7 +2559,7 @@ fn build_local_session_labels_for_repo(
     labels
 }
 
-fn session_display_label(
+async fn session_display_label(
     repo: &std::path::Path,
     entry: &note::IndexEntry,
     local_labels: &std::collections::HashMap<String, String>,
@@ -2587,7 +2572,7 @@ fn session_display_label(
         Ok(data) => data,
         Err(_) => return fallback,
     };
-    let decoded_blob = match load_decrypted_session_blob(&blob) {
+    let decoded_blob = match load_decrypted_session_blob(&blob).await {
         Some(data) => data,
         None => return fallback,
     };
@@ -2611,14 +2596,14 @@ fn session_display_label(
     fallback
 }
 
-fn discovered_repos_for_sessions() -> Vec<std::path::PathBuf> {
+async fn discovered_repos_for_sessions() -> Vec<std::path::PathBuf> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
     let mut repos = std::collections::BTreeSet::new();
-    for file in agents::all_recent_files(now, 90 * 86_400) {
-        let metadata = scanner::parse_session_metadata(&file);
+    for file in agents::all_recent_files(now, 90 * 86_400).await {
+        let metadata = scanner::parse_session_metadata(&file).await;
         let Some(cwd) = metadata.cwd else {
             continue;
         };
@@ -2630,7 +2615,7 @@ fn discovered_repos_for_sessions() -> Vec<std::path::PathBuf> {
     repos.into_iter().collect()
 }
 
-fn print_sessions_for_repo(repo: &std::path::Path) -> Result<()> {
+async fn print_sessions_for_repo(repo: &std::path::Path) -> Result<()> {
     let repo_str = repo.to_string_lossy();
     let branch_key_hash = note::hash_key(&branch_key_for_repo(repo));
     let committer_hash = committer_key_hash_for_repo(repo);
@@ -2644,12 +2629,12 @@ fn print_sessions_for_repo(repo: &std::path::Path) -> Result<()> {
         list_index_entries_for_key(repo, git::SESSION_INDEX_COMMITTER_REF, &committer_hash)?;
     user_entries.sort_by(|a, b| b.session_start.cmp(&a.session_start));
     user_entries.dedup_by(|a, b| a.session_uid == b.session_uid);
-    let local_labels = build_local_session_labels_for_repo(repo);
+    let local_labels = build_local_session_labels_for_repo(repo).await;
 
     output::action("Repo", &repo_str);
     output::detail("Branch sessions:");
     for entry in branch_entries.iter().take(10) {
-        let label = session_display_label(repo, entry, &local_labels);
+        let label = session_display_label(repo, entry, &local_labels).await;
         output::detail(&format!(
             "  {} {} {}",
             entry.session_start.unwrap_or_default(),
@@ -2664,7 +2649,7 @@ fn print_sessions_for_repo(repo: &std::path::Path) -> Result<()> {
         user_entries.len()
     ));
     for entry in user_entries.iter().take(shown) {
-        let label = session_display_label(repo, entry, &local_labels);
+        let label = session_display_label(repo, entry, &local_labels).await;
         output::detail(&format!(
             "  {} {} {}",
             entry.session_start.unwrap_or_default(),
@@ -2675,30 +2660,30 @@ fn print_sessions_for_repo(repo: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn run_sessions_list(all: bool) -> Result<()> {
+async fn run_sessions_list(all: bool) -> Result<()> {
     if all {
-        let repos = discovered_repos_for_sessions();
+        let repos = discovered_repos_for_sessions().await;
         if repos.is_empty() {
             output::note("No repositories discovered from recent sessions.");
             return Ok(());
         }
         for repo in repos {
-            let _ = print_sessions_for_repo(&repo);
+            let _ = print_sessions_for_repo(&repo).await;
         }
         return Ok(());
     }
 
     let repo = git::repo_root()
         .map_err(|_| anyhow::anyhow!("not in a git repository. Use `cadence sessions --all`."))?;
-    print_sessions_for_repo(&repo)
+    print_sessions_for_repo(&repo).await
 }
 
-fn load_session_envelope_for_entry(
+async fn load_session_envelope_for_entry(
     repo: &std::path::Path,
     entry: &note::IndexEntry,
 ) -> Option<note::SessionEnvelope> {
     let blob = git::read_blob_at(Some(repo), &entry.session_blob_sha).ok()?;
-    let decoded = load_decrypted_session_blob(&blob)?;
+    let decoded = load_decrypted_session_blob(&blob).await?;
     serde_json::from_slice::<note::SessionEnvelope>(&decoded).ok()
 }
 
@@ -2714,11 +2699,11 @@ fn repo_local_branches(repo: &std::path::Path) -> Vec<String> {
     branches
 }
 
-fn sessions_audit_repo(repo: &std::path::Path, show_ok: bool) -> Result<()> {
+async fn sessions_audit_repo(repo: &std::path::Path, show_ok: bool) -> Result<()> {
     let repo_label = repo.to_string_lossy().to_string();
     let remote = git::resolve_push_remote_at(repo)?.unwrap_or_else(|| "origin".to_string());
     let branches = repo_local_branches(repo);
-    let local_labels = build_local_session_labels_for_repo(repo);
+    let local_labels = build_local_session_labels_for_repo(repo).await;
     let mut contains_cache: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
 
@@ -2753,8 +2738,9 @@ fn sessions_audit_repo(repo: &std::path::Path, show_ok: bool) -> Result<()> {
         ));
         for entry in entries {
             total_sessions += 1;
-            let label = session_display_label(repo, &entry, &local_labels);
+            let label = session_display_label(repo, &entry, &local_labels).await;
             let observed_commits = load_session_envelope_for_entry(repo, &entry)
+                .await
                 .map(|env| env.record.observed_commits)
                 .unwrap_or_default();
 
@@ -2835,27 +2821,27 @@ fn sessions_audit_repo(repo: &std::path::Path, show_ok: bool) -> Result<()> {
     Ok(())
 }
 
-fn run_sessions_audit(all: bool, show_ok: bool) -> Result<()> {
+async fn run_sessions_audit(all: bool, show_ok: bool) -> Result<()> {
     if all {
-        let repos = discovered_repos_for_sessions();
+        let repos = discovered_repos_for_sessions().await;
         if repos.is_empty() {
             output::note("No repositories discovered from recent sessions.");
             return Ok(());
         }
         for repo in repos {
-            let _ = sessions_audit_repo(&repo, show_ok);
+            let _ = sessions_audit_repo(&repo, show_ok).await;
         }
         return Ok(());
     }
     let repo = git::repo_root().map_err(|_| {
         anyhow::anyhow!("not in a git repository. Use `cadence sessions audit --all`.")
     })?;
-    sessions_audit_repo(&repo, show_ok)
+    sessions_audit_repo(&repo, show_ok).await
 }
 
-fn run_sessions_inspect(query: &str, all: bool) -> Result<()> {
+async fn run_sessions_inspect(query: &str, all: bool) -> Result<()> {
     let repos = if all {
-        discovered_repos_for_sessions()
+        discovered_repos_for_sessions().await
     } else {
         vec![git::repo_root().map_err(|_| {
             anyhow::anyhow!(
@@ -2871,7 +2857,7 @@ fn run_sessions_inspect(query: &str, all: bool) -> Result<()> {
     let query_lc = query.to_ascii_lowercase();
     let mut matches = 0usize;
     for repo in repos {
-        let local_labels = build_local_session_labels_for_repo(&repo);
+        let local_labels = build_local_session_labels_for_repo(&repo).await;
         let committer_hash = committer_key_hash_for_repo(&repo);
         let mut user_entries =
             list_index_entries_for_key(&repo, git::SESSION_INDEX_COMMITTER_REF, &committer_hash)?;
@@ -2882,12 +2868,12 @@ fn run_sessions_inspect(query: &str, all: bool) -> Result<()> {
         let branches = repo_local_branches(&repo);
 
         for entry in user_entries {
-            let envelope = load_session_envelope_for_entry(&repo, &entry);
+            let envelope = load_session_envelope_for_entry(&repo, &entry).await;
             let session_id = envelope
                 .as_ref()
                 .map(|e| e.record.session_id.as_str())
                 .unwrap_or("");
-            let label = session_display_label(&repo, &entry, &local_labels);
+            let label = session_display_label(&repo, &entry, &local_labels).await;
             let matches_query = entry.session_uid.starts_with(query)
                 || session_id.to_ascii_lowercase().contains(&query_lc)
                 || label.to_ascii_lowercase().contains(&query_lc);
@@ -2935,12 +2921,12 @@ fn run_sessions_inspect(query: &str, all: bool) -> Result<()> {
     Ok(())
 }
 
-fn run_sessions(command: Option<SessionsCommand>, all: bool) -> Result<()> {
+async fn run_sessions(command: Option<SessionsCommand>, all: bool) -> Result<()> {
     match command {
-        None => run_sessions_list(all),
-        Some(SessionsCommand::List { all }) => run_sessions_list(all),
-        Some(SessionsCommand::Audit { all, show_ok }) => run_sessions_audit(all, show_ok),
-        Some(SessionsCommand::Inspect { query, all }) => run_sessions_inspect(&query, all),
+        None => run_sessions_list(all).await,
+        Some(SessionsCommand::List { all }) => run_sessions_list(all).await,
+        Some(SessionsCommand::Audit { all, show_ok }) => run_sessions_audit(all, show_ok).await,
+        Some(SessionsCommand::Inspect { query, all }) => run_sessions_inspect(&query, all).await,
     }
 }
 
@@ -2955,11 +2941,11 @@ fn run_sessions(command: Option<SessionsCommand>, all: bool) -> Result<()> {
 ///
 /// All output is user-facing and written to stderr.
 /// Handles being called outside a git repo gracefully.
-fn run_status() -> Result<()> {
-    run_status_inner(&mut std::io::stderr())
+async fn run_status() -> Result<()> {
+    run_status_inner(&mut std::io::stderr()).await
 }
 
-fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
+async fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
     output::action_to_with_tty(w, "Status", "", false);
 
     // --- Repo root ---
@@ -2980,7 +2966,7 @@ fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
         match git::config_get_at(root, "core.hooksPath").ok().flatten() {
             Some(path) => {
                 let hooks_dir = resolve_hooks_path(Some(root), &path);
-                let (post_installed, pre_installed) = cadence_hooks_installed(&hooks_dir);
+                let (post_installed, pre_installed) = cadence_hooks_installed(&hooks_dir).await;
                 let post_str = if post_installed { "yes" } else { "no" };
                 let pre_str = if pre_installed { "yes" } else { "no" };
                 output::detail_to_with_tty(
@@ -3028,7 +3014,7 @@ fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
         }
     } else if let Some(path) = global_hooks_path {
         let hooks_dir = resolve_hooks_path(None, &path);
-        let (post_installed, pre_installed) = cadence_hooks_installed(&hooks_dir);
+        let (post_installed, pre_installed) = cadence_hooks_installed(&hooks_dir).await;
         let post_str = if post_installed { "yes" } else { "no" };
         let pre_str = if pre_installed { "yes" } else { "no" };
         output::detail_to_with_tty(
@@ -3086,11 +3072,11 @@ fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
     Ok(())
 }
 
-fn run_doctor() -> Result<()> {
-    run_doctor_inner(&mut std::io::stderr())
+async fn run_doctor() -> Result<()> {
+    run_doctor_inner(&mut std::io::stderr()).await
 }
 
-fn run_doctor_inner(w: &mut dyn std::io::Write) -> Result<()> {
+async fn run_doctor_inner(w: &mut dyn std::io::Write) -> Result<()> {
     output::action_to_with_tty(w, "Doctor", "", false);
 
     let mut issues = 0usize;
@@ -3123,7 +3109,7 @@ fn run_doctor_inner(w: &mut dyn std::io::Write) -> Result<()> {
     match &global_hooks_path {
         Some(path) => {
             let hooks_dir = resolve_hooks_path(repo_root.as_deref(), path);
-            let (post_installed, pre_installed) = cadence_hooks_installed(&hooks_dir);
+            let (post_installed, pre_installed) = cadence_hooks_installed(&hooks_dir).await;
             output::detail_to_with_tty(
                 w,
                 &format!(
@@ -3156,7 +3142,7 @@ fn run_doctor_inner(w: &mut dyn std::io::Write) -> Result<()> {
         match git::config_get_at(root, "core.hooksPath") {
             Ok(Some(active_path)) => {
                 let hooks_dir = resolve_hooks_path(Some(root), &active_path);
-                let (post_installed, pre_installed) = cadence_hooks_installed(&hooks_dir);
+                let (post_installed, pre_installed) = cadence_hooks_installed(&hooks_dir).await;
                 output::detail_to_with_tty(
                     w,
                     &format!(
@@ -3271,24 +3257,30 @@ struct KeysStatusReport {
 }
 
 impl KeysStatusReport {
-    fn collect() -> Self {
+    async fn collect() -> Self {
         let (user_fingerprint, user_fingerprint_error) = match pgp_keys::get_user_fingerprint() {
             Ok(v) => (v, None),
             Err(e) => (None, Some(format!("{}", e))),
         };
         let user_public_key_cached = pgp_keys::load_cached_user_public_key()
+            .await
             .ok()
             .flatten()
             .is_some();
         let user_private_key_cached = pgp_keys::load_cached_user_private_key()
+            .await
             .ok()
             .flatten()
             .is_some();
         let api_public_key_cached = pgp_keys::load_cached_api_public_key()
+            .await
             .ok()
             .flatten()
             .is_some();
-        let api_metadata = pgp_keys::load_api_public_key_metadata().ok().flatten();
+        let api_metadata = pgp_keys::load_api_public_key_metadata()
+            .await
+            .ok()
+            .flatten();
 
         KeysStatusReport {
             user_fingerprint,
@@ -3426,41 +3418,41 @@ fn render_keys_status(
     Ok(())
 }
 
-fn run_keys_status() -> Result<()> {
-    let report = KeysStatusReport::collect();
+async fn run_keys_status() -> Result<()> {
+    let report = KeysStatusReport::collect().await;
     let _ = render_keys_status(&mut std::io::stdout(), &report);
     Ok(())
 }
 
-fn run_keys_setup() -> Result<()> {
+async fn run_keys_setup() -> Result<()> {
     if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
         anyhow::bail!("cadence keys setup requires an interactive TTY. Run from a terminal.");
     }
     let mut prompter = DialoguerPrompter::new();
-    run_keys_setup_inner(&mut prompter, &mut std::io::stdout(), true)
+    run_keys_setup_inner(&mut prompter, &mut std::io::stdout(), true).await
 }
 
-fn run_keys_refresh() -> Result<()> {
-    let _ = resolve_api_public_key_cache(true)?;
+async fn run_keys_refresh() -> Result<()> {
+    let _ = resolve_api_public_key_cache(true).await?;
     output::success("API", "public key refreshed.");
     Ok(())
 }
 
-fn run_keys_disable() -> Result<()> {
+async fn run_keys_disable() -> Result<()> {
     let _ = git::config_unset_global(pgp_keys::USER_FINGERPRINT_KEY);
     let _ = git::config_unset_global(pgp_keys::API_FINGERPRINT_KEY);
 
     if let Some(path) = pgp_keys::user_public_key_cache_path() {
-        let _ = std::fs::remove_file(path);
+        let _ = tokio::fs::remove_file(path).await;
     }
     if let Some(path) = pgp_keys::user_private_key_cache_path() {
-        let _ = std::fs::remove_file(path);
+        let _ = tokio::fs::remove_file(path).await;
     }
     if let Some(path) = pgp_keys::api_public_key_cache_path() {
-        let _ = std::fs::remove_file(path);
+        let _ = tokio::fs::remove_file(path).await;
     }
     if let Some(path) = pgp_keys::api_public_key_meta_path() {
-        let _ = std::fs::remove_file(path);
+        let _ = tokio::fs::remove_file(path).await;
     }
 
     output::success("Encryption", "disabled.");
@@ -3469,7 +3461,7 @@ fn run_keys_disable() -> Result<()> {
 
 /// Optional encryption setup during install. Returns `Ok(())` if setup was
 /// skipped or completed, and `Err` if install should abort before backfill.
-fn run_install_encryption_setup() -> Result<()> {
+async fn run_install_encryption_setup() -> Result<()> {
     if !output::is_stderr_tty() || !Term::stdout().is_term() {
         return Ok(());
     }
@@ -3501,7 +3493,7 @@ fn run_install_encryption_setup() -> Result<()> {
         return Ok(());
     }
 
-    if let Err(e) = run_keys_setup_inner(&mut prompter, &mut stdout, false) {
+    if let Err(e) = run_keys_setup_inner(&mut prompter, &mut stdout, false).await {
         output::note_to_with_tty(
             &mut stdout,
             &format!("Encryption setup incomplete: {e:#}"),
@@ -3535,8 +3527,8 @@ fn run_install_encryption_setup() -> Result<()> {
 ///
 /// This is non-critical: failures are logged but never abort install.
 /// Skipped silently if stdin is not a TTY or auto_update is already configured.
-fn run_install_auto_update_prompt() {
-    let cfg = match config::CliConfig::load() {
+async fn run_install_auto_update_prompt() {
+    let cfg = match config::CliConfig::load().await {
         Ok(c) => c,
         Err(_) => return,
     };
@@ -3545,13 +3537,13 @@ fn run_install_auto_update_prompt() {
         None => return,
     };
     let mut prompter = DialoguerPrompter::new();
-    run_install_auto_update_prompt_inner(&mut prompter, &cfg, &config_path);
+    run_install_auto_update_prompt_inner(&mut prompter, &cfg, &config_path).await;
 }
 
 /// Testable inner implementation of the auto-update prompt.
 ///
 /// Accepts injectable prompter and config path for testing.
-fn run_install_auto_update_prompt_inner(
+async fn run_install_auto_update_prompt_inner(
     prompter: &mut dyn Prompter,
     cfg: &config::CliConfig,
     config_path: &std::path::Path,
@@ -3582,10 +3574,13 @@ fn run_install_auto_update_prompt_inner(
         Ok(Some(enabled)) => {
             let value = if enabled { "true" } else { "false" };
             let mut cfg = cfg.clone();
-            if let Err(e) = cfg
-                .set_key(config::ConfigKey::AutoUpdate, value)
-                .and_then(|()| cfg.save_to(config_path))
-            {
+            if let Err(e) = cfg.set_key(config::ConfigKey::AutoUpdate, value) {
+                output::note_to_with_tty(
+                    &mut stdout,
+                    &format!("Could not save auto-update preference: {e}"),
+                    is_tty,
+                );
+            } else if let Err(e) = cfg.save_to(config_path).await {
                 output::note_to_with_tty(
                     &mut stdout,
                     &format!("Could not save auto-update preference: {e}"),
@@ -3683,7 +3678,7 @@ fn generate_passphrase() -> String {
 // ---------------------------------------------------------------------------
 
 /// Inner implementation of `keys setup` that accepts injectable I/O.
-fn run_keys_setup_inner(
+async fn run_keys_setup_inner(
     prompter: &mut dyn Prompter,
     writer: &mut dyn std::io::Write,
     show_intro: bool,
@@ -3706,11 +3701,13 @@ fn run_keys_setup_inner(
     output::detail_to_with_tty(writer, &format!("Using Git identity: {identity}"), is_tty);
 
     let cached_public = pgp_keys::load_cached_user_public_key()
+        .await
         .context("failed to read cached local public key")?;
     let cached_private = pgp_keys::load_cached_user_private_key()
+        .await
         .context("failed to read cached local private key")?;
 
-    if resolve_api_public_key_cache(true)?.is_none() {
+    if resolve_api_public_key_cache(true).await?.is_none() {
         anyhow::bail!("failed to fetch API public key");
     }
 
@@ -3748,6 +3745,7 @@ fn run_keys_setup_inner(
             .context("failed to store passphrase in OS keychain")?;
 
         pgp_keys::save_user_keys(&armored_public_key, &armored_private_key)
+            .await
             .context("failed to cache local keys")?;
 
         fingerprint
@@ -3770,26 +3768,26 @@ fn run_keys_setup_inner(
 // ---------------------------------------------------------------------------
 
 /// Set a configuration value and persist to disk.
-fn run_config_set(key_str: &str, value: &str) -> Result<()> {
+async fn run_config_set(key_str: &str, value: &str) -> Result<()> {
     let key: config::ConfigKey = key_str.parse()?;
-    let mut cfg = config::CliConfig::load()?;
+    let mut cfg = config::CliConfig::load().await?;
     cfg.set_key(key, value)?;
-    cfg.save()?;
+    cfg.save().await?;
     output::success("Set", &format!("{} = {}", key.name(), cfg.get_key(key)));
     Ok(())
 }
 
 /// Print a single configuration value to stdout (machine-readable).
-fn run_config_get(key_str: &str) -> Result<()> {
+async fn run_config_get(key_str: &str) -> Result<()> {
     let key: config::ConfigKey = key_str.parse()?;
-    let cfg = config::CliConfig::load()?;
+    let cfg = config::CliConfig::load().await?;
     println!("{}", cfg.get_key(key));
     Ok(())
 }
 
 /// List all user-settable configuration keys with their current values.
-fn run_config_list() -> Result<()> {
-    let cfg = config::CliConfig::load()?;
+async fn run_config_list() -> Result<()> {
+    let cfg = config::CliConfig::load().await?;
     for key in config::ALL_CONFIG_KEYS {
         let value = cfg.get_key(*key);
         println!("{} = {}", key.name(), value);
@@ -3804,8 +3802,8 @@ fn run_config_list() -> Result<()> {
 ///
 /// Without `--check`: downloads, verifies, and replaces the running binary.
 /// Use `--yes` / `-y` to skip the confirmation prompt.
-fn run_update(check: bool, yes: bool) -> Result<()> {
-    update::run_update(check, yes)
+async fn run_update(check: bool, yes: bool) -> Result<()> {
+    update::run_update(check, yes).await
 }
 
 // ---------------------------------------------------------------------------
@@ -3881,28 +3879,28 @@ async fn main() {
     let is_update_command = matches!(cli.command, Command::Update { .. });
 
     let result = match cli.command {
-        Command::Install { org } => run_install(org),
+        Command::Install { org } => run_install(org).await,
         Command::Hook { hook_command } => match hook_command {
-            HookCommand::PostCommit => run_hook_post_commit(),
-            HookCommand::PrePush { remote, url } => run_hook_pre_push(&remote, &url),
+            HookCommand::PostCommit => run_hook_post_commit().await,
+            HookCommand::PrePush { remote, url } => run_hook_pre_push(&remote, &url).await,
         },
         Command::Backfill { since } => run_backfill(&since).await,
-        Command::Login => run_login(),
-        Command::Logout => run_logout(),
-        Command::Sessions { command, all } => run_sessions(command, all),
-        Command::Status => run_status(),
+        Command::Login => run_login().await,
+        Command::Logout => run_logout().await,
+        Command::Sessions { command, all } => run_sessions(command, all).await,
+        Command::Status => run_status().await,
         Command::Config { config_command } => match config_command.unwrap_or(ConfigCommand::List) {
-            ConfigCommand::Set { key, value } => run_config_set(&key, &value),
-            ConfigCommand::Get { key } => run_config_get(&key),
-            ConfigCommand::List => run_config_list(),
+            ConfigCommand::Set { key, value } => run_config_set(&key, &value).await,
+            ConfigCommand::Get { key } => run_config_get(&key).await,
+            ConfigCommand::List => run_config_list().await,
         },
-        Command::Doctor => run_doctor(),
-        Command::Update { check, yes } => run_update(check, yes),
+        Command::Doctor => run_doctor().await,
+        Command::Update { check, yes } => run_update(check, yes).await,
         Command::Keys { keys_command } => match keys_command.unwrap_or(KeysCommands::Status) {
-            KeysCommands::Setup => run_keys_setup(),
-            KeysCommands::Status => run_keys_status(),
-            KeysCommands::Disable => run_keys_disable(),
-            KeysCommands::Refresh => run_keys_refresh(),
+            KeysCommands::Setup => run_keys_setup().await,
+            KeysCommands::Status => run_keys_status().await,
+            KeysCommands::Disable => run_keys_disable().await,
+            KeysCommands::Refresh => run_keys_refresh().await,
         },
         Command::Gc { since, confirm } => run_gc(&since, confirm).await,
     };
@@ -3910,7 +3908,7 @@ async fn main() {
     // Passive background version check: run after successful command execution
     // on all non-Update commands. Failures are silently ignored.
     if result.is_ok() && !is_update_command {
-        update::passive_version_check();
+        update::passive_version_check().await;
     }
 
     if let Err(e) = result {
@@ -4439,7 +4437,8 @@ mod tests {
             EncryptionMethod::None,
             None,
             backfill_log::BackfillLogger::disabled(),
-        );
+        )
+        .await;
 
         assert_eq!(stats.attached, 1);
         assert!(
@@ -4473,7 +4472,8 @@ mod tests {
             EncryptionMethod::None,
             None,
             backfill_log::BackfillLogger::disabled(),
-        );
+        )
+        .await;
 
         assert_eq!(stats.attached, 1);
         assert!(

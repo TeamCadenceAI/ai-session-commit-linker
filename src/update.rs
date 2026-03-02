@@ -12,7 +12,6 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::future::Future;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -112,8 +111,8 @@ pub fn compare_versions(local: &str, remote: &str) -> Result<Ordering> {
 // ---------------------------------------------------------------------------
 
 /// Fetches the latest release metadata from the production GitHub endpoint.
-pub fn check_latest_version() -> Result<LatestRelease> {
-    check_latest_version_from_url(GITHUB_RELEASES_LATEST_URL)
+pub async fn check_latest_version() -> Result<LatestRelease> {
+    check_latest_version_from_url(GITHUB_RELEASES_LATEST_URL).await
 }
 
 /// Fetches the latest release metadata from a given URL.
@@ -124,8 +123,8 @@ pub fn check_latest_version() -> Result<LatestRelease> {
 ///
 /// This is the injectable entry point used by tests. The URL should return
 /// a 3xx redirect whose Location header ends with the version tag.
-pub fn check_latest_version_from_url(url: &str) -> Result<LatestRelease> {
-    let tag = discover_latest_tag(url, REQUEST_TIMEOUT)?;
+pub async fn check_latest_version_from_url(url: &str) -> Result<LatestRelease> {
+    let tag = discover_latest_tag(url, REQUEST_TIMEOUT).await?;
     let repo_base = repo_base_from_releases_url(url);
     Ok(build_release_from_tag(&tag, repo_base))
 }
@@ -135,45 +134,39 @@ pub fn check_latest_version_from_url(url: &str) -> Result<LatestRelease> {
 /// Sends a request to the releases/latest URL and extracts the version tag
 /// from the redirect `Location` header without actually following it. This
 /// is efficient (single request) and avoids the GitHub API entirely.
-fn discover_latest_tag(url: &str, timeout: Duration) -> Result<String> {
+async fn discover_latest_tag(url: &str, timeout: Duration) -> Result<String> {
     let client = reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .timeout(timeout)
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("Failed to build HTTP client")?;
-    block_on_http(async move {
-        let response = client
-            .get(url)
-            .send()
-            .await
-            .context("Failed to connect to release server")?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .context("Failed to connect to release server")?;
 
-        let status = response.status();
-        if !status.is_redirection() {
-            bail!(
-                "Release server returned HTTP {status} — expected a redirect to the latest release"
-            );
-        }
+    let status = response.status();
+    if !status.is_redirection() {
+        bail!("Release server returned HTTP {status} — expected a redirect to the latest release");
+    }
 
-        let location = response
-            .headers()
-            .get(reqwest::header::LOCATION)
-            .ok_or_else(|| anyhow::anyhow!("Redirect response missing Location header"))?
-            .to_str()
-            .context("Location header is not valid UTF-8")?;
+    let location = response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .ok_or_else(|| anyhow::anyhow!("Redirect response missing Location header"))?
+        .to_str()
+        .context("Location header is not valid UTF-8")?;
 
-        // Extract tag from URL like: https://github.com/REPO/releases/tag/v0.4.1
-        let tag = location
-            .rsplit('/')
-            .next()
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                anyhow::anyhow!("Could not extract version tag from redirect URL: {location}")
-            })?;
+    // Extract tag from URL like: https://github.com/REPO/releases/tag/v0.4.1
+    let tag = location
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Could not extract version tag from redirect URL: {location}"))?;
 
-        Ok(tag.to_string())
-    })
+    Ok(tag.to_string())
 }
 
 /// Constructs a `LatestRelease` from a discovered tag and repo base URL.
@@ -304,45 +297,30 @@ fn build_http_client() -> Result<reqwest::Client> {
 }
 
 /// Downloads a URL to a file in the given directory. Returns the file path.
-pub fn download_to_file(url: &str, dest_dir: &Path, filename: &str) -> Result<PathBuf> {
+pub async fn download_to_file(url: &str, dest_dir: &Path, filename: &str) -> Result<PathBuf> {
     let client = build_http_client()?;
-    let bytes = block_on_http(async move {
-        let response =
-            client.get(url).send().await.with_context(|| {
-                format!("Failed to connect to download server for '{filename}'")
-            })?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("Failed to connect to download server for '{filename}'"))?;
 
-        let status = response.status();
-        if !status.is_success() {
-            bail!("Download of '{filename}' failed: HTTP {status} from {url}");
-        }
+    let status = response.status();
+    if !status.is_success() {
+        bail!("Download of '{filename}' failed: HTTP {status} from {url}");
+    }
 
-        response
-            .bytes()
-            .await
-            .with_context(|| format!("Failed to read response body for '{filename}'"))
-    })?;
+    let bytes = response
+        .bytes()
+        .await
+        .with_context(|| format!("Failed to read response body for '{filename}'"))?;
 
     let dest_path = dest_dir.join(filename);
-    std::fs::write(&dest_path, &bytes)
+    tokio::fs::write(&dest_path, &bytes)
+        .await
         .with_context(|| format!("Failed to write '{filename}' to {}", dest_path.display()))?;
 
     Ok(dest_path)
-}
-
-fn block_on_http<F>(fut: F) -> F::Output
-where
-    F: Future,
-{
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        tokio::task::block_in_place(|| handle.block_on(fut))
-    } else {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("failed to create Tokio runtime")
-            .block_on(fut)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -621,19 +599,19 @@ pub fn confirm_update(
 ///
 /// If `check` is true, only checks and prints whether an update is available.
 /// Otherwise, downloads, verifies, extracts, and replaces the running binary.
-pub fn run_update(check: bool, yes: bool) -> Result<()> {
+pub async fn run_update(check: bool, yes: bool) -> Result<()> {
     if check {
-        return run_update_check();
+        return run_update_check().await;
     }
 
-    run_update_install(yes)
+    run_update_install(yes).await
 }
 
 /// Check-only path: prints whether an update is available.
-fn run_update_check() -> Result<()> {
+async fn run_update_check() -> Result<()> {
     let local = current_version();
 
-    let release = match check_latest_version() {
+    let release = match check_latest_version().await {
         Ok(r) => r,
         Err(e) => {
             eprintln!("Warning: Unable to check for updates: {e}");
@@ -660,23 +638,25 @@ fn run_update_check() -> Result<()> {
 }
 
 /// Full install path: download, verify, extract, confirm, replace.
-fn run_update_install(yes: bool) -> Result<()> {
-    run_update_install_from_url(GITHUB_RELEASES_LATEST_URL, yes)
+async fn run_update_install(yes: bool) -> Result<()> {
+    run_update_install_from_url(GITHUB_RELEASES_LATEST_URL, yes).await
 }
 
 /// Install path with injectable URL for testing.
-pub fn run_update_install_from_url(release_url: &str, yes: bool) -> Result<()> {
+pub async fn run_update_install_from_url(release_url: &str, yes: bool) -> Result<()> {
     let local = current_version();
 
     // Load config for auto-update preference.
     // Config load failure is a hard error for update to avoid silently ignoring
     // user intent (e.g., a malformed config that was supposed to enable auto-update).
     let config = CliConfig::load()
+        .await
         .context("Failed to load config. Check ~/.cadence/cli/config.toml for syntax errors.")?;
 
     // Step 1: Fetch release metadata
-    let release =
-        check_latest_version_from_url(release_url).context("Failed to check for latest release")?;
+    let release = check_latest_version_from_url(release_url)
+        .await
+        .context("Failed to check for latest release")?;
 
     let remote = &release.tag_name;
     let remote_display = normalize_version_tag(remote);
@@ -713,6 +693,7 @@ pub fn run_update_install_from_url(release_url: &str, yes: bool) -> Result<()> {
         tmp_dir.path(),
         CHECKSUMS_FILENAME,
     )
+    .await
     .context("Failed to download checksums file")?;
 
     let artifact_path = download_to_file(
@@ -720,6 +701,7 @@ pub fn run_update_install_from_url(release_url: &str, yes: bool) -> Result<()> {
         tmp_dir.path(),
         &artifact_asset.name,
     )
+    .await
     .context("Failed to download release archive")?;
 
     // Step 6: Verify checksum
@@ -836,7 +818,7 @@ pub fn write_last_check_timestamp(path: &Path) -> Result<()> {
 /// `env_no_update_check` is the value of the `CADENCE_NO_UPDATE_CHECK` env var.
 /// `is_tty` indicates whether stdout is a TTY.
 /// `config_dir` is the path to the cadence config directory.
-pub fn should_check_for_update(
+pub async fn should_check_for_update(
     env_no_update_check: Option<&str>,
     is_tty: bool,
     config_dir: Option<&Path>,
@@ -870,6 +852,7 @@ pub fn should_check_for_update(
 
     // Load config interval (default 8h, treat parse errors as "check due")
     let interval = CliConfig::load()
+        .await
         .ok()
         .and_then(|cfg| cfg.resolved_update_check_interval().ok())
         .unwrap_or(Duration::from_secs(8 * 3600));
@@ -898,16 +881,16 @@ pub fn format_update_notification(current: &str, latest: &str) -> String {
 /// - Prints a notification to stderr if a newer version is available
 ///
 /// All failures are silently ignored to avoid disrupting the user's workflow.
-pub fn passive_version_check() {
-    passive_version_check_from_url(GITHUB_RELEASES_LATEST_URL);
+pub async fn passive_version_check() {
+    passive_version_check_from_url(GITHUB_RELEASES_LATEST_URL).await;
 }
 
 /// Injectable version for testing — accepts a custom release URL.
-pub fn passive_version_check_from_url(url: &str) {
+pub async fn passive_version_check_from_url(url: &str) {
     let env_val = std::env::var(PASSIVE_CHECK_ENV_VAR).ok();
     let is_tty = console::Term::stdout().is_term();
 
-    if !should_check_for_update(env_val.as_deref(), is_tty, None) {
+    if !should_check_for_update(env_val.as_deref(), is_tty, None).await {
         return;
     }
 
@@ -918,7 +901,8 @@ pub fn passive_version_check_from_url(url: &str) {
     };
 
     // Perform the version check with a short timeout
-    let check_result = check_latest_version_from_url_with_timeout(url, PASSIVE_CHECK_TIMEOUT);
+    let check_result =
+        check_latest_version_from_url_with_timeout(url, PASSIVE_CHECK_TIMEOUT).await;
 
     // Always update the timestamp after an attempt (success or failure)
     // to prevent retry storms on persistent failures
@@ -935,7 +919,7 @@ pub fn passive_version_check_from_url(url: &str) {
     let local_version = current_version();
 
     // Cache the latest version regardless of comparison result
-    let _ = crate::config::write_cached_latest_version(remote_version);
+    let _ = crate::config::write_cached_latest_version(remote_version).await;
 
     // Compare versions — only notify if remote is newer
     if let Ok(Ordering::Less) = compare_versions(local_version, remote_tag) {
@@ -947,11 +931,11 @@ pub fn passive_version_check_from_url(url: &str) {
 /// Fetches latest release metadata with a custom timeout.
 ///
 /// Used by the passive check path to enforce the 3-second budget.
-fn check_latest_version_from_url_with_timeout(
+async fn check_latest_version_from_url_with_timeout(
     url: &str,
     timeout: Duration,
 ) -> Result<LatestRelease> {
-    let tag = discover_latest_tag(url, timeout)?;
+    let tag = discover_latest_tag(url, timeout).await?;
     let repo_base = repo_base_from_releases_url(url);
     Ok(build_release_from_tag(&tag, repo_base))
 }
@@ -967,75 +951,75 @@ mod tests {
 
     // -- normalize_version_tag -----------------------------------------------
 
-    #[test]
-    fn normalize_strips_lowercase_v() {
+    #[tokio::test]
+    async fn normalize_strips_lowercase_v() {
         assert_eq!(normalize_version_tag("v0.3.0"), "0.3.0");
     }
 
-    #[test]
-    fn normalize_strips_uppercase_v() {
+    #[tokio::test]
+    async fn normalize_strips_uppercase_v() {
         assert_eq!(normalize_version_tag("V1.2.3"), "1.2.3");
     }
 
-    #[test]
-    fn normalize_no_prefix() {
+    #[tokio::test]
+    async fn normalize_no_prefix() {
         assert_eq!(normalize_version_tag("0.3.0"), "0.3.0");
     }
 
-    #[test]
-    fn normalize_trims_whitespace() {
+    #[tokio::test]
+    async fn normalize_trims_whitespace() {
         assert_eq!(normalize_version_tag("  v0.3.0  "), "0.3.0");
         assert_eq!(normalize_version_tag("  0.3.0  "), "0.3.0");
     }
 
-    #[test]
-    fn normalize_empty_string() {
+    #[tokio::test]
+    async fn normalize_empty_string() {
         assert_eq!(normalize_version_tag(""), "");
     }
 
     // -- compare_versions ----------------------------------------------------
 
-    #[test]
-    fn compare_same_versions() {
+    #[tokio::test]
+    async fn compare_same_versions() {
         assert_eq!(compare_versions("0.2.1", "0.2.1").unwrap(), Ordering::Equal);
     }
 
-    #[test]
-    fn compare_remote_newer() {
+    #[tokio::test]
+    async fn compare_remote_newer() {
         assert_eq!(compare_versions("0.2.1", "0.3.0").unwrap(), Ordering::Less);
     }
 
-    #[test]
-    fn compare_local_newer() {
+    #[tokio::test]
+    async fn compare_local_newer() {
         assert_eq!(
             compare_versions("0.3.0", "0.2.1").unwrap(),
             Ordering::Greater
         );
     }
 
-    #[test]
-    fn compare_with_v_prefix_on_remote() {
+    #[tokio::test]
+    async fn compare_with_v_prefix_on_remote() {
         assert_eq!(compare_versions("0.2.1", "v0.3.0").unwrap(), Ordering::Less);
     }
 
-    #[test]
-    fn compare_with_v_prefix_on_both() {
+    #[tokio::test]
+    async fn compare_with_v_prefix_on_both() {
         assert_eq!(
             compare_versions("v0.2.1", "v0.2.1").unwrap(),
             Ordering::Equal
         );
     }
 
-    #[test]
-    fn compare_with_v_prefix_on_local() {
+    #[tokio::test]
+    async fn compare_with_v_prefix_on_local() {
         assert_eq!(
             compare_versions("v0.3.0", "0.2.1").unwrap(),
             Ordering::Greater
         );
     }
 
-    #[test]
-    fn compare_prerelease_less_than_release() {
+    #[tokio::test]
+    async fn compare_prerelease_less_than_release() {
         // semver: 0.3.0-beta < 0.3.0
         assert_eq!(
             compare_versions("0.3.0-beta", "0.3.0").unwrap(),
@@ -1043,45 +1027,45 @@ mod tests {
         );
     }
 
-    #[test]
-    fn compare_prerelease_same() {
+    #[tokio::test]
+    async fn compare_prerelease_same() {
         assert_eq!(
             compare_versions("0.3.0-beta.1", "0.3.0-beta.1").unwrap(),
             Ordering::Equal
         );
     }
 
-    #[test]
-    fn compare_invalid_local_version() {
+    #[tokio::test]
+    async fn compare_invalid_local_version() {
         let result = compare_versions("not-a-version", "0.3.0");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("local version"));
     }
 
-    #[test]
-    fn compare_invalid_remote_version() {
+    #[tokio::test]
+    async fn compare_invalid_remote_version() {
         let result = compare_versions("0.2.1", "totally-bogus");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("remote version"));
     }
 
-    #[test]
-    fn compare_both_invalid() {
+    #[tokio::test]
+    async fn compare_both_invalid() {
         // Should fail on local first
         let result = compare_versions("bad", "also-bad");
         assert!(result.is_err());
     }
 
-    #[test]
-    fn compare_empty_strings() {
+    #[tokio::test]
+    async fn compare_empty_strings() {
         assert!(compare_versions("", "0.3.0").is_err());
         assert!(compare_versions("0.3.0", "").is_err());
     }
 
     // -- current_version -----------------------------------------------------
 
-    #[test]
-    fn current_version_is_valid_semver() {
+    #[tokio::test]
+    async fn current_version_is_valid_semver() {
         let ver = current_version();
         assert!(!ver.is_empty(), "current_version() should not be empty");
         assert!(
@@ -1092,8 +1076,8 @@ mod tests {
 
     // -- build_release_from_tag -----------------------------------------------
 
-    #[test]
-    fn build_release_includes_all_targets_and_checksums() {
+    #[tokio::test]
+    async fn build_release_includes_all_targets_and_checksums() {
         let release = build_release_from_tag("v0.3.0", "https://github.com/Org/Repo");
         assert_eq!(release.tag_name, "v0.3.0");
         // 6 platform assets + 1 checksums
@@ -1111,8 +1095,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn build_release_constructs_correct_download_urls() {
+    #[tokio::test]
+    async fn build_release_constructs_correct_download_urls() {
         let release = build_release_from_tag("v1.2.3", "https://github.com/Org/Repo");
         let linux = release
             .assets
@@ -1125,8 +1109,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn build_release_works_with_test_base_url() {
+    #[tokio::test]
+    async fn build_release_works_with_test_base_url() {
         let release = build_release_from_tag("v0.5.0", "http://127.0.0.1:12345");
         let checksums = release
             .assets
@@ -1141,8 +1125,8 @@ mod tests {
 
     // -- repo_base_from_releases_url ------------------------------------------
 
-    #[test]
-    fn repo_base_strips_releases_latest() {
+    #[tokio::test]
+    async fn repo_base_strips_releases_latest() {
         assert_eq!(
             repo_base_from_releases_url(
                 "https://github.com/TeamCadenceAI/cadence-cli/releases/latest"
@@ -1151,8 +1135,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn repo_base_preserves_url_without_suffix() {
+    #[tokio::test]
+    async fn repo_base_preserves_url_without_suffix() {
         assert_eq!(
             repo_base_from_releases_url("http://127.0.0.1:9999"),
             "http://127.0.0.1:9999"
@@ -1168,32 +1152,32 @@ mod tests {
         }
     }
 
-    #[test]
-    fn expected_artifact_name_linux() {
+    #[tokio::test]
+    async fn expected_artifact_name_linux() {
         assert_eq!(
             expected_artifact_name("x86_64-unknown-linux-gnu"),
             "cadence-cli-x86_64-unknown-linux-gnu.tar.gz"
         );
     }
 
-    #[test]
-    fn expected_artifact_name_macos() {
+    #[tokio::test]
+    async fn expected_artifact_name_macos() {
         assert_eq!(
             expected_artifact_name("aarch64-apple-darwin"),
             "cadence-cli-aarch64-apple-darwin.tar.gz"
         );
     }
 
-    #[test]
-    fn expected_artifact_name_windows() {
+    #[tokio::test]
+    async fn expected_artifact_name_windows() {
         assert_eq!(
             expected_artifact_name("x86_64-pc-windows-msvc"),
             "cadence-cli-x86_64-pc-windows-msvc.zip"
         );
     }
 
-    #[test]
-    fn pick_artifact_exact_match() {
+    #[tokio::test]
+    async fn pick_artifact_exact_match() {
         let assets = vec![
             make_asset("cadence-cli-aarch64-apple-darwin.tar.gz"),
             make_asset("cadence-cli-x86_64-unknown-linux-gnu.tar.gz"),
@@ -1203,8 +1187,8 @@ mod tests {
         assert_eq!(result.name, "cadence-cli-x86_64-unknown-linux-gnu.tar.gz");
     }
 
-    #[test]
-    fn pick_artifact_windows_zip() {
+    #[tokio::test]
+    async fn pick_artifact_windows_zip() {
         let assets = vec![
             make_asset("cadence-cli-x86_64-pc-windows-msvc.zip"),
             make_asset("checksums-sha256.txt"),
@@ -1213,8 +1197,8 @@ mod tests {
         assert_eq!(result.name, "cadence-cli-x86_64-pc-windows-msvc.zip");
     }
 
-    #[test]
-    fn pick_artifact_no_match() {
+    #[tokio::test]
+    async fn pick_artifact_no_match() {
         let assets = vec![make_asset("cadence-cli-x86_64-unknown-linux-gnu.tar.gz")];
         let result = pick_artifact_for_target(&assets, "aarch64-apple-darwin");
         assert!(result.is_err());
@@ -1229,14 +1213,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn pick_artifact_empty_assets() {
+    #[tokio::test]
+    async fn pick_artifact_empty_assets() {
         let result = pick_artifact_for_target(&[], "x86_64-unknown-linux-gnu");
         assert!(result.is_err());
     }
 
-    #[test]
-    fn pick_checksums_found() {
+    #[tokio::test]
+    async fn pick_checksums_found() {
         let assets = vec![
             make_asset("cadence-cli-aarch64-apple-darwin.tar.gz"),
             make_asset("checksums-sha256.txt"),
@@ -1245,8 +1229,8 @@ mod tests {
         assert_eq!(result.name, "checksums-sha256.txt");
     }
 
-    #[test]
-    fn pick_checksums_missing() {
+    #[tokio::test]
+    async fn pick_checksums_missing() {
         let assets = vec![make_asset("cadence-cli-aarch64-apple-darwin.tar.gz")];
         let result = pick_checksums_asset(&assets);
         assert!(result.is_err());
@@ -1260,8 +1244,8 @@ mod tests {
 
     // -- checksum parsing ----------------------------------------------------
 
-    #[test]
-    fn parse_checksums_valid() {
+    #[tokio::test]
+    async fn parse_checksums_valid() {
         let content = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2  file1.tar.gz\n\
                         1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef  file2.zip\n";
         let map = parse_checksums(content).unwrap();
@@ -1276,8 +1260,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn parse_checksums_crlf() {
+    #[tokio::test]
+    async fn parse_checksums_crlf() {
         let content =
             "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2  file.tar.gz\r\n";
         let map = parse_checksums(content).unwrap();
@@ -1285,23 +1269,23 @@ mod tests {
         assert!(map.contains_key("file.tar.gz"));
     }
 
-    #[test]
-    fn parse_checksums_blank_lines() {
+    #[tokio::test]
+    async fn parse_checksums_blank_lines() {
         let content =
             "\na1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2  file.tar.gz\n\n";
         let map = parse_checksums(content).unwrap();
         assert_eq!(map.len(), 1);
     }
 
-    #[test]
-    fn parse_checksums_empty_file() {
+    #[tokio::test]
+    async fn parse_checksums_empty_file() {
         let result = parse_checksums("");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("empty"));
     }
 
-    #[test]
-    fn parse_checksums_malformed_no_double_space() {
+    #[tokio::test]
+    async fn parse_checksums_malformed_no_double_space() {
         // Single space instead of double space
         let content =
             "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2 file.tar.gz\n";
@@ -1310,16 +1294,16 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("Malformed"));
     }
 
-    #[test]
-    fn parse_checksums_malformed_short_hash() {
+    #[tokio::test]
+    async fn parse_checksums_malformed_short_hash() {
         let content = "abc123  file.tar.gz\n";
         let result = parse_checksums(content);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("64 hex"));
     }
 
-    #[test]
-    fn parse_checksums_malformed_non_hex() {
+    #[tokio::test]
+    async fn parse_checksums_malformed_non_hex() {
         let content =
             "ZZZZ567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef  file.tar.gz\n";
         let result = parse_checksums(content);
@@ -1327,8 +1311,8 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("64 hex"));
     }
 
-    #[test]
-    fn parse_checksums_empty_filename() {
+    #[tokio::test]
+    async fn parse_checksums_empty_filename() {
         let content = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2  \n";
         let result = parse_checksums(content);
         assert!(result.is_err());
@@ -1337,8 +1321,8 @@ mod tests {
 
     // -- checksum verification -----------------------------------------------
 
-    #[test]
-    fn verify_checksum_match() {
+    #[tokio::test]
+    async fn verify_checksum_match() {
         let tmp = tempfile::tempdir().unwrap();
         let file_path = tmp.path().join("test.bin");
         std::fs::write(&file_path, b"hello world").unwrap();
@@ -1350,8 +1334,8 @@ mod tests {
         verify_checksum(&checksums, "test.bin", &file_path).unwrap();
     }
 
-    #[test]
-    fn verify_checksum_mismatch() {
+    #[tokio::test]
+    async fn verify_checksum_mismatch() {
         let tmp = tempfile::tempdir().unwrap();
         let file_path = tmp.path().join("test.bin");
         std::fs::write(&file_path, b"hello world").unwrap();
@@ -1369,8 +1353,8 @@ mod tests {
         assert!(err.contains("corrupted"), "err: {err}");
     }
 
-    #[test]
-    fn verify_checksum_missing_entry() {
+    #[tokio::test]
+    async fn verify_checksum_missing_entry() {
         let tmp = tempfile::tempdir().unwrap();
         let file_path = tmp.path().join("test.bin");
         std::fs::write(&file_path, b"hello world").unwrap();
@@ -1384,8 +1368,8 @@ mod tests {
 
     // -- sha256 helper -------------------------------------------------------
 
-    #[test]
-    fn sha256_known_value() {
+    #[tokio::test]
+    async fn sha256_known_value() {
         let tmp = tempfile::tempdir().unwrap();
         let file_path = tmp.path().join("known.bin");
         std::fs::write(&file_path, b"hello world").unwrap();
@@ -1398,16 +1382,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn sha256_nonexistent_file() {
+    #[tokio::test]
+    async fn sha256_nonexistent_file() {
         let result = sha256_file(Path::new("/nonexistent/path/to/file"));
         assert!(result.is_err());
     }
 
     // -- archive extraction --------------------------------------------------
 
-    #[test]
-    fn extract_tar_gz_binary() {
+    #[tokio::test]
+    async fn extract_tar_gz_binary() {
         let tmp = tempfile::tempdir().unwrap();
 
         // Create a tar.gz archive containing a "cadence" binary
@@ -1439,8 +1423,8 @@ mod tests {
         assert_eq!(extracted_content, b"#!/bin/sh\necho hello\n");
     }
 
-    #[test]
-    fn extract_tar_gz_nested_binary() {
+    #[tokio::test]
+    async fn extract_tar_gz_nested_binary() {
         let tmp = tempfile::tempdir().unwrap();
 
         // Create a tar.gz with cadence nested in a subdirectory
@@ -1468,8 +1452,8 @@ mod tests {
         assert_eq!(result.file_name().unwrap(), "cadence");
     }
 
-    #[test]
-    fn extract_tar_gz_no_binary() {
+    #[tokio::test]
+    async fn extract_tar_gz_no_binary() {
         let tmp = tempfile::tempdir().unwrap();
 
         let archive_path = tmp.path().join("empty.tar.gz");
@@ -1497,8 +1481,8 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("does not contain"));
     }
 
-    #[test]
-    fn extract_zip_binary() {
+    #[tokio::test]
+    async fn extract_zip_binary() {
         let tmp = tempfile::tempdir().unwrap();
 
         let archive_path = tmp.path().join("test.zip");
@@ -1520,8 +1504,8 @@ mod tests {
         assert!(result.exists());
     }
 
-    #[test]
-    fn extract_zip_no_binary() {
+    #[tokio::test]
+    async fn extract_zip_no_binary() {
         let tmp = tempfile::tempdir().unwrap();
 
         let archive_path = tmp.path().join("empty.zip");
@@ -1542,8 +1526,8 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("does not contain"));
     }
 
-    #[test]
-    fn extract_unsupported_format() {
+    #[tokio::test]
+    async fn extract_unsupported_format() {
         let tmp = tempfile::tempdir().unwrap();
         let archive_path = tmp.path().join("archive.rar");
         std::fs::write(&archive_path, b"fake rar").unwrap();
@@ -1560,8 +1544,8 @@ mod tests {
 
     // -- self_replace_binary -------------------------------------------------
 
-    #[test]
-    fn self_replace_nonexistent_source() {
+    #[tokio::test]
+    async fn self_replace_nonexistent_source() {
         let result = self_replace_binary(Path::new("/nonexistent/path"));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("does not exist"));
@@ -1569,8 +1553,8 @@ mod tests {
 
     // -- archive extension ---------------------------------------------------
 
-    #[test]
-    fn archive_ext_unix_targets() {
+    #[tokio::test]
+    async fn archive_ext_unix_targets() {
         assert_eq!(
             archive_extension_for_target("aarch64-apple-darwin"),
             ".tar.gz"
@@ -1589,8 +1573,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn archive_ext_windows_targets() {
+    #[tokio::test]
+    async fn archive_ext_windows_targets() {
         assert_eq!(
             archive_extension_for_target("x86_64-pc-windows-msvc"),
             ".zip"
@@ -1603,8 +1587,8 @@ mod tests {
 
     // -- build_target --------------------------------------------------------
 
-    #[test]
-    fn build_target_is_nonempty() {
+    #[tokio::test]
+    async fn build_target_is_nonempty() {
         let target = build_target();
         assert!(!target.is_empty(), "build_target() should not be empty");
         // Should contain a dash (all canonical triples have dashes)
@@ -1616,36 +1600,36 @@ mod tests {
 
     // -- confirm_update (precedence matrix) ----------------------------------
 
-    #[test]
-    fn confirm_update_yes_bypass() {
+    #[tokio::test]
+    async fn confirm_update_yes_bypass() {
         // --yes flag should skip prompt and return true
         let result = confirm_update("0.2.1", "0.3.0", true, None).unwrap();
         assert!(result);
     }
 
-    #[test]
-    fn confirm_update_yes_overrides_config_false() {
+    #[tokio::test]
+    async fn confirm_update_yes_overrides_config_false() {
         // --yes wins even when config says auto_update=false
         let result = confirm_update("0.2.1", "0.3.0", true, Some(false)).unwrap();
         assert!(result);
     }
 
-    #[test]
-    fn confirm_update_yes_overrides_config_true() {
+    #[tokio::test]
+    async fn confirm_update_yes_overrides_config_true() {
         // --yes wins over config=true (both are "yes", should still bypass)
         let result = confirm_update("0.2.1", "0.3.0", true, Some(true)).unwrap();
         assert!(result);
     }
 
-    #[test]
-    fn confirm_update_auto_config_true_skips_prompt() {
+    #[tokio::test]
+    async fn confirm_update_auto_config_true_skips_prompt() {
         // auto_update=true should skip prompt without --yes
         let result = confirm_update("0.2.1", "0.3.0", false, Some(true)).unwrap();
         assert!(result);
     }
 
-    #[test]
-    fn confirm_update_auto_config_false_no_yes_would_prompt() {
+    #[tokio::test]
+    async fn confirm_update_auto_config_false_no_yes_would_prompt() {
         // auto_update=false, no --yes: would go to interactive prompt.
         // We can't test the actual prompt here without a TTY,
         // but we verify the None/false config path doesn't auto-accept.
@@ -1653,8 +1637,8 @@ mod tests {
         // Skip this test in CI — just verify the yes/auto paths cover all branches.
     }
 
-    #[test]
-    fn confirm_update_config_none_no_yes_would_prompt() {
+    #[tokio::test]
+    async fn confirm_update_config_none_no_yes_would_prompt() {
         // No config, no --yes: same as auto_update=false — would prompt.
         // Confirm that None acts like false.
         let result = confirm_update("0.2.1", "0.3.0", false, None);
@@ -1668,82 +1652,82 @@ mod tests {
 
     // -- parse_timestamp_string -----------------------------------------------
 
-    #[test]
-    fn parse_timestamp_epoch_seconds() {
+    #[tokio::test]
+    async fn parse_timestamp_epoch_seconds() {
         let ts = parse_timestamp_string("1700000000");
         assert!(ts.is_some());
         let elapsed = ts.unwrap().duration_since(std::time::UNIX_EPOCH).unwrap();
         assert_eq!(elapsed.as_secs(), 1700000000);
     }
 
-    #[test]
-    fn parse_timestamp_epoch_zero() {
+    #[tokio::test]
+    async fn parse_timestamp_epoch_zero() {
         let ts = parse_timestamp_string("0");
         assert!(ts.is_some());
         let elapsed = ts.unwrap().duration_since(std::time::UNIX_EPOCH).unwrap();
         assert_eq!(elapsed.as_secs(), 0);
     }
 
-    #[test]
-    fn parse_timestamp_rfc3339() {
+    #[tokio::test]
+    async fn parse_timestamp_rfc3339() {
         let ts = parse_timestamp_string("2024-01-15T10:30:00Z");
         assert!(ts.is_some());
     }
 
-    #[test]
-    fn parse_timestamp_rfc3339_with_offset() {
+    #[tokio::test]
+    async fn parse_timestamp_rfc3339_with_offset() {
         let ts = parse_timestamp_string("2024-01-15T10:30:00+05:00");
         assert!(ts.is_some());
     }
 
-    #[test]
-    fn parse_timestamp_empty() {
+    #[tokio::test]
+    async fn parse_timestamp_empty() {
         assert!(parse_timestamp_string("").is_none());
     }
 
-    #[test]
-    fn parse_timestamp_garbage() {
+    #[tokio::test]
+    async fn parse_timestamp_garbage() {
         assert!(parse_timestamp_string("not-a-timestamp").is_none());
     }
 
-    #[test]
-    fn parse_timestamp_negative_epoch() {
+    #[tokio::test]
+    async fn parse_timestamp_negative_epoch() {
         assert!(parse_timestamp_string("-100").is_none());
     }
 
-    #[test]
-    fn parse_timestamp_float() {
+    #[tokio::test]
+    async fn parse_timestamp_float() {
         // Floats are not valid epoch integers
         assert!(parse_timestamp_string("1700000000.5").is_none());
     }
 
     // -- read/write last_check_timestamp --------------------------------------
 
-    #[test]
-    fn read_last_check_timestamp_missing_file() {
+    #[tokio::test]
+    async fn read_last_check_timestamp_missing_file() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("nonexistent");
         assert!(read_last_check_timestamp(&path).is_none());
     }
 
-    #[test]
-    fn read_last_check_timestamp_empty_file() {
+    #[tokio::test]
+    async fn read_last_check_timestamp_empty_file() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join(LAST_UPDATE_CHECK_FILE);
         std::fs::write(&path, "").unwrap();
         assert!(read_last_check_timestamp(&path).is_none());
     }
 
-    #[test]
-    fn read_last_check_timestamp_whitespace_only() {
+    #[tokio::test]
+    async fn read_last_check_timestamp_whitespace_only() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join(LAST_UPDATE_CHECK_FILE);
         std::fs::write(&path, "  \n  ").unwrap();
         assert!(read_last_check_timestamp(&path).is_none());
     }
 
-    #[test]
-    fn read_last_check_timestamp_valid_epoch() {
+    #[tokio::test]
+    async fn read_last_check_timestamp_valid_epoch() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join(LAST_UPDATE_CHECK_FILE);
         std::fs::write(&path, "1700000000\n").unwrap();
@@ -1758,8 +1742,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn read_last_check_timestamp_valid_rfc3339() {
+    #[tokio::test]
+    async fn read_last_check_timestamp_valid_rfc3339() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join(LAST_UPDATE_CHECK_FILE);
         std::fs::write(&path, "2024-01-15T10:30:00Z\n").unwrap();
@@ -1767,16 +1751,16 @@ mod tests {
         assert!(ts.is_some());
     }
 
-    #[test]
-    fn read_last_check_timestamp_malformed() {
+    #[tokio::test]
+    async fn read_last_check_timestamp_malformed() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join(LAST_UPDATE_CHECK_FILE);
         std::fs::write(&path, "not-a-time\n").unwrap();
         assert!(read_last_check_timestamp(&path).is_none());
     }
 
-    #[test]
-    fn write_and_read_last_check_timestamp_roundtrip() {
+    #[tokio::test]
+    async fn write_and_read_last_check_timestamp_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join(LAST_UPDATE_CHECK_FILE);
         write_last_check_timestamp(&path).unwrap();
@@ -1795,8 +1779,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn write_last_check_timestamp_creates_parent_dirs() {
+    #[tokio::test]
+    async fn write_last_check_timestamp_creates_parent_dirs() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp
             .path()
@@ -1809,50 +1793,51 @@ mod tests {
 
     // -- should_check_for_update -----------------------------------------------
 
-    #[test]
-    fn should_check_env_var_suppresses() {
+    #[tokio::test]
+    async fn should_check_env_var_suppresses() {
         let tmp = tempfile::tempdir().unwrap();
-        assert!(!should_check_for_update(Some("1"), true, Some(tmp.path())));
+        assert!(!should_check_for_update(Some("1"), true, Some(tmp.path())).await);
     }
 
-    #[test]
-    fn should_check_env_var_other_values_dont_suppress() {
+    #[tokio::test]
+    async fn should_check_env_var_other_values_dont_suppress() {
         let tmp = tempfile::tempdir().unwrap();
         // "0", "true", "yes" should NOT suppress — only "1" does
-        assert!(should_check_for_update(Some("0"), true, Some(tmp.path())));
+        assert!(should_check_for_update(Some("0"), true, Some(tmp.path())).await);
         assert!(should_check_for_update(
             Some("true"),
             true,
             Some(tmp.path())
-        ));
-        assert!(should_check_for_update(Some(""), true, Some(tmp.path())));
+        )
+        .await);
+        assert!(should_check_for_update(Some(""), true, Some(tmp.path())).await);
     }
 
-    #[test]
-    fn should_check_non_tty_suppresses() {
+    #[tokio::test]
+    async fn should_check_non_tty_suppresses() {
         let tmp = tempfile::tempdir().unwrap();
-        assert!(!should_check_for_update(None, false, Some(tmp.path())));
+        assert!(!should_check_for_update(None, false, Some(tmp.path())).await);
     }
 
-    #[test]
-    fn should_check_missing_timestamp_runs() {
+    #[tokio::test]
+    async fn should_check_missing_timestamp_runs() {
         let tmp = tempfile::tempdir().unwrap();
         // No timestamp file — check should run
-        assert!(should_check_for_update(None, true, Some(tmp.path())));
+        assert!(should_check_for_update(None, true, Some(tmp.path())).await);
     }
 
-    #[test]
-    fn should_check_recent_timestamp_skips() {
+    #[tokio::test]
+    async fn should_check_recent_timestamp_skips() {
         let tmp = tempfile::tempdir().unwrap();
         let ts_path = tmp.path().join(LAST_UPDATE_CHECK_FILE);
         // Write a current timestamp
         write_last_check_timestamp(&ts_path).unwrap();
         // Should NOT check (just checked)
-        assert!(!should_check_for_update(None, true, Some(tmp.path())));
+        assert!(!should_check_for_update(None, true, Some(tmp.path())).await);
     }
 
-    #[test]
-    fn should_check_old_timestamp_runs() {
+    #[tokio::test]
+    async fn should_check_old_timestamp_runs() {
         let tmp = tempfile::tempdir().unwrap();
         let ts_path = tmp.path().join(LAST_UPDATE_CHECK_FILE);
         // Write a timestamp from 24 hours ago (well past 8h default)
@@ -1862,11 +1847,11 @@ mod tests {
             .as_secs()
             - 24 * 3600;
         std::fs::write(&ts_path, format!("{old_epoch}\n")).unwrap();
-        assert!(should_check_for_update(None, true, Some(tmp.path())));
+        assert!(should_check_for_update(None, true, Some(tmp.path())).await);
     }
 
-    #[test]
-    fn should_check_future_timestamp_runs() {
+    #[tokio::test]
+    async fn should_check_future_timestamp_runs() {
         let tmp = tempfile::tempdir().unwrap();
         let ts_path = tmp.path().join(LAST_UPDATE_CHECK_FILE);
         // Write a timestamp in the future (clock skew)
@@ -1877,24 +1862,24 @@ mod tests {
             + 3600;
         std::fs::write(&ts_path, format!("{future_epoch}\n")).unwrap();
         // Clock went "backward" relative to stored time — should check
-        assert!(should_check_for_update(None, true, Some(tmp.path())));
+        assert!(should_check_for_update(None, true, Some(tmp.path())).await);
     }
 
-    #[test]
-    fn should_check_corrupt_timestamp_runs() {
+    #[tokio::test]
+    async fn should_check_corrupt_timestamp_runs() {
         let tmp = tempfile::tempdir().unwrap();
         let ts_path = tmp.path().join(LAST_UPDATE_CHECK_FILE);
         std::fs::write(&ts_path, "totally-corrupt-data").unwrap();
         // Corrupt file = can't parse = treat as missing = should check
-        assert!(should_check_for_update(None, true, Some(tmp.path())));
+        assert!(should_check_for_update(None, true, Some(tmp.path())).await);
     }
 
-    #[test]
-    fn should_check_no_config_dir_runs() {
+    #[tokio::test]
+    async fn should_check_no_config_dir_runs() {
         // When config_dir is None, fall back to CliConfig::config_dir() internally
         // In test environments this may or may not resolve, but the function
         // should not panic
-        let result = should_check_for_update(None, true, None);
+        let result = should_check_for_update(None, true, None).await;
         // We can't assert true/false deterministically without controlling HOME,
         // but it should not panic
         let _ = result;
@@ -1902,8 +1887,8 @@ mod tests {
 
     // -- format_update_notification -------------------------------------------
 
-    #[test]
-    fn format_notification_exact_message() {
+    #[tokio::test]
+    async fn format_notification_exact_message() {
         let msg = format_update_notification("0.2.1", "0.3.0");
         assert_eq!(
             msg,
@@ -1911,8 +1896,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn format_notification_preserves_version_strings() {
+    #[tokio::test]
+    async fn format_notification_preserves_version_strings() {
         let msg = format_update_notification("1.0.0", "2.0.0-beta.1");
         assert!(msg.contains("v2.0.0-beta.1"));
         assert!(msg.contains("v1.0.0"));
@@ -1920,12 +1905,13 @@ mod tests {
 
     // -- check_latest_version_from_url_with_timeout ---------------------------
 
-    #[test]
-    fn check_with_timeout_connection_refused() {
+    #[tokio::test]
+    async fn check_with_timeout_connection_refused() {
         let result = check_latest_version_from_url_with_timeout(
             "http://127.0.0.1:1/nonexistent",
             Duration::from_millis(100),
-        );
+        )
+        .await;
         assert!(result.is_err());
     }
 }

@@ -61,8 +61,8 @@ fn spawn_redirect_server(tag: &str) -> String {
 // Artifact selection tests (via library)
 // ---------------------------------------------------------------------------
 
-#[test]
-fn pick_artifact_for_all_release_targets() {
+#[tokio::test]
+async fn pick_artifact_for_all_release_targets() {
     use cadence_cli::update::{ReleaseAsset, pick_artifact_for_target};
 
     let assets: Vec<ReleaseAsset> = [
@@ -107,8 +107,8 @@ fn pick_artifact_for_all_release_targets() {
     }
 }
 
-#[test]
-fn pick_artifact_for_unknown_target_gives_clear_error() {
+#[tokio::test]
+async fn pick_artifact_for_unknown_target_gives_clear_error() {
     use cadence_cli::update::{ReleaseAsset, pick_artifact_for_target};
 
     let assets = vec![ReleaseAsset {
@@ -127,8 +127,8 @@ fn pick_artifact_for_unknown_target_gives_clear_error() {
 // Checksum integration tests
 // ---------------------------------------------------------------------------
 
-#[test]
-fn checksum_round_trip_with_real_file() {
+#[tokio::test]
+async fn checksum_round_trip_with_real_file() {
     use cadence_cli::update::{parse_checksums, sha256_file, verify_checksum};
 
     let tmp = tempfile::tempdir().unwrap();
@@ -148,8 +148,8 @@ fn checksum_round_trip_with_real_file() {
     assert!(verify_checksum(&checksums, "test-binary.tar.gz", &test_file).is_ok());
 }
 
-#[test]
-fn checksum_verification_rejects_tampered_file() {
+#[tokio::test]
+async fn checksum_verification_rejects_tampered_file() {
     use cadence_cli::update::{parse_checksums, verify_checksum};
 
     let tmp = tempfile::tempdir().unwrap();
@@ -173,8 +173,8 @@ fn checksum_verification_rejects_tampered_file() {
     );
 }
 
-#[test]
-fn checksum_missing_entry_for_artifact() {
+#[tokio::test]
+async fn checksum_missing_entry_for_artifact() {
     use cadence_cli::update::{parse_checksums, verify_checksum};
 
     let tmp = tempfile::tempdir().unwrap();
@@ -194,8 +194,8 @@ fn checksum_missing_entry_for_artifact() {
 // Archive extraction integration tests
 // ---------------------------------------------------------------------------
 
-#[test]
-fn extract_tar_gz_integration() {
+#[tokio::test]
+async fn extract_tar_gz_integration() {
     use cadence_cli::update::extract_binary;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -229,8 +229,8 @@ fn extract_tar_gz_integration() {
     assert!(content.contains("echo test binary"));
 }
 
-#[test]
-fn extract_zip_integration() {
+#[tokio::test]
+async fn extract_zip_integration() {
     use cadence_cli::update::extract_binary;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -258,8 +258,8 @@ fn extract_zip_integration() {
 // Full update flow integration tests
 // ---------------------------------------------------------------------------
 
-#[test]
-fn update_install_already_up_to_date() {
+#[tokio::test]
+async fn update_install_already_up_to_date() {
     use cadence_cli::update::{current_version, run_update_install_from_url};
 
     // Serve a redirect with the same version as the current binary
@@ -267,7 +267,7 @@ fn update_install_already_up_to_date() {
     let url = spawn_redirect_server(&tag);
 
     // Should succeed and indicate already up to date
-    let result = run_update_install_from_url(&url, true);
+    let result = run_update_install_from_url(&url, true).await;
     assert!(
         result.is_ok(),
         "should succeed when up to date: {:?}",
@@ -275,12 +275,12 @@ fn update_install_already_up_to_date() {
     );
 }
 
-#[test]
-fn update_install_network_error() {
+#[tokio::test]
+async fn update_install_network_error() {
     use cadence_cli::update::run_update_install_from_url;
 
     // Connect to a port with no listener
-    let result = run_update_install_from_url("http://127.0.0.1:1", true);
+    let result = run_update_install_from_url("http://127.0.0.1:1", true).await;
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(
@@ -289,13 +289,13 @@ fn update_install_network_error() {
     );
 }
 
-#[test]
-fn update_check_flag_still_works() {
+#[tokio::test]
+async fn update_check_flag_still_works() {
     use cadence_cli::update::run_update;
 
     // --check mode should work (hits real server or fails gracefully)
     // We just verify it doesn't panic or try to install anything
-    let result = run_update(true, false);
+    let result = run_update(true, false).await;
     assert!(
         result.is_ok(),
         "check mode should always succeed: {:?}",
@@ -307,14 +307,14 @@ fn update_check_flag_still_works() {
 // Confirm bypass tests
 // ---------------------------------------------------------------------------
 
-#[test]
-fn confirm_update_yes_flag_bypasses_prompt() {
+#[tokio::test]
+async fn confirm_update_yes_flag_bypasses_prompt() {
     let result = cadence_cli::update::confirm_update("0.2.1", "0.3.0", true, None).unwrap();
     assert!(result, "--yes should always confirm");
 }
 
-#[test]
-fn confirm_update_with_auto_override() {
+#[tokio::test]
+async fn confirm_update_with_auto_override() {
     let result = cadence_cli::update::confirm_update("0.2.1", "0.3.0", true, Some(true)).unwrap();
     assert!(result, "--yes with auto_update should confirm");
 }
@@ -323,8 +323,8 @@ fn confirm_update_with_auto_override() {
 // Download helper tests
 // ---------------------------------------------------------------------------
 
-#[test]
-fn download_to_file_success() {
+#[tokio::test]
+async fn download_to_file_success() {
     use cadence_cli::update::download_to_file;
 
     let body = b"file content for download test";
@@ -348,13 +348,15 @@ fn download_to_file_success() {
     });
 
     let tmp = tempfile::tempdir().unwrap();
-    let result = download_to_file(&url, tmp.path(), "test-file.bin").unwrap();
+    let result = download_to_file(&url, tmp.path(), "test-file.bin")
+        .await
+        .unwrap();
     assert!(result.exists());
     assert_eq!(std::fs::read(&result).unwrap(), body);
 }
 
-#[test]
-fn download_to_file_http_error() {
+#[tokio::test]
+async fn download_to_file_http_error() {
     use cadence_cli::update::download_to_file;
 
     let url = spawn_one_shot_server(500, "Internal Server Error");
@@ -364,17 +366,18 @@ fn download_to_file_http_error() {
         &format!("{url}/artifact.tar.gz"),
         tmp.path(),
         "artifact.tar.gz",
-    );
+    )
+    .await;
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("HTTP 500"));
 }
 
-#[test]
-fn download_to_file_connection_refused() {
+#[tokio::test]
+async fn download_to_file_connection_refused() {
     use cadence_cli::update::download_to_file;
 
     let tmp = tempfile::tempdir().unwrap();
-    let result = download_to_file("http://127.0.0.1:1/file.bin", tmp.path(), "file.bin");
+    let result = download_to_file("http://127.0.0.1:1/file.bin", tmp.path(), "file.bin").await;
     assert!(result.is_err());
 }
 
@@ -382,8 +385,8 @@ fn download_to_file_connection_refused() {
 // build_release_from_tag integration tests
 // ---------------------------------------------------------------------------
 
-#[test]
-fn build_release_from_tag_includes_current_target() {
+#[tokio::test]
+async fn build_release_from_tag_includes_current_target() {
     use cadence_cli::update::{build_release_from_tag, build_target, pick_artifact_for_target};
 
     let release = build_release_from_tag("v1.0.0", "https://github.com/Org/Repo");
@@ -396,8 +399,8 @@ fn build_release_from_tag_includes_current_target() {
     );
 }
 
-#[test]
-fn build_release_from_tag_includes_checksums() {
+#[tokio::test]
+async fn build_release_from_tag_includes_checksums() {
     use cadence_cli::update::{build_release_from_tag, pick_checksums_asset};
 
     let release = build_release_from_tag("v1.0.0", "https://github.com/Org/Repo");

@@ -36,7 +36,7 @@ pub async fn login_via_browser(
     })?;
 
     let deadline = Instant::now() + timeout;
-    let exchange_code = wait_for_exchange_code(&listener, &nonce, deadline)?;
+    let exchange_code = wait_for_exchange_code(&listener, &nonce, deadline).await?;
 
     let client = ApiClient::new(api_base_url);
     client
@@ -61,7 +61,7 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
     out
 }
 
-fn wait_for_exchange_code(
+async fn wait_for_exchange_code(
     listener: &TcpListener,
     expected_state: &str,
     deadline: Instant,
@@ -78,7 +78,7 @@ fn wait_for_exchange_code(
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(50));
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
             Err(e) => return Err(e).context("failed while waiting for browser callback"),
         }

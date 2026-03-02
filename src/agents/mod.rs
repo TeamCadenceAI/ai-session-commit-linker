@@ -148,7 +148,7 @@ pub fn find_chat_session_dirs(root: &Path) -> Vec<PathBuf> {
 }
 
 /// Collect recent files across all supported agents.
-pub fn all_recent_files(now: i64, since_secs: i64) -> Vec<PathBuf> {
+pub async fn all_recent_files(now: i64, since_secs: i64) -> Vec<PathBuf> {
     let mut results = Vec::new();
 
     let claude_dirs = claude::all_log_dirs();
@@ -183,7 +183,7 @@ pub fn all_recent_files(now: i64, since_secs: i64) -> Vec<PathBuf> {
         &["json"],
     ));
 
-    let antigravity_dirs = antigravity::all_log_dirs();
+    let antigravity_dirs = antigravity::all_log_dirs().await;
     results.extend(recent_files_with_exts(
         &antigravity_dirs,
         now,

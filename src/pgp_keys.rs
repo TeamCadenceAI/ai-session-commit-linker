@@ -46,11 +46,11 @@ fn cache_dir() -> Option<PathBuf> {
     agents::home_dir().map(|home| home.join(".cadence").join("cli"))
 }
 
-fn read_optional_file(path: Option<PathBuf>) -> Result<Option<String>> {
+async fn read_optional_file(path: Option<PathBuf>) -> Result<Option<String>> {
     let Some(path) = path else {
         return Ok(None);
     };
-    match std::fs::read_to_string(&path) {
+    match tokio::fs::read_to_string(&path).await {
         Ok(contents) if contents.trim().is_empty() => Ok(None),
         Ok(contents) => Ok(Some(contents)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -58,12 +58,14 @@ fn read_optional_file(path: Option<PathBuf>) -> Result<Option<String>> {
     }
 }
 
-fn write_cache_file(path: &Path, contents: &str) -> Result<()> {
+async fn write_cache_file(path: &Path, contents: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
+        tokio::fs::create_dir_all(parent)
+            .await
             .with_context(|| format!("failed to create cache directory at {}", parent.display()))?;
     }
-    std::fs::write(path, contents)
+    tokio::fs::write(path, contents)
+        .await
         .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
 }
@@ -116,47 +118,47 @@ pub fn api_public_key_meta_path() -> Option<PathBuf> {
 }
 
 /// Load the cached armored public key for the local user.
-pub fn load_cached_user_public_key() -> Result<Option<String>> {
-    read_optional_file(user_public_key_cache_path())
+pub async fn load_cached_user_public_key() -> Result<Option<String>> {
+    read_optional_file(user_public_key_cache_path()).await
 }
 
 /// Load the cached armored private key for the local user.
-pub fn load_cached_user_private_key() -> Result<Option<String>> {
-    read_optional_file(user_private_key_cache_path())
+pub async fn load_cached_user_private_key() -> Result<Option<String>> {
+    read_optional_file(user_private_key_cache_path()).await
 }
 
 /// Load the cached armored public key for the API recipient.
-pub fn load_cached_api_public_key() -> Result<Option<String>> {
-    read_optional_file(api_public_key_cache_path())
+pub async fn load_cached_api_public_key() -> Result<Option<String>> {
+    read_optional_file(api_public_key_cache_path()).await
 }
 
 /// Save armored public + private keys to cache, enforcing private key permissions.
-pub fn save_user_keys(armored_public_key: &str, armored_private_key: &str) -> Result<()> {
+pub async fn save_user_keys(armored_public_key: &str, armored_private_key: &str) -> Result<()> {
     let public_path = user_public_key_cache_path()
         .ok_or_else(|| anyhow::anyhow!("cannot determine cache path: $HOME is not set"))?;
     let private_path = user_private_key_cache_path()
         .ok_or_else(|| anyhow::anyhow!("cannot determine cache path: $HOME is not set"))?;
 
-    write_cache_file(&public_path, armored_public_key)?;
-    write_cache_file(&private_path, armored_private_key)?;
+    write_cache_file(&public_path, armored_public_key).await?;
+    write_cache_file(&private_path, armored_private_key).await?;
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o600);
-        let _ = std::fs::set_permissions(&private_path, perms);
+        let _ = tokio::fs::set_permissions(&private_path, perms).await;
     }
 
     Ok(())
 }
 
 /// Load cached API public key metadata.
-pub fn load_api_public_key_metadata() -> Result<Option<ApiPublicKeyMetadata>> {
+pub async fn load_api_public_key_metadata() -> Result<Option<ApiPublicKeyMetadata>> {
     let path = api_public_key_meta_path();
     let Some(path) = path else {
         return Ok(None);
     };
-    match std::fs::read_to_string(&path) {
+    match tokio::fs::read_to_string(&path).await {
         Ok(contents) if contents.trim().is_empty() => Ok(None),
         Ok(contents) => {
             let parsed: ApiPublicKeyMetadata =
@@ -173,7 +175,7 @@ pub fn load_api_public_key_metadata() -> Result<Option<ApiPublicKeyMetadata>> {
 }
 
 /// Save API public key and metadata to cache.
-pub fn save_api_public_key_cache(
+pub async fn save_api_public_key_cache(
     armored_public_key: &str,
     metadata: &ApiPublicKeyMetadata,
 ) -> Result<()> {
@@ -182,18 +184,21 @@ pub fn save_api_public_key_cache(
     let meta_path = api_public_key_meta_path()
         .ok_or_else(|| anyhow::anyhow!("cannot determine cache path: $HOME is not set"))?;
     if let Some(parent) = key_path.parent() {
-        std::fs::create_dir_all(parent)
+        tokio::fs::create_dir_all(parent)
+            .await
             .with_context(|| format!("failed to create cache directory at {}", parent.display()))?;
     }
-    std::fs::write(&key_path, armored_public_key).with_context(|| {
-        format!(
-            "failed to write cached api public key at {}",
-            key_path.display()
-        )
-    })?;
+    tokio::fs::write(&key_path, armored_public_key)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to write cached api public key at {}",
+                key_path.display()
+            )
+        })?;
     let meta =
         serde_json::to_string_pretty(metadata).context("failed to serialize api key metadata")?;
-    std::fs::write(&meta_path, meta).with_context(|| {
+    tokio::fs::write(&meta_path, meta).await.with_context(|| {
         format!(
             "failed to write api key metadata at {}",
             meta_path.display()
