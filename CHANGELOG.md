@@ -1,5 +1,8 @@
 # Changelog
 
+## [1.0.0](https://github.com/TeamCadenceAI/cadence-cli/compare/v0.10.0...v1.0.0) (2026-03-04)
+
+
 ## [0.10.0](https://github.com/TeamCadenceAI/cadence-cli/compare/v0.9.0...v0.10.0) (2026-03-04)
 
 
