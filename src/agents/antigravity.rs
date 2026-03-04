@@ -17,6 +17,7 @@ use super::{
 };
 use crate::scanner::AgentType;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 /// Return all Antigravity log directories for use by the post-commit hook.
 pub async fn log_dirs() -> Vec<PathBuf> {
@@ -84,11 +85,19 @@ struct LspProcess {
     extension_port: Option<u16>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ProbeCache {
+    last_checked_epoch: i64,
+    last_success_epoch: Option<i64>,
+    cached_log_dir: Option<String>,
+}
+
 async fn api_log_dir(home: &Path) -> Option<PathBuf> {
     if std::env::var("CADENCE_DISABLE_ANTIGRAVITY_API").is_ok() {
         return None;
     }
     let debug = std::env::var("CADENCE_ANTIGRAVITY_DEBUG").is_ok();
+    let now = now_epoch();
 
     let cache_dir = api_cache_dir(home);
     if ensure_dir(&cache_dir).await.is_err() {
@@ -97,9 +106,35 @@ async fn api_log_dir(home: &Path) -> Option<PathBuf> {
         }
         return None;
     }
+    let probe_ttl_secs = std::env::var("CADENCE_ANTIGRAVITY_PROBE_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(90);
+    let cache_path = probe_cache_path(home);
+    let mut probe_cache = load_probe_cache(&cache_path).await.unwrap_or_default();
+    if now.saturating_sub(probe_cache.last_checked_epoch) < probe_ttl_secs {
+        if let Some(cached_dir) = probe_cache.cached_log_dir.as_deref() {
+            let candidate = PathBuf::from(cached_dir);
+            if tokio::fs::try_exists(&candidate).await.unwrap_or(false) {
+                return Some(candidate);
+            }
+        }
+        return None;
+    }
+
+    probe_cache.last_checked_epoch = now;
+    let _ = save_probe_cache(&cache_path, &probe_cache).await;
     let _ = clear_json_files(&cache_dir).await;
 
-    let process = discover_lsp_process().await?;
+    let process = match discover_lsp_process().await {
+        Some(v) => v,
+        None => {
+            probe_cache.cached_log_dir = None;
+            let _ = save_probe_cache(&cache_path, &probe_cache).await;
+            return None;
+        }
+    };
     if debug {
         eprintln!(
             "[cadence] antigravity: pid={}, extension_port={:?}",
@@ -124,6 +159,8 @@ async fn api_log_dir(home: &Path) -> Option<PathBuf> {
                 if debug {
                     eprintln!("[cadence] antigravity: no connect port found");
                 }
+                probe_cache.cached_log_dir = None;
+                let _ = save_probe_cache(&cache_path, &probe_cache).await;
                 return None;
             }
         }
@@ -142,6 +179,8 @@ async fn api_log_dir(home: &Path) -> Option<PathBuf> {
             if debug {
                 eprintln!("[cadence] antigravity: list failed: {e}");
             }
+            probe_cache.cached_log_dir = None;
+            let _ = save_probe_cache(&cache_path, &probe_cache).await;
             return None;
         }
     };
@@ -150,6 +189,8 @@ async fn api_log_dir(home: &Path) -> Option<PathBuf> {
         if debug {
             eprintln!("[cadence] antigravity: no cascade ids found");
         }
+        probe_cache.cached_log_dir = None;
+        let _ = save_probe_cache(&cache_path, &probe_cache).await;
         return None;
     }
 
@@ -186,11 +227,46 @@ async fn api_log_dir(home: &Path) -> Option<PathBuf> {
         }
     }
 
-    if wrote_any { Some(cache_dir) } else { None }
+    if wrote_any {
+        probe_cache.last_success_epoch = Some(now);
+        probe_cache.cached_log_dir = Some(cache_dir.to_string_lossy().to_string());
+        let _ = save_probe_cache(&cache_path, &probe_cache).await;
+        Some(cache_dir)
+    } else {
+        probe_cache.cached_log_dir = None;
+        let _ = save_probe_cache(&cache_path, &probe_cache).await;
+        None
+    }
 }
 
 fn api_cache_dir(home: &Path) -> PathBuf {
     home.join(".cadence/cli").join("antigravity-api")
+}
+
+fn probe_cache_path(home: &Path) -> PathBuf {
+    home.join(".cadence/cli").join("antigravity-probe.json")
+}
+
+async fn load_probe_cache(path: &Path) -> Option<ProbeCache> {
+    let content = tokio::fs::read_to_string(path).await.ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+async fn save_probe_cache(path: &Path, cache: &ProbeCache) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    tokio::fs::write(&tmp, serde_json::to_vec_pretty(cache)?).await?;
+    tokio::fs::rename(&tmp, path).await?;
+    Ok(())
+}
+
+fn now_epoch() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 async fn ensure_dir(dir: &Path) -> anyhow::Result<()> {

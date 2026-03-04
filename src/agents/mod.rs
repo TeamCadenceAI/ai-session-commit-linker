@@ -179,31 +179,22 @@ pub async fn find_chat_session_dirs(root: &Path) -> Vec<PathBuf> {
 
 /// Collect recent session logs across all supported agents.
 pub async fn discover_recent_sessions(now: i64, since_secs: i64) -> Vec<SessionLog> {
+    let (claude_logs, codex_logs, cursor_logs, copilot_logs, antigravity_logs, warp_logs) = tokio::join!(
+        claude::ClaudeExplorer.discover_recent(now, since_secs),
+        codex::CodexExplorer.discover_recent(now, since_secs),
+        cursor::CursorExplorer.discover_recent(now, since_secs),
+        copilot::CopilotExplorer.discover_recent(now, since_secs),
+        antigravity::AntigravityExplorer.discover_recent(now, since_secs),
+        warp::WarpExplorer.discover_recent(now, since_secs),
+    );
+
     let mut results = Vec::new();
-
-    results.extend(
-        claude::ClaudeExplorer
-            .discover_recent(now, since_secs)
-            .await,
-    );
-    results.extend(codex::CodexExplorer.discover_recent(now, since_secs).await);
-    results.extend(
-        cursor::CursorExplorer
-            .discover_recent(now, since_secs)
-            .await,
-    );
-    results.extend(
-        copilot::CopilotExplorer
-            .discover_recent(now, since_secs)
-            .await,
-    );
-    results.extend(
-        antigravity::AntigravityExplorer
-            .discover_recent(now, since_secs)
-            .await,
-    );
-    results.extend(warp::WarpExplorer.discover_recent(now, since_secs).await);
-
+    results.extend(claude_logs);
+    results.extend(codex_logs);
+    results.extend(cursor_logs);
+    results.extend(copilot_logs);
+    results.extend(antigravity_logs);
+    results.extend(warp_logs);
     results
 }
 

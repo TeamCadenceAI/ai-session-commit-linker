@@ -80,7 +80,12 @@ pub async fn sync_session_refs_for_remote_at(repo: &Path, remote: &str) -> Resul
         let repo = repo.to_path_buf();
         let remote = remote.to_string();
         let ref_name = ref_name.to_string();
-        set.spawn(async move { sync_ref_for_remote_at(&repo, &remote, &ref_name).await });
+        let pre_remote_hash = remote_hashes.get(ref_name.as_str()).cloned();
+        let local_hash = local_hashes.get(ref_name.as_str()).cloned();
+        set.spawn(async move {
+            sync_ref_for_remote_with_state(&repo, &remote, &ref_name, pre_remote_hash, local_hash)
+                .await
+        });
     }
 
     while let Some(next) = set.join_next().await {
@@ -117,8 +122,84 @@ async fn fetch_merge_ref_for_remote_at(repo: &Path, remote: &str, ref_name: &str
     Ok(())
 }
 
-async fn sync_ref_for_remote_at(repo: &Path, remote: &str, ref_name: &str) -> Result<()> {
-    sync_ref_for_remote_inner(repo, remote, ref_name, true).await
+async fn sync_ref_for_remote_with_state(
+    repo: &Path,
+    remote: &str,
+    ref_name: &str,
+    pre_remote_hash: Option<String>,
+    local_hash: Option<String>,
+) -> Result<()> {
+    if local_hash == pre_remote_hash {
+        return Ok(());
+    }
+
+    if pre_remote_hash.is_none() {
+        if local_hash.is_none() {
+            return Ok(());
+        }
+        let push_res =
+            git::push_ref_with_lease_at(Some(repo), remote, ref_name, &pre_remote_hash).await;
+        if let Err(e) = push_res {
+            let msg = e.to_string();
+            if is_ref_push_race(&msg, ref_name) {
+                return sync_ref_for_remote_inner(repo, remote, ref_name, false).await;
+            }
+            return Err(e);
+        }
+        return Ok(());
+    }
+
+    if local_hash.is_none() {
+        let temp_ref = temp_ref_name(ref_name, remote);
+        let _ = git::run_git_output_at(Some(repo), &["update-ref", "-d", &temp_ref], &[]).await;
+        let fetch_result =
+            git::fetch_ref_to_temp_at(Some(repo), remote, ref_name, &temp_ref).await?;
+        if fetch_result.fetched {
+            let remote_tip = git::rev_parse_at(Some(repo), &temp_ref).await?;
+            git::update_ref_at(Some(repo), ref_name, &remote_tip).await?;
+        }
+        let _ = git::run_git_output_at(Some(repo), &["update-ref", "-d", &temp_ref], &[]).await;
+        return Ok(());
+    }
+
+    let temp_ref = temp_ref_name(ref_name, remote);
+    let _ = git::run_git_output_at(Some(repo), &["update-ref", "-d", &temp_ref], &[]).await;
+    let fetch_result = git::fetch_ref_to_temp_at(Some(repo), remote, ref_name, &temp_ref).await?;
+    if !fetch_result.fetched {
+        let _ = git::run_git_output_at(Some(repo), &["update-ref", "-d", &temp_ref], &[]).await;
+        let push_res =
+            git::push_ref_with_lease_at(Some(repo), remote, ref_name, &pre_remote_hash).await;
+        if let Err(e) = push_res {
+            let msg = e.to_string();
+            if is_ref_push_race(&msg, ref_name) {
+                return sync_ref_for_remote_inner(repo, remote, ref_name, false).await;
+            }
+            return Err(e);
+        }
+        return Ok(());
+    }
+
+    let fetched_hash = git::rev_parse_at(Some(repo), &temp_ref).await.ok();
+    if fetched_hash == local_hash {
+        let _ = git::run_git_output_at(Some(repo), &["update-ref", "-d", &temp_ref], &[]).await;
+        return Ok(());
+    }
+
+    let merged = merge_ref_maps(repo, ref_name, &temp_ref).await?;
+    if let Some(new_tip) = merged {
+        git::update_ref_at(Some(repo), ref_name, &new_tip).await?;
+    }
+    let push_res =
+        git::push_ref_with_lease_at(Some(repo), remote, ref_name, &pre_remote_hash).await;
+    let _ = git::run_git_output_at(Some(repo), &["update-ref", "-d", &temp_ref], &[]).await;
+    if let Err(e) = push_res {
+        let msg = e.to_string();
+        if is_ref_push_race(&msg, ref_name) {
+            return sync_ref_for_remote_inner(repo, remote, ref_name, false).await;
+        }
+        return Err(e);
+    }
+    Ok(())
 }
 
 async fn sync_ref_for_remote_inner(
