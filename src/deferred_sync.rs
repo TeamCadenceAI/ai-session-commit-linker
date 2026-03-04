@@ -26,6 +26,7 @@ const DEFAULT_LOG_RETENTION_DAYS: i64 = 7;
 const DEFAULT_SYNC_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_TIME_BUDGET_MS: u64 = 8_000;
 const REF_SYNC_JOB_CONCURRENCY: usize = 4;
+static SYNC_TRACING_INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub struct SyncRunOptions {
@@ -178,10 +179,18 @@ pub async fn spawn_background_sync(repo_root: &Path, remote: &str) -> Result<()>
 }
 
 pub async fn run_sync_command(opts: SyncRunOptions) -> Result<()> {
+    let _ = init_tracing_for_run(opts.background);
     run_startup_maintenance().await?;
 
     let jobs = collect_runnable_jobs(&opts).await?;
-    execute_jobs_bounded(jobs, opts.background, opts.time_budget_ms).await
+    info!(
+        background = opts.background,
+        max_items = opts.max_items,
+        time_budget_ms = opts.time_budget_ms,
+        runnable_jobs = jobs.len(),
+        "deferred sync invocation started"
+    );
+    execute_jobs_bounded(jobs, opts.time_budget_ms).await
 }
 
 /// Run lock/log maintenance before processing jobs.
@@ -210,12 +219,9 @@ async fn collect_runnable_jobs(opts: &SyncRunOptions) -> Result<Vec<PendingSyncR
 }
 
 /// Execute jobs with bounded concurrency and a global time budget.
-async fn execute_jobs_bounded(
-    jobs: Vec<PendingSyncRecord>,
-    background: bool,
-    time_budget_ms: u64,
-) -> Result<()> {
+async fn execute_jobs_bounded(jobs: Vec<PendingSyncRecord>, time_budget_ms: u64) -> Result<()> {
     if jobs.is_empty() {
+        info!("no deferred sync jobs were runnable");
         return Ok(());
     }
     let start = std::time::Instant::now();
@@ -225,7 +231,7 @@ async fn execute_jobs_bounded(
     while idx < jobs.len() || in_flight > 0 {
         while idx < jobs.len() && in_flight < REF_SYNC_JOB_CONCURRENCY {
             let job = jobs[idx].clone();
-            set.spawn(async move { run_one_pending_job(job, background).await });
+            set.spawn(async move { run_one_pending_job(job).await });
             idx += 1;
             in_flight += 1;
         }
@@ -236,15 +242,23 @@ async fn execute_jobs_bounded(
         in_flight -= 1;
         let _ = done?;
         if start.elapsed().as_millis() as u64 > time_budget_ms {
+            info!(
+                time_budget_ms,
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "stopping deferred sync invocation due to time budget"
+            );
             break;
         }
     }
+    info!(
+        elapsed_ms = start.elapsed().as_millis() as u64,
+        "deferred sync invocation finished"
+    );
     Ok(())
 }
 
-async fn run_one_pending_job(job: PendingSyncRecord, background: bool) -> Result<()> {
+async fn run_one_pending_job(job: PendingSyncRecord) -> Result<()> {
     let worker_id = Uuid::new_v4().to_string();
-    let _trace_guard = init_tracing_for_worker(&worker_id, &job, background).ok();
     info!(
         worker_id = %worker_id,
         repo_root = %job.repo_root,
@@ -576,6 +590,7 @@ async fn build_explicit_jobs(
     Ok(vec![rec])
 }
 
+#[cfg(test)]
 fn sanitize_filename_part(v: &str) -> String {
     v.chars()
         .map(|c| {
@@ -596,23 +611,13 @@ fn timestamp_for_filename() -> String {
         .unwrap_or_else(|_| now_epoch().to_string())
 }
 
-fn init_tracing_for_worker(
-    worker_id: &str,
-    job: &PendingSyncRecord,
-    background: bool,
-) -> Result<tracing::subscriber::DefaultGuard> {
-    let dir = std::fs::create_dir_all(log_dir_blocking()?.as_path());
-    if dir.is_err() {
-        return Err(anyhow::anyhow!("failed to create sync log directory"));
+fn init_tracing_for_run(background: bool) -> Result<()> {
+    if SYNC_TRACING_INIT.get().is_some() {
+        return Ok(());
     }
     let pid = std::process::id();
     let ts = timestamp_for_filename();
-    let name = format!(
-        "sync-{}-{}-{}.log",
-        ts,
-        sanitize_filename_part(worker_id),
-        pid
-    );
+    let name = format!("sync-{}-{}.log", ts, pid);
     let path = log_dir_blocking()?.join(name);
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -621,14 +626,18 @@ fn init_tracing_for_worker(
         .with_context(|| format!("open sync log file {}", path.display()))?;
     writeln!(
         file,
-        "start worker_id={} pid={} repo_root={} remote={} background={}",
-        worker_id, pid, job.repo_root, job.remote, background
+        "start pid={} background={} cmd=deferred-sync",
+        pid, background
     )?;
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)
+        .with_target(true)
         .with_writer(file)
         .finish();
-    Ok(tracing::subscriber::set_default(subscriber))
+    tracing::subscriber::set_global_default(subscriber)
+        .map_err(|e| anyhow::anyhow!("set global tracing subscriber: {e}"))?;
+    let _ = SYNC_TRACING_INIT.set(());
+    Ok(())
 }
 
 /// Delete old per-worker logs based on retention-days policy.
