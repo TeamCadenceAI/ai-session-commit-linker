@@ -2,6 +2,7 @@ mod agents;
 mod api_client;
 mod backfill_log;
 mod config;
+mod deferred_sync;
 mod git;
 mod keychain;
 mod login;
@@ -22,8 +23,10 @@ use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, Semaphore};
+use tokio::task::JoinSet;
 
 use crate::keychain::KeychainStore;
 
@@ -161,6 +164,27 @@ enum HookCommand {
         remote: String,
         /// Remote URL provided by git.
         url: String,
+    },
+    /// Deferred sync worker: process queued session-ref sync jobs.
+    DeferredSync {
+        /// Repository path to sync (defaults to current repository).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Remote name to sync (defaults to push remote or origin).
+        #[arg(long)]
+        remote: Option<String>,
+        /// Process queued pending sync jobs.
+        #[arg(long)]
+        all_pending: bool,
+        /// Internal: background worker mode.
+        #[arg(long)]
+        background: bool,
+        /// Max pending jobs to process in this invocation.
+        #[arg(long, default_value_t = 4)]
+        max_items: usize,
+        /// Max time budget for this invocation in milliseconds.
+        #[arg(long, default_value_t = 8000)]
+        time_budget_ms: u64,
     },
 }
 
@@ -1009,16 +1033,10 @@ async fn hook_pre_push_inner(remote: &str, _url: &str) -> Result<()> {
         {
             output::note(&format!("Pre-push ingest issue: {}", e));
         }
-        let pushing_progress = hook_status_spinner_start("Pushing AI sessions");
-        let sync_start = std::time::Instant::now();
-        push::sync_notes_for_remote(remote).await;
-        hook_status_spinner_finish_ok(pushing_progress, "Pushing AI sessions");
-        if output::is_verbose() {
-            output::detail(&format!(
-                "Pre-push sync in {} ms",
-                sync_start.elapsed().as_millis()
-            ));
-        }
+        let queue_progress = hook_status_spinner_start("Queueing AI session sync");
+        deferred_sync::enqueue_pending_sync(&repo_root, remote).await?;
+        let _ = deferred_sync::spawn_background_sync(&repo_root, remote).await;
+        hook_status_spinner_finish_ok(queue_progress, "Queueing AI session sync");
     }
 
     Ok(())
@@ -1124,6 +1142,116 @@ async fn branch_keys_for_repo_and_commits(
         && let Ok(Some(current)) = git::current_branch_at(repo).await
     {
         branch_names.insert(current);
+    }
+
+    if branch_names.is_empty() {
+        branch_names.insert("detached/unknown".to_string());
+    }
+
+    branch_names
+        .into_iter()
+        .map(|branch| format!("{remote}/{branch}"))
+        .collect()
+}
+
+fn hook_discovery_concurrency() -> usize {
+    std::env::var("CADENCE_HOOK_DISCOVERY_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get().clamp(2, 8))
+                .unwrap_or(4)
+        })
+}
+
+struct ParsedSessionLog {
+    log: agents::SessionLog,
+    metadata: scanner::SessionMetadata,
+    session_start: Option<i64>,
+    observed_commits: Vec<String>,
+    session_log: String,
+}
+
+async fn parse_session_log_once(log: agents::SessionLog) -> Option<ParsedSessionLog> {
+    let session_log = match &log.source {
+        agents::SessionSource::File(path) => tokio::fs::read_to_string(path).await.ok()?,
+        agents::SessionSource::Inline { content, .. } => content.clone(),
+    };
+    let mut metadata = scanner::parse_session_metadata_str(&session_log);
+    metadata.agent_type = Some(log.agent_type.clone());
+    let session_start = scanner::session_time_range_str(&session_log).map(|(start, _)| start);
+    let observed_commits = scanner::extract_commit_hashes_str(&session_log);
+    Some(ParsedSessionLog {
+        log,
+        metadata,
+        session_start,
+        observed_commits,
+        session_log,
+    })
+}
+
+async fn parse_session_logs_bounded(logs: Vec<agents::SessionLog>) -> Vec<ParsedSessionLog> {
+    if logs.is_empty() {
+        return Vec::new();
+    }
+    let semaphore = Arc::new(Semaphore::new(hook_discovery_concurrency()));
+    let mut set = JoinSet::new();
+    for log in logs {
+        let semaphore = Arc::clone(&semaphore);
+        set.spawn(async move {
+            let _permit = semaphore.acquire_owned().await.ok()?;
+            parse_session_log_once(log).await
+        });
+    }
+
+    let mut out = Vec::new();
+    while let Some(res) = set.join_next().await {
+        if let Ok(Some(parsed)) = res {
+            out.push(parsed);
+        }
+    }
+    out
+}
+
+async fn branch_keys_for_repo_and_commits_cached(
+    repo: &std::path::Path,
+    commits: &[String],
+    branches_cache: &mut std::collections::HashMap<String, Vec<String>>,
+    remote_hint: Option<&str>,
+    current_branch_hint: Option<&str>,
+) -> Vec<String> {
+    let remote = remote_hint
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| "origin".to_string());
+    let mut branch_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+    for commit in commits {
+        if let Some(cached) = branches_cache.get(commit) {
+            for branch in cached {
+                if !branch.is_empty() {
+                    branch_names.insert(branch.clone());
+                }
+            }
+            continue;
+        }
+
+        let branches = git::branches_containing_commit_at(repo, commit)
+            .await
+            .unwrap_or_default();
+        branches_cache.insert(commit.clone(), branches.clone());
+        for branch in branches {
+            if !branch.is_empty() {
+                branch_names.insert(branch);
+            }
+        }
+    }
+
+    if branch_names.is_empty()
+        && let Some(current) = current_branch_hint
+    {
+        branch_names.insert(current.to_string());
     }
 
     if branch_names.is_empty() {
@@ -1294,41 +1422,65 @@ async fn ingest_recent_sessions_for_repo(
         .unwrap_or_default()
         .as_secs() as i64;
     let files = agents::discover_recent_sessions(now, since_secs).await;
+    let parsed_logs = parse_session_logs_bounded(files).await;
+    let remote_hint = git::resolve_push_remote_at(repo_root)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "origin".to_string());
+    let current_branch_hint = git::current_branch_at(repo_root)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "detached/unknown".to_string());
+    let mut repo_root_cache: std::collections::HashMap<String, Option<std::path::PathBuf>> =
+        std::collections::HashMap::new();
+    let mut branches_cache: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
     let mut ingested = 0usize;
 
-    for log in files {
-        let metadata = session_log_metadata(&log).await;
-        let Some(cwd) = metadata.cwd else {
+    for parsed in parsed_logs {
+        let Some(cwd) = parsed.metadata.cwd.clone() else {
             continue;
         };
-        let Ok(resolved_repo) = git::repo_root_at(std::path::Path::new(&cwd)).await else {
+        let resolved_repo = if let Some(cached) = repo_root_cache.get(&cwd) {
+            cached.clone()
+        } else {
+            let resolved = git::repo_root_at(std::path::Path::new(&cwd)).await.ok();
+            repo_root_cache.insert(cwd.clone(), resolved.clone());
+            resolved
+        };
+        let Some(resolved_repo) = resolved_repo else {
             continue;
         };
         if resolved_repo != repo_root {
             continue;
         }
 
-        let session_id = metadata
+        let session_id = parsed
+            .metadata
             .session_id
             .as_deref()
             .unwrap_or("unknown")
             .to_string();
-        let agent = metadata
+        let agent = parsed
+            .metadata
             .agent_type
             .clone()
             .unwrap_or(scanner::AgentType::Claude);
-        let session_start = session_log_time_range(&log).await.map(|(start, _)| start);
-        let observed_commits = session_log_commit_hashes(&log).await;
-        let explicit_branch_keys =
-            branch_keys_for_repo_and_commits(repo_root, &observed_commits).await;
-        let session_log = match session_log_content_async(&log).await {
-            Some(content) => content,
-            None => continue,
-        };
-        let match_reasons = if log.match_reasons.is_empty() {
+        let observed_commits = parsed.observed_commits.clone();
+        let explicit_branch_keys = branch_keys_for_repo_and_commits_cached(
+            repo_root,
+            &observed_commits,
+            &mut branches_cache,
+            Some(remote_hint.as_str()),
+            Some(current_branch_hint.as_str()),
+        )
+        .await;
+        let match_reasons = if parsed.log.match_reasons.is_empty() {
             None
         } else {
-            Some(log.match_reasons.as_slice())
+            Some(parsed.log.match_reasons.as_slice())
         };
 
         let info = ingest_session_from_log(
@@ -1336,10 +1488,10 @@ async fn ingest_recent_sessions_for_repo(
             &session_id,
             repo_root_str,
             Some(&observed_commits),
-            &session_log,
+            &parsed.session_log,
             note::Confidence::ScoredMatch,
             method,
-            session_start,
+            parsed.session_start,
             None,
             match_reasons,
             Some(repo_root),
@@ -1448,6 +1600,7 @@ async fn ingest_incremental_sessions_for_repo(
 
     let mut ingested = 0usize;
     let mut max_mtime = min_cursor;
+    let mut candidates = Vec::new();
     for log in files {
         let Some(mtime) = log.updated_at else {
             continue;
@@ -1458,39 +1611,61 @@ async fn ingest_incremental_sessions_for_repo(
         if mtime > max_mtime {
             max_mtime = mtime;
         }
+        candidates.push(log);
+    }
+    let parsed_logs = parse_session_logs_bounded(candidates).await;
+    let current_branch_hint = git::current_branch_at(repo_root)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "detached/unknown".to_string());
+    let mut repo_root_cache: std::collections::HashMap<String, Option<std::path::PathBuf>> =
+        std::collections::HashMap::new();
+    let mut branches_cache: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
 
-        let metadata = session_log_metadata(&log).await;
-        let Some(cwd) = metadata.cwd else {
+    for parsed in parsed_logs {
+        let Some(cwd) = parsed.metadata.cwd.clone() else {
             continue;
         };
-        let Ok(resolved_repo) = git::repo_root_at(std::path::Path::new(&cwd)).await else {
+        let resolved_repo = if let Some(cached) = repo_root_cache.get(&cwd) {
+            cached.clone()
+        } else {
+            let resolved = git::repo_root_at(std::path::Path::new(&cwd)).await.ok();
+            repo_root_cache.insert(cwd.clone(), resolved.clone());
+            resolved
+        };
+        let Some(resolved_repo) = resolved_repo else {
             continue;
         };
         if resolved_repo != repo_root {
             continue;
         }
 
-        let session_id = metadata
+        let session_id = parsed
+            .metadata
             .session_id
             .as_deref()
             .unwrap_or("unknown")
             .to_string();
-        let agent = metadata
+        let agent = parsed
+            .metadata
             .agent_type
             .clone()
             .unwrap_or(scanner::AgentType::Claude);
-        let observed_commits = session_log_commit_hashes(&log).await;
-        let explicit_branch_keys =
-            branch_keys_for_repo_and_commits(repo_root, &observed_commits).await;
-        let session_start = session_log_time_range(&log).await.map(|(start, _)| start);
-        let session_log = match session_log_content_async(&log).await {
-            Some(content) => content,
-            None => continue,
-        };
-        let match_reasons = if log.match_reasons.is_empty() {
+        let observed_commits = parsed.observed_commits.clone();
+        let explicit_branch_keys = branch_keys_for_repo_and_commits_cached(
+            repo_root,
+            &observed_commits,
+            &mut branches_cache,
+            Some(remote.as_str()),
+            Some(current_branch_hint.as_str()),
+        )
+        .await;
+        let match_reasons = if parsed.log.match_reasons.is_empty() {
             None
         } else {
-            Some(log.match_reasons.as_slice())
+            Some(parsed.log.match_reasons.as_slice())
         };
 
         let info = ingest_session_from_log(
@@ -1498,10 +1673,10 @@ async fn ingest_incremental_sessions_for_repo(
             &session_id,
             repo_root_str,
             Some(&observed_commits),
-            &session_log,
+            &parsed.session_log,
             note::Confidence::ScoredMatch,
             method,
-            session_start,
+            parsed.session_start,
             None,
             match_reasons,
             Some(repo_root),
@@ -4083,11 +4258,53 @@ async fn main() {
 
     let is_update_command = matches!(cli.command, Command::Update { .. });
 
+    // Opportunistic sweep of pending sync jobs for normal CLI flows.
+    if !matches!(cli.command, Command::Hook { .. }) && deferred_sync::has_pending_sync_jobs().await
+    {
+        let _ = deferred_sync::run_sync_command(deferred_sync::SyncRunOptions {
+            repo: None,
+            remote: None,
+            all_pending: true,
+            background: false,
+            max_items: 2,
+            time_budget_ms: std::env::var("CADENCE_SYNC_SWEEP_TIME_BUDGET_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                // Deprecated compatibility path: legacy var was in seconds.
+                .or_else(|| {
+                    std::env::var("CADENCE_SYNC_LOCK_SWEEP_INTERVAL_SECS")
+                        .ok()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .map(|secs| secs * 1000)
+                })
+                .unwrap_or(1500),
+        })
+        .await;
+    }
+
     let result = match cli.command {
         Command::Install { org } => run_install(org).await,
         Command::Hook { hook_command } => match hook_command {
             HookCommand::PostCommit => run_hook_post_commit().await,
             HookCommand::PrePush { remote, url } => run_hook_pre_push(&remote, &url).await,
+            HookCommand::DeferredSync {
+                repo,
+                remote,
+                all_pending,
+                background,
+                max_items,
+                time_budget_ms,
+            } => {
+                run_sync(
+                    repo,
+                    remote,
+                    all_pending,
+                    background,
+                    max_items,
+                    time_budget_ms,
+                )
+                .await
+            }
         },
         Command::Backfill { since } => run_backfill(&since).await,
         Command::Login => run_login().await,
@@ -4120,6 +4337,25 @@ async fn main() {
         output::fail("Failed", &format!("{}", e));
         process::exit(1);
     }
+}
+
+async fn run_sync(
+    repo: Option<PathBuf>,
+    remote: Option<String>,
+    all_pending: bool,
+    background: bool,
+    max_items: usize,
+    time_budget_ms: u64,
+) -> Result<()> {
+    deferred_sync::run_sync_command(deferred_sync::SyncRunOptions {
+        repo,
+        remote,
+        all_pending,
+        background,
+        max_items,
+        time_budget_ms,
+    })
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -4327,6 +4563,32 @@ mod tests {
         match cli.command {
             Command::Doctor => {}
             _ => panic!("expected Doctor command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_hook_deferred_sync_defaults() {
+        let cli = Cli::parse_from(["cadence", "hook", "deferred-sync"]);
+        match cli.command {
+            Command::Hook { hook_command } => match hook_command {
+                HookCommand::DeferredSync {
+                    repo,
+                    remote,
+                    all_pending,
+                    background,
+                    max_items,
+                    time_budget_ms,
+                } => {
+                    assert!(repo.is_none());
+                    assert!(remote.is_none());
+                    assert!(!all_pending);
+                    assert!(!background);
+                    assert_eq!(max_items, 4);
+                    assert_eq!(time_budget_ms, 8000);
+                }
+                _ => panic!("expected DeferredSync hook command"),
+            },
+            _ => panic!("expected Hook command"),
         }
     }
 
