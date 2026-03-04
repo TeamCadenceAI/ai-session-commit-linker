@@ -37,6 +37,8 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 keyring = "2.3"
 zstd = "0.13"
 open = "5"
+rusqlite = { version = "0.31", features = ["bundled"] }
+protobuf = "3"
 
 [dev-dependencies]
 serial_test = "3"

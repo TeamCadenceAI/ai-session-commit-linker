@@ -8,9 +8,46 @@ pub mod claude;
 pub mod codex;
 pub mod copilot;
 pub mod cursor;
+pub mod warp;
 
+use crate::scanner::AgentType;
+use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
+
+#[async_trait]
+pub trait AgentExplorer {
+    async fn discover_recent(&self, now: i64, since_secs: i64) -> Vec<SessionLog>;
+}
+
+#[derive(Debug, Clone)]
+pub enum SessionSource {
+    File(PathBuf),
+    Inline { label: String, content: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionLog {
+    pub agent_type: AgentType,
+    pub source: SessionSource,
+    pub updated_at: Option<i64>,
+    pub match_reasons: Vec<String>,
+}
+
+impl SessionLog {
+    pub fn source_label(&self) -> String {
+        match &self.source {
+            SessionSource::File(path) => path.to_string_lossy().to_string(),
+            SessionSource::Inline { label, .. } => label.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DiscoveredFile {
+    pub path: PathBuf,
+    pub mtime_epoch: i64,
+}
 
 /// Find files in the given directories whose modification time is within
 /// `since_secs` of `now`, and whose extension matches `exts`.
@@ -19,7 +56,7 @@ pub async fn recent_files_with_exts(
     now: i64,
     since_secs: i64,
     exts: &[&str],
-) -> Vec<PathBuf> {
+) -> Vec<DiscoveredFile> {
     let cutoff = now - since_secs;
     let mut results = Vec::new();
 
@@ -65,7 +102,7 @@ pub async fn recent_files_with_exts(
             };
 
             if mtime_epoch >= cutoff {
-                results.push(path);
+                results.push(DiscoveredFile { path, mtime_epoch });
             }
         }
     }
@@ -140,24 +177,32 @@ pub async fn find_chat_session_dirs(root: &Path) -> Vec<PathBuf> {
     results
 }
 
-/// Collect recent files across all supported agents.
-pub async fn all_recent_files(now: i64, since_secs: i64) -> Vec<PathBuf> {
+/// Collect recent session logs across all supported agents.
+pub async fn discover_recent_sessions(now: i64, since_secs: i64) -> Vec<SessionLog> {
     let mut results = Vec::new();
 
-    let claude_dirs = claude::all_log_dirs().await;
-    results.extend(recent_files_with_exts(&claude_dirs, now, since_secs, &["jsonl"]).await);
-
-    let codex_dirs = codex::all_log_dirs().await;
-    results.extend(recent_files_with_exts(&codex_dirs, now, since_secs, &["jsonl"]).await);
-
-    let cursor_dirs = cursor::all_log_dirs().await;
-    results.extend(recent_files_with_exts(&cursor_dirs, now, since_secs, &["json", "txt"]).await);
-
-    let copilot_dirs = copilot::all_log_dirs().await;
-    results.extend(recent_files_with_exts(&copilot_dirs, now, since_secs, &["json"]).await);
-
-    let antigravity_dirs = antigravity::all_log_dirs().await;
-    results.extend(recent_files_with_exts(&antigravity_dirs, now, since_secs, &["json"]).await);
+    results.extend(
+        claude::ClaudeExplorer
+            .discover_recent(now, since_secs)
+            .await,
+    );
+    results.extend(codex::CodexExplorer.discover_recent(now, since_secs).await);
+    results.extend(
+        cursor::CursorExplorer
+            .discover_recent(now, since_secs)
+            .await,
+    );
+    results.extend(
+        copilot::CopilotExplorer
+            .discover_recent(now, since_secs)
+            .await,
+    );
+    results.extend(
+        antigravity::AntigravityExplorer
+            .discover_recent(now, since_secs)
+            .await,
+    );
+    results.extend(warp::WarpExplorer.discover_recent(now, since_secs).await);
 
     results
 }
@@ -201,7 +246,7 @@ mod tests {
         let result =
             recent_files_with_exts(&[dir.path().to_path_buf()], now, since_secs, &["jsonl"]).await;
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0], file);
+        assert_eq!(result[0].path, file);
     }
 
     #[tokio::test]

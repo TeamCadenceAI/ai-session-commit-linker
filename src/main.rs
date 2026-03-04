@@ -188,6 +188,9 @@ enum SessionsCommand {
         /// Search all discovered repos instead of only current repo.
         #[arg(long)]
         all: bool,
+        /// Print the full stored record + session_content for each match.
+        #[arg(long)]
+        raw: bool,
     },
 }
 
@@ -1290,11 +1293,11 @@ async fn ingest_recent_sessions_for_repo(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
-    let files = agents::all_recent_files(now, since_secs).await;
+    let files = agents::discover_recent_sessions(now, since_secs).await;
     let mut ingested = 0usize;
 
-    for file in files {
-        let metadata = scanner::parse_session_metadata(&file).await;
+    for log in files {
+        let metadata = session_log_metadata(&log).await;
         let Some(cwd) = metadata.cwd else {
             continue;
         };
@@ -1314,15 +1317,18 @@ async fn ingest_recent_sessions_for_repo(
             .agent_type
             .clone()
             .unwrap_or(scanner::AgentType::Claude);
-        let session_start = scanner::session_time_range(&file)
-            .await
-            .map(|(start, _)| start);
-        let observed_commits = scanner::extract_commit_hashes(&file).await;
+        let session_start = session_log_time_range(&log).await.map(|(start, _)| start);
+        let observed_commits = session_log_commit_hashes(&log).await;
         let explicit_branch_keys =
             branch_keys_for_repo_and_commits(repo_root, &observed_commits).await;
-        let session_log = match tokio::fs::read_to_string(&file).await {
-            Ok(content) => content,
-            Err(_) => continue,
+        let session_log = match session_log_content_async(&log).await {
+            Some(content) => content,
+            None => continue,
+        };
+        let match_reasons = if log.match_reasons.is_empty() {
+            None
+        } else {
+            Some(log.match_reasons.as_slice())
         };
 
         let info = ingest_session_from_log(
@@ -1335,7 +1341,7 @@ async fn ingest_recent_sessions_for_repo(
             method,
             session_start,
             None,
-            None,
+            match_reasons,
             Some(repo_root),
             Some(&explicit_branch_keys),
         )
@@ -1352,11 +1358,38 @@ async fn ingest_recent_sessions_for_repo(
     Ok(ingested)
 }
 
-async fn file_mtime_epoch(path: &std::path::Path) -> Option<i64> {
-    let meta = tokio::fs::metadata(path).await.ok()?;
-    let modified = meta.modified().ok()?;
-    let dur = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
-    Some(dur.as_secs() as i64)
+async fn session_log_metadata(log: &agents::SessionLog) -> scanner::SessionMetadata {
+    let mut metadata = match &log.source {
+        agents::SessionSource::File(path) => scanner::parse_session_metadata(path).await,
+        agents::SessionSource::Inline { content, .. } => {
+            scanner::parse_session_metadata_str(content)
+        }
+    };
+    metadata.agent_type = Some(log.agent_type.clone());
+    metadata
+}
+
+async fn session_log_time_range(log: &agents::SessionLog) -> Option<(i64, i64)> {
+    match &log.source {
+        agents::SessionSource::File(path) => scanner::session_time_range(path).await,
+        agents::SessionSource::Inline { content, .. } => scanner::session_time_range_str(content),
+    }
+}
+
+async fn session_log_commit_hashes(log: &agents::SessionLog) -> Vec<String> {
+    match &log.source {
+        agents::SessionSource::File(path) => scanner::extract_commit_hashes(path).await,
+        agents::SessionSource::Inline { content, .. } => {
+            scanner::extract_commit_hashes_str(content)
+        }
+    }
+}
+
+async fn session_log_content_async(log: &agents::SessionLog) -> Option<String> {
+    match &log.source {
+        agents::SessionSource::File(path) => tokio::fs::read_to_string(path).await.ok(),
+        agents::SessionSource::Inline { content, .. } => Some(content.clone()),
+    }
 }
 
 async fn ingest_incremental_sessions_for_repo(
@@ -1411,12 +1444,12 @@ async fn ingest_incremental_sessions_for_repo(
     let fallback_since = now - 30 * 86_400;
     let min_cursor = cursor_values.into_iter().min().unwrap_or(fallback_since);
     let since_secs = (now - min_cursor).max(0);
-    let files = agents::all_recent_files(now, since_secs).await;
+    let files = agents::discover_recent_sessions(now, since_secs).await;
 
     let mut ingested = 0usize;
     let mut max_mtime = min_cursor;
-    for file in files {
-        let Some(mtime) = file_mtime_epoch(&file).await else {
+    for log in files {
+        let Some(mtime) = log.updated_at else {
             continue;
         };
         if mtime <= min_cursor {
@@ -1426,7 +1459,7 @@ async fn ingest_incremental_sessions_for_repo(
             max_mtime = mtime;
         }
 
-        let metadata = scanner::parse_session_metadata(&file).await;
+        let metadata = session_log_metadata(&log).await;
         let Some(cwd) = metadata.cwd else {
             continue;
         };
@@ -1446,15 +1479,18 @@ async fn ingest_incremental_sessions_for_repo(
             .agent_type
             .clone()
             .unwrap_or(scanner::AgentType::Claude);
-        let observed_commits = scanner::extract_commit_hashes(&file).await;
+        let observed_commits = session_log_commit_hashes(&log).await;
         let explicit_branch_keys =
             branch_keys_for_repo_and_commits(repo_root, &observed_commits).await;
-        let session_start = scanner::session_time_range(&file)
-            .await
-            .map(|(start, _)| start);
-        let session_log = match tokio::fs::read_to_string(&file).await {
-            Ok(content) => content,
-            Err(_) => continue,
+        let session_start = session_log_time_range(&log).await.map(|(start, _)| start);
+        let session_log = match session_log_content_async(&log).await {
+            Some(content) => content,
+            None => continue,
+        };
+        let match_reasons = if log.match_reasons.is_empty() {
+            None
+        } else {
+            Some(log.match_reasons.as_slice())
         };
 
         let info = ingest_session_from_log(
@@ -1467,7 +1503,7 @@ async fn ingest_incremental_sessions_for_repo(
             method,
             session_start,
             None,
-            None,
+            match_reasons,
             Some(repo_root),
             Some(&explicit_branch_keys),
         )
@@ -1545,7 +1581,7 @@ async fn run_backfill(since: &str) -> Result<()> {
 /// re-backfill to the current repository.
 #[derive(Clone)]
 struct SessionInfo {
-    file: std::path::PathBuf,
+    log: agents::SessionLog,
     session_id: String,
     repo_root: std::path::PathBuf,
     metadata: scanner::SessionMetadata,
@@ -1760,7 +1796,7 @@ async fn process_repo_backfill(
         stats.sessions_seen += 1;
         let commit_hashes = session.commit_hashes.clone();
         stats.commits_found += commit_hashes.len();
-        let session_file = session.file.to_string_lossy().to_string();
+        let session_file = session.log.source_label();
         let agent_type = session
             .metadata
             .agent_type
@@ -1778,9 +1814,9 @@ async fn process_repo_backfill(
             }),
         );
 
-        let session_log = match tokio::fs::read_to_string(&session.file).await {
-            Ok(content) => content,
-            Err(e) => {
+        let session_log = match session_log_content_async(&session.log).await {
+            Some(content) => content,
+            None => {
                 stats.errors += 1;
                 backfill_logger.event(
                     "session_error",
@@ -1788,9 +1824,9 @@ async fn process_repo_backfill(
                         "repo_display": repo_display.as_str(),
                         "repo_root": repo_root_str.as_str(),
                         "session_id": session.session_id.as_str(),
-                        "file": session.file.to_string_lossy(),
+                        "file": session.log.source_label(),
                         "stage": "read_session_log",
-                        "error": e.to_string(),
+                        "error": "failed to read session log",
                     }),
                 );
                 if let Some(pb) = &repo_progress {
@@ -1800,7 +1836,7 @@ async fn process_repo_backfill(
             }
         };
         let repo_str = session.repo_root.to_string_lossy().to_string();
-        let session_start = scanner::session_time_range(&session.file)
+        let session_start = session_log_time_range(&session.log)
             .await
             .map(|(start, _)| start);
 
@@ -1816,7 +1852,11 @@ async fn process_repo_backfill(
             &encryption_method,
             session_start,
             None,
-            None,
+            if session.log.match_reasons.is_empty() {
+                None
+            } else {
+                Some(session.log.match_reasons.as_slice())
+            },
             Some(&session.repo_root),
             Some(&branch_keys),
         )
@@ -1830,7 +1870,7 @@ async fn process_repo_backfill(
                         "repo_display": repo_display.as_str(),
                         "repo_root": repo_root_str.as_str(),
                         "session_id": session.session_id.as_str(),
-                        "file": session.file.to_string_lossy(),
+                        "file": session.log.source_label(),
                         "session_uid": info.session_uid,
                         "session_blob": info.blob_sha,
                     }),
@@ -1844,7 +1884,7 @@ async fn process_repo_backfill(
                         "repo_display": repo_display.as_str(),
                         "repo_root": repo_root_str.as_str(),
                         "session_id": session.session_id.as_str(),
-                        "file": session.file.to_string_lossy(),
+                        "file": session.log.source_label(),
                         "error": e.to_string(),
                     }),
                 );
@@ -1966,7 +2006,7 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
             "since_secs": since_secs,
         }),
     );
-    let files = agents::all_recent_files(now, since_secs).await;
+    let files = agents::discover_recent_sessions(now, since_secs).await;
     if let Some(pb) = spinner {
         pb.finish_and_clear();
     }
@@ -1975,7 +2015,7 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
     let mut agent_counts: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
     for file in &files {
-        let agent = scanner::agent_type_from_path(file).to_string();
+        let agent = file.agent_type.to_string();
         *agent_counts.entry(agent).or_insert(0) += 1;
     }
     backfill_logger.event(
@@ -2019,9 +2059,9 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
         None
     };
 
-    for file in &files {
-        let file_path = file.to_string_lossy().to_string();
-        let metadata = scanner::parse_session_metadata(file).await;
+    for log in &files {
+        let file_path = log.source_label();
+        let metadata = session_log_metadata(log).await;
 
         // Skip files with no session metadata (e.g., file-history-snapshot files)
         if metadata.session_id.is_none() && metadata.cwd.is_none() {
@@ -2141,7 +2181,7 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
             resolved
         };
 
-        let commit_hashes = scanner::extract_commit_hashes(file).await;
+        let commit_hashes = session_log_commit_hashes(log).await;
         let agent_label = metadata
             .agent_type
             .clone()
@@ -2164,7 +2204,7 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
             .entry(repo_display.clone())
             .or_default()
             .push(SessionInfo {
-                file: file.clone(),
+                log: log.clone(),
                 session_id,
                 repo_root,
                 metadata,
@@ -2486,10 +2526,46 @@ fn jsonl_prompt_excerpt(text: &str, max_chars: usize) -> Option<String> {
             continue;
         };
 
+        if value.get("type").and_then(|v| v.as_str()) == Some("user")
+            && let Some(content) = value.get("content").and_then(|v| v.as_str())
+        {
+            let out = codex_user_prompt_title(content, max_chars);
+            if out.is_some() {
+                return out;
+            }
+        }
+
         if let Some(title) = value.pointer("/payload/title").and_then(|v| v.as_str()) {
             let out = truncate_with_ellipsis(title, max_chars);
             if !out.is_empty() {
                 latest_prompt = Some(out);
+            }
+        }
+
+        if let Some(input) = value.get("input") {
+            if let Some(text) = input.as_str() {
+                let out = codex_user_prompt_title(text, max_chars);
+                if out.is_some() {
+                    latest_prompt = out;
+                }
+            } else if let Some(map) = input.as_object() {
+                let keys = [
+                    "prompt",
+                    "query",
+                    "user_query",
+                    "userQuery",
+                    "request",
+                    "text",
+                ];
+                for key in keys {
+                    if let Some(text) = map.get(key).and_then(|v| v.as_str()) {
+                        let out = codex_user_prompt_title(text, max_chars);
+                        if out.is_some() {
+                            latest_prompt = out;
+                            break;
+                        }
+                    }
+                }
             }
         }
 
@@ -2571,8 +2647,8 @@ async fn build_local_session_labels_for_repo(
         .unwrap_or_default()
         .as_secs() as i64;
     let mut labels = std::collections::HashMap::new();
-    for file in agents::all_recent_files(now, 90 * 86_400).await {
-        let metadata = scanner::parse_session_metadata(&file).await;
+    for log in agents::discover_recent_sessions(now, 90 * 86_400).await {
+        let metadata = session_log_metadata(&log).await;
         let Some(cwd) = metadata.cwd else {
             continue;
         };
@@ -2582,15 +2658,13 @@ async fn build_local_session_labels_for_repo(
         if file_repo_root != repo {
             continue;
         }
-        let session_log = match tokio::fs::read_to_string(&file).await {
-            Ok(content) => content,
-            Err(_) => continue,
+        let session_log = match session_log_content_async(&log).await {
+            Some(content) => content,
+            None => continue,
         };
         let session_id = metadata.session_id.as_deref().unwrap_or("unknown");
         let agent = metadata.agent_type.unwrap_or(scanner::AgentType::Claude);
-        let session_start = scanner::session_time_range(&file)
-            .await
-            .map(|(start, _)| start);
+        let session_start = session_log_time_range(&log).await.map(|(start, _)| start);
         let content_sha256 = note::content_sha256(&session_log);
         let session_uid = note::compute_session_uid(
             &agent,
@@ -2651,8 +2725,8 @@ async fn discovered_repos_for_sessions() -> Vec<std::path::PathBuf> {
         .unwrap_or_default()
         .as_secs() as i64;
     let mut repos = std::collections::BTreeSet::new();
-    for file in agents::all_recent_files(now, 90 * 86_400).await {
-        let metadata = scanner::parse_session_metadata(&file).await;
+    for log in agents::discover_recent_sessions(now, 90 * 86_400).await {
+        let metadata = session_log_metadata(&log).await;
         let Some(cwd) = metadata.cwd else {
             continue;
         };
@@ -2894,7 +2968,7 @@ async fn run_sessions_audit(all: bool, show_ok: bool) -> Result<()> {
     sessions_audit_repo(&repo, show_ok).await
 }
 
-async fn run_sessions_inspect(query: &str, all: bool) -> Result<()> {
+async fn run_sessions_inspect(query: &str, all: bool, raw: bool) -> Result<()> {
     let repos = if all {
         discovered_repos_for_sessions().await
     } else {
@@ -2970,6 +3044,19 @@ async fn run_sessions_inspect(query: &str, all: bool) -> Result<()> {
                     env.record.observed_commits.len(),
                     env.record.session_id
                 ));
+                if raw {
+                    output::detail("raw_record:");
+                    let raw_record = serde_json::to_string_pretty(&env.record)?;
+                    for line in raw_record.lines() {
+                        output::detail(line);
+                    }
+                    output::detail("raw_session_content:");
+                    for line in env.session_content.lines() {
+                        output::detail(line);
+                    }
+                }
+            } else if raw {
+                output::detail("raw unavailable: unable to decrypt/parse session envelope");
             }
         }
     }
@@ -2985,7 +3072,9 @@ async fn run_sessions(command: Option<SessionsCommand>, all: bool) -> Result<()>
         None => run_sessions_list(all).await,
         Some(SessionsCommand::List { all }) => run_sessions_list(all).await,
         Some(SessionsCommand::Audit { all, show_ok }) => run_sessions_audit(all, show_ok).await,
-        Some(SessionsCommand::Inspect { query, all }) => run_sessions_inspect(&query, all).await,
+        Some(SessionsCommand::Inspect { query, all, raw }) => {
+            run_sessions_inspect(&query, all, raw).await
+        }
     }
 }
 
@@ -4291,7 +4380,30 @@ mod tests {
                 assert!(!all);
                 assert!(matches!(
                     command,
-                    Some(SessionsCommand::Inspect { query, all: false }) if query == "abc123"
+                    Some(SessionsCommand::Inspect {
+                        query,
+                        all: false,
+                        raw: false
+                    }) if query == "abc123"
+                ));
+            }
+            _ => panic!("expected Sessions command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_sessions_inspect_raw() {
+        let cli = Cli::parse_from(["cadence", "sessions", "inspect", "abc123", "--raw"]);
+        match cli.command {
+            Command::Sessions { command, all } => {
+                assert!(!all);
+                assert!(matches!(
+                    command,
+                    Some(SessionsCommand::Inspect {
+                        query,
+                        all: false,
+                        raw: true
+                    }) if query == "abc123"
                 ));
             }
             _ => panic!("expected Sessions command"),
@@ -4559,7 +4671,12 @@ mod tests {
         let stats = process_repo_backfill(
             "example-org/example-repo".to_string(),
             vec![SessionInfo {
-                file: session_file,
+                log: agents::SessionLog {
+                    agent_type: scanner::AgentType::Claude,
+                    source: agents::SessionSource::File(session_file),
+                    updated_at: Some(0),
+                    match_reasons: Vec::new(),
+                },
                 session_id: "no-candidate".to_string(),
                 repo_root: repo.path().to_path_buf(),
                 metadata,
@@ -4597,7 +4714,12 @@ mod tests {
         let stats = process_repo_backfill(
             "example-org/example-repo".to_string(),
             vec![SessionInfo {
-                file: session_file,
+                log: agents::SessionLog {
+                    agent_type: scanner::AgentType::Claude,
+                    source: agents::SessionSource::File(session_file),
+                    updated_at: Some(0),
+                    match_reasons: Vec::new(),
+                },
                 session_id: "missing-commit".to_string(),
                 repo_root: repo.path().to_path_buf(),
                 metadata,
@@ -4641,5 +4763,20 @@ mod tests {
             r#"{"type":"event","payload":{"title":"Fix session list labels for codex logs"}}"#;
         let excerpt = jsonl_prompt_excerpt(content, 72).expect("extract title");
         assert_eq!(excerpt, "Fix session list labels for codex logs");
+    }
+
+    #[test]
+    fn jsonl_prompt_excerpt_extracts_warp_input_prompt() {
+        let content = r#"{"type":"warp_ai_query","input":{"prompt":"Summarize the warp query format for Cadence"}}"#;
+        let excerpt = jsonl_prompt_excerpt(content, 72).expect("extract prompt");
+        assert!(excerpt.starts_with("Summarize the warp query format"));
+    }
+
+    #[test]
+    fn jsonl_prompt_excerpt_prefers_normalized_user_turn() {
+        let content = r#"{"type":"user","content":"Review the Warp output and summarize tool calls"}
+{"type":"warp_ai_query","input":{"prompt":"fallback prompt"}}"#;
+        let excerpt = jsonl_prompt_excerpt(content, 72).expect("extract prompt");
+        assert!(excerpt.starts_with("Review the Warp output"));
     }
 }

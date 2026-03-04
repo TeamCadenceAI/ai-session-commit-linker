@@ -10,7 +10,12 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{app_config_dir_in, find_chat_session_dirs, home_dir};
+use super::{
+    AgentExplorer, SessionLog, SessionSource, app_config_dir_in, find_chat_session_dirs, home_dir,
+    recent_files_with_exts,
+};
+use crate::scanner::AgentType;
+use async_trait::async_trait;
 
 /// Return all Cursor log directories for use by the post-commit hook.
 pub async fn log_dirs() -> Vec<PathBuf> {
@@ -24,6 +29,25 @@ pub async fn log_dirs() -> Vec<PathBuf> {
 /// Return all Cursor log directories for backfill (not repo-scoped).
 pub async fn all_log_dirs() -> Vec<PathBuf> {
     log_dirs().await
+}
+
+pub struct CursorExplorer;
+
+#[async_trait]
+impl AgentExplorer for CursorExplorer {
+    async fn discover_recent(&self, now: i64, since_secs: i64) -> Vec<SessionLog> {
+        let dirs = all_log_dirs().await;
+        recent_files_with_exts(&dirs, now, since_secs, &["json", "txt"])
+            .await
+            .into_iter()
+            .map(|file| SessionLog {
+                agent_type: AgentType::Cursor,
+                source: SessionSource::File(file.path),
+                updated_at: Some(file.mtime_epoch),
+                match_reasons: Vec::new(),
+            })
+            .collect()
+    }
 }
 
 async fn log_dirs_in(home: &Path) -> Vec<PathBuf> {
