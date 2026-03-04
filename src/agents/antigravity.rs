@@ -12,7 +12,12 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use super::{app_config_dir_in, find_chat_session_dirs, home_dir};
+use super::{
+    AgentExplorer, SessionLog, SessionSource, app_config_dir_in, find_chat_session_dirs, home_dir,
+    recent_files_with_exts,
+};
+use crate::scanner::AgentType;
+use async_trait::async_trait;
 
 /// Return all Antigravity log directories for use by the post-commit hook.
 pub fn log_dirs() -> Vec<PathBuf> {
@@ -26,6 +31,24 @@ pub fn log_dirs() -> Vec<PathBuf> {
 /// Return all Antigravity log directories for backfill (not repo-scoped).
 pub fn all_log_dirs() -> Vec<PathBuf> {
     log_dirs()
+}
+
+pub struct AntigravityExplorer;
+
+#[async_trait]
+impl AgentExplorer for AntigravityExplorer {
+    async fn discover_recent(&self, now: i64, since_secs: i64) -> Vec<SessionLog> {
+        let dirs = all_log_dirs();
+        recent_files_with_exts(&dirs, now, since_secs, &["json"])
+            .into_iter()
+            .map(|file| SessionLog {
+                agent_type: AgentType::Antigravity,
+                source: SessionSource::File(file.path),
+                updated_at: Some(file.mtime_epoch),
+                match_reasons: Vec::new(),
+            })
+            .collect()
+    }
 }
 
 fn log_dirs_in(home: &Path) -> Vec<PathBuf> {

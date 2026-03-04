@@ -53,6 +53,10 @@ cadence doctor
 - Cursor
 - GitHub Copilot
 - Antigravity
+- Warp
+
+Note: Warp stores sessions in a local SQLite database. In some local-only cases the
+assistant output may be missing, so Cadence stores prompts/context without responses.
 
 ## Encryption
 

@@ -11,7 +11,7 @@
 //! the short hash (first 7 characters).
 
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Cursor};
 use std::path::Path;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -28,6 +28,7 @@ pub enum AgentType {
     Cursor,
     Copilot,
     Antigravity,
+    Warp,
 }
 
 impl std::fmt::Display for AgentType {
@@ -38,6 +39,7 @@ impl std::fmt::Display for AgentType {
             AgentType::Cursor => write!(f, "cursor"),
             AgentType::Copilot => write!(f, "copilot"),
             AgentType::Antigravity => write!(f, "antigravity"),
+            AgentType::Warp => write!(f, "warp"),
         }
     }
 }
@@ -80,68 +82,32 @@ pub fn parse_session_metadata(file: &Path) -> SessionMetadata {
         Err(_) => return metadata,
     };
 
-    let reader = BufReader::new(file_handle);
-
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-
-        // Attempt to parse as JSON
-        let value: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        // Extract session_id (top-level or nested under payload for Codex)
-        if metadata.session_id.is_none()
-            && let Some(id) = value
-                .get("session_id")
-                .or_else(|| value.get("sessionId"))
-                .or_else(|| value.pointer("/payload/id"))
-                .and_then(|v| v.as_str())
-        {
-            metadata.session_id = Some(id.to_string());
-        }
-
-        // Extract cwd / workdir (top-level or nested under payload for Codex)
-        if metadata.cwd.is_none()
-            && let Some(cwd) = value
-                .get("cwd")
-                .or_else(|| value.get("workdir"))
-                .or_else(|| value.get("working_directory"))
-                .or_else(|| value.pointer("/payload/cwd"))
-                .and_then(|v| v.as_str())
-        {
-            metadata.cwd = Some(cwd.to_string());
-        }
-
-        // If we have both fields, stop early
-        if metadata.session_id.is_some() && metadata.cwd.is_some() {
-            break;
-        }
-    }
+    metadata = parse_session_metadata_reader(BufReader::new(file_handle), metadata);
 
     // Fallback: parse full JSON (chatSessions format).
     if (metadata.session_id.is_none() || metadata.cwd.is_none())
         && let Some(value) = read_json_value(file)
     {
-        if metadata.session_id.is_none()
-            && let Some(id) = value.get("sessionId").and_then(|v| v.as_str())
-        {
-            metadata.session_id = Some(id.to_string());
-        }
-
-        if metadata.cwd.is_none()
-            && let Some(path) = extract_cwd_from_value(&value)
-        {
-            metadata.cwd = Some(path);
-        }
+        apply_metadata_from_value(&mut metadata, &value);
     }
 
     // Infer agent type from file path
     metadata.agent_type = Some(infer_agent_type(file));
+
+    metadata
+}
+
+/// Parse minimal metadata from a session log string.
+pub fn parse_session_metadata_str(content: &str) -> SessionMetadata {
+    let metadata = SessionMetadata::default();
+    let metadata = parse_session_metadata_reader(BufReader::new(Cursor::new(content)), metadata);
+    let mut metadata = metadata;
+
+    if (metadata.session_id.is_none() || metadata.cwd.is_none())
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(content)
+    {
+        apply_metadata_from_value(&mut metadata, &value);
+    }
 
     metadata
 }
@@ -158,66 +124,29 @@ pub fn session_time_range(file: &Path) -> Option<(i64, i64)> {
     let file_handle = File::open(file).ok()?;
     let reader = BufReader::new(file_handle);
 
-    let mut min_ts: Option<i64> = None;
-    let mut max_ts: Option<i64> = None;
+    let range = session_time_range_reader(reader);
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-
-        let value: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        let candidates = [
-            value.get("timestamp"),
-            value.get("time"),
-            value.get("created_at"),
-            value.get("createdAt"),
-            value.get("creationDate"),
-            value.get("lastMessageDate"),
-            value.pointer("/payload/timestamp"),
-            value.pointer("/payload/created_at"),
-            value.pointer("/payload/createdAt"),
-        ];
-
-        for candidate in candidates.iter().flatten() {
-            if let Some(ts) =
-                parse_timestamp(candidate).or_else(|| parse_numeric_timestamp(candidate))
-            {
-                min_ts = Some(min_ts.map_or(ts, |min| min.min(ts)));
-                max_ts = Some(max_ts.map_or(ts, |max| max.max(ts)));
-            }
-        }
-    }
-
-    if (min_ts.is_none() || max_ts.is_none())
+    if range.is_none()
         && let Some(value) = read_json_value(file)
     {
-        let mut all = Vec::new();
-        collect_timestamp_candidates(&value, &mut all);
-        for candidate in all {
-            if let Some(ts) =
-                parse_timestamp(&candidate).or_else(|| parse_numeric_timestamp(&candidate))
-            {
-                min_ts = Some(min_ts.map_or(ts, |min| min.min(ts)));
-                max_ts = Some(max_ts.map_or(ts, |max| max.max(ts)));
-            }
-        }
+        return session_time_range_from_value(&value);
     }
 
-    match (min_ts, max_ts) {
-        (Some(min), Some(max)) => Some((min, max)),
-        _ => None,
-    }
+    range
 }
 
-/// Public wrapper to infer agent type from a log file path.
-pub fn agent_type_from_path(path: &Path) -> AgentType {
-    infer_agent_type(path)
+/// Extract the session time range (start, end) from a session log string.
+pub fn session_time_range_str(content: &str) -> Option<(i64, i64)> {
+    let reader = BufReader::new(Cursor::new(content));
+    let range = session_time_range_reader(reader);
+
+    if range.is_none()
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(content)
+    {
+        return session_time_range_from_value(&value);
+    }
+
+    range
 }
 
 /// Extract commit hashes from git commit confirmation output in a session log.
@@ -234,21 +163,12 @@ pub fn extract_commit_hashes(file: &Path) -> Vec<String> {
         Ok(f) => f,
         Err(_) => return Vec::new(),
     };
+    extract_commit_hashes_reader(BufReader::new(file_handle))
+}
 
-    let reader = BufReader::new(file_handle);
-    let mut hashes = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-
-        extract_hashes_from_line(&line, &mut hashes, &mut seen);
-    }
-
-    hashes
+/// Extract commit hashes from session log content.
+pub fn extract_commit_hashes_str(content: &str) -> Vec<String> {
+    extract_commit_hashes_reader(BufReader::new(Cursor::new(content)))
 }
 
 /// Extract commit hashes from `[branch HASH]` patterns in a single line.
@@ -344,6 +264,8 @@ fn infer_agent_type(path: &Path) -> AgentType {
         || path_lower.contains("/.cadence/cli/antigravity-api/")
     {
         AgentType::Antigravity
+    } else if path_lower.contains("warp.sqlite") || path_lower.contains("/warp/") {
+        AgentType::Warp
     } else if path_lower.contains("/code/") {
         AgentType::Copilot
     } else {
@@ -374,6 +296,148 @@ fn parse_numeric_timestamp(value: &serde_json::Value) -> Option<i64> {
 fn read_json_value(file: &Path) -> Option<serde_json::Value> {
     let content = std::fs::read_to_string(file).ok()?;
     serde_json::from_str(&content).ok()
+}
+
+fn parse_session_metadata_reader<R: BufRead>(
+    reader: R,
+    mut metadata: SessionMetadata,
+) -> SessionMetadata {
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+
+        // Attempt to parse as JSON
+        let value: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        apply_metadata_from_value(&mut metadata, &value);
+
+        // If we have both fields, stop early
+        if metadata.session_id.is_some() && metadata.cwd.is_some() {
+            break;
+        }
+    }
+
+    metadata
+}
+
+fn apply_metadata_from_value(metadata: &mut SessionMetadata, value: &serde_json::Value) {
+    // Extract session_id (top-level or nested under payload for Codex)
+    if metadata.session_id.is_none()
+        && let Some(id) = value
+            .get("session_id")
+            .or_else(|| value.get("sessionId"))
+            .or_else(|| value.pointer("/payload/id"))
+            .and_then(|v| v.as_str())
+    {
+        metadata.session_id = Some(id.to_string());
+    }
+
+    // Extract cwd / workdir (top-level or nested under payload for Codex)
+    if metadata.cwd.is_none()
+        && let Some(cwd) = value
+            .get("cwd")
+            .or_else(|| value.get("workdir"))
+            .or_else(|| value.get("working_directory"))
+            .or_else(|| value.pointer("/payload/cwd"))
+            .and_then(|v| v.as_str())
+    {
+        metadata.cwd = Some(cwd.to_string());
+    }
+
+    if metadata.session_id.is_none()
+        && let Some(id) = value.get("sessionId").and_then(|v| v.as_str())
+    {
+        metadata.session_id = Some(id.to_string());
+    }
+
+    if metadata.cwd.is_none()
+        && let Some(path) = extract_cwd_from_value(value)
+    {
+        metadata.cwd = Some(path);
+    }
+}
+
+fn session_time_range_reader<R: BufRead>(reader: R) -> Option<(i64, i64)> {
+    let mut min_ts: Option<i64> = None;
+    let mut max_ts: Option<i64> = None;
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+
+        let value: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let candidates = [
+            value.get("timestamp"),
+            value.get("time"),
+            value.get("created_at"),
+            value.get("createdAt"),
+            value.get("creationDate"),
+            value.get("lastMessageDate"),
+            value.pointer("/payload/timestamp"),
+            value.pointer("/payload/created_at"),
+            value.pointer("/payload/createdAt"),
+        ];
+
+        for candidate in candidates.iter().flatten() {
+            if let Some(ts) =
+                parse_timestamp(candidate).or_else(|| parse_numeric_timestamp(candidate))
+            {
+                min_ts = Some(min_ts.map_or(ts, |min| min.min(ts)));
+                max_ts = Some(max_ts.map_or(ts, |max| max.max(ts)));
+            }
+        }
+    }
+
+    match (min_ts, max_ts) {
+        (Some(min), Some(max)) => Some((min, max)),
+        _ => None,
+    }
+}
+
+fn session_time_range_from_value(value: &serde_json::Value) -> Option<(i64, i64)> {
+    let mut all = Vec::new();
+    collect_timestamp_candidates(value, &mut all);
+    let mut min_ts: Option<i64> = None;
+    let mut max_ts: Option<i64> = None;
+    for candidate in all {
+        if let Some(ts) =
+            parse_timestamp(&candidate).or_else(|| parse_numeric_timestamp(&candidate))
+        {
+            min_ts = Some(min_ts.map_or(ts, |min| min.min(ts)));
+            max_ts = Some(max_ts.map_or(ts, |max| max.max(ts)));
+        }
+    }
+    match (min_ts, max_ts) {
+        (Some(min), Some(max)) => Some((min, max)),
+        _ => None,
+    }
+}
+
+fn extract_commit_hashes_reader<R: BufRead>(reader: R) -> Vec<String> {
+    let mut hashes = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+
+        extract_hashes_from_line(&line, &mut hashes, &mut seen);
+    }
+
+    hashes
 }
 
 fn extract_cwd_from_value(value: &serde_json::Value) -> Option<String> {
@@ -533,6 +597,14 @@ mod tests {
     }
 
     #[test]
+    fn test_infer_agent_type_warp() {
+        let path = Path::new(
+            "/Users/foo/Library/Group Containers/2BBY89MBSN.dev.warp/Library/Application Support/dev.warp.Warp-Stable/warp.sqlite",
+        );
+        assert_eq!(infer_agent_type(path), AgentType::Warp);
+    }
+
+    #[test]
     fn test_infer_agent_type_unknown_defaults_to_claude() {
         let path = Path::new("/tmp/some/random/session.jsonl");
         assert_eq!(infer_agent_type(path), AgentType::Claude);
@@ -565,6 +637,11 @@ mod tests {
     #[test]
     fn test_agent_type_display_antigravity() {
         assert_eq!(AgentType::Antigravity.to_string(), "antigravity");
+    }
+
+    #[test]
+    fn test_agent_type_display_warp() {
+        assert_eq!(AgentType::Warp.to_string(), "warp");
     }
 
     // -----------------------------------------------------------------------
@@ -752,6 +829,26 @@ also not json {{{{
     }
 
     // -----------------------------------------------------------------------
+    // parse_session_metadata_str
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_metadata_str_extracts_fields() {
+        let content = r#"{"session_id":"str-1","cwd":"/tmp/repo"}"#;
+        let metadata = parse_session_metadata_str(content);
+        assert_eq!(metadata.session_id, Some("str-1".to_string()));
+        assert_eq!(metadata.cwd, Some("/tmp/repo".to_string()));
+    }
+
+    #[test]
+    fn test_parse_metadata_str_falls_back_to_full_json() {
+        let content = r#"{"sessionId":"chat-999","requests":[{"response":[{"baseUri":{"path":"file:///Users/foo/dev/repo"}}]}]}"#;
+        let metadata = parse_session_metadata_str(content);
+        assert_eq!(metadata.session_id, Some("chat-999".to_string()));
+        assert_eq!(metadata.cwd, Some("/Users/foo/dev/repo".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
     // parse_session_metadata — Codex format (nested under payload)
     // -----------------------------------------------------------------------
 
@@ -847,6 +944,13 @@ also not json {{{{
         let range = session_time_range(&file).unwrap();
         assert_eq!(range.0, 1_749_509_938);
         assert_eq!(range.1, 1_749_509_971);
+    }
+
+    #[test]
+    fn test_session_time_range_str_parses() {
+        let content = r#"{"timestamp":"2026-02-10T01:52:21Z"}"#;
+        let range = session_time_range_str(content).unwrap();
+        assert_eq!(range.0, range.1);
     }
 
     #[test]
@@ -1021,5 +1125,12 @@ also not json {{{{
         // but NOT from the bare "Commit 655dd38" mention
         assert_eq!(hashes.len(), 1);
         assert_eq!(hashes[0], "655dd38");
+    }
+
+    #[test]
+    fn test_extract_commit_hashes_str() {
+        let content = r#"{"content":"[main abcdef0] fix bug"}"#;
+        let hashes = extract_commit_hashes_str(content);
+        assert_eq!(hashes, vec!["abcdef0".to_string()]);
     }
 }

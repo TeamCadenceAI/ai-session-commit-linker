@@ -8,7 +8,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::home_dir;
+use super::{AgentExplorer, SessionLog, SessionSource, home_dir, recent_files_with_exts};
+use crate::scanner::AgentType;
+use async_trait::async_trait;
 
 /// Return ALL directories under `~/.claude/projects/`.
 ///
@@ -25,6 +27,24 @@ pub fn all_log_dirs() -> Vec<PathBuf> {
         None => return Vec::new(),
     };
     all_log_dirs_in(&home)
+}
+
+pub struct ClaudeExplorer;
+
+#[async_trait]
+impl AgentExplorer for ClaudeExplorer {
+    async fn discover_recent(&self, now: i64, since_secs: i64) -> Vec<SessionLog> {
+        let dirs = all_log_dirs();
+        recent_files_with_exts(&dirs, now, since_secs, &["jsonl"])
+            .into_iter()
+            .map(|file| SessionLog {
+                agent_type: AgentType::Claude,
+                source: SessionSource::File(file.path),
+                updated_at: Some(file.mtime_epoch),
+                match_reasons: Vec::new(),
+            })
+            .collect()
+    }
 }
 
 /// Internal: find ALL Claude log directories under a given home directory.
