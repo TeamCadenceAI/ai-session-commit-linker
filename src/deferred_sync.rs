@@ -813,6 +813,8 @@ async fn log_dir() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     #[test]
@@ -839,5 +841,156 @@ mod tests {
             .await
             .unwrap();
         assert!(lock2.is_some());
+    }
+
+    #[tokio::test]
+    async fn write_json_atomic_allows_concurrent_writers() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("record.json");
+
+        let mut set = JoinSet::new();
+        for i in 0..24u32 {
+            let path = path.clone();
+            set.spawn(
+                async move { write_json_atomic(&path, &serde_json::json!({ "i": i })).await },
+            );
+        }
+
+        while let Some(done) = set.join_next().await {
+            done.unwrap().unwrap();
+        }
+
+        let content = tokio::fs::read_to_string(&path).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(parsed.get("i").and_then(|v| v.as_u64()).is_some());
+    }
+
+    struct EnvBackup {
+        home: Option<String>,
+        userprofile: Option<String>,
+        homedrive: Option<String>,
+        homepath: Option<String>,
+    }
+
+    impl EnvBackup {
+        fn capture() -> Self {
+            Self {
+                home: std::env::var("HOME").ok(),
+                userprofile: std::env::var("USERPROFILE").ok(),
+                homedrive: std::env::var("HOMEDRIVE").ok(),
+                homepath: std::env::var("HOMEPATH").ok(),
+            }
+        }
+
+        fn restore(self) {
+            match self.home {
+                Some(v) => unsafe { std::env::set_var("HOME", v) },
+                None => unsafe { std::env::remove_var("HOME") },
+            }
+            match self.userprofile {
+                Some(v) => unsafe { std::env::set_var("USERPROFILE", v) },
+                None => unsafe { std::env::remove_var("USERPROFILE") },
+            }
+            match self.homedrive {
+                Some(v) => unsafe { std::env::set_var("HOMEDRIVE", v) },
+                None => unsafe { std::env::remove_var("HOMEDRIVE") },
+            }
+            match self.homepath {
+                Some(v) => unsafe { std::env::set_var("HOMEPATH", v) },
+                None => unsafe { std::env::remove_var("HOMEPATH") },
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn has_pending_sync_jobs_detects_pending_json_files() {
+        let tmp = TempDir::new().unwrap();
+        let backup = EnvBackup::capture();
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+        }
+
+        assert!(!has_pending_sync_jobs().await);
+
+        let pending = tmp.path().join(".cadence/cli/pending-sync");
+        tokio::fs::create_dir_all(&pending).await.unwrap();
+        tokio::fs::write(pending.join("ignore.txt"), "x")
+            .await
+            .unwrap();
+        assert!(!has_pending_sync_jobs().await);
+
+        tokio::fs::write(
+            pending.join("job.json"),
+            serde_json::to_vec_pretty(&PendingSyncRecord {
+                repo_root: "/tmp/repo".to_string(),
+                remote: "origin".to_string(),
+                enqueued_at: crate::note::now_rfc3339(),
+                updated_at: crate::note::now_rfc3339(),
+                attempt_count: 0,
+                next_attempt_at_epoch: now_epoch(),
+                last_error: None,
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(has_pending_sync_jobs().await);
+
+        backup.restore();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn collect_runnable_jobs_filters_by_retry_window_and_max_items() {
+        let tmp = TempDir::new().unwrap();
+        let backup = EnvBackup::capture();
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+        }
+
+        let pending = tmp.path().join(".cadence/cli/pending-sync");
+        tokio::fs::create_dir_all(&pending).await.unwrap();
+        let now = now_epoch();
+        let mk = |repo_root: &str, remote: &str, next_attempt_at_epoch: i64| PendingSyncRecord {
+            repo_root: repo_root.to_string(),
+            remote: remote.to_string(),
+            enqueued_at: crate::note::now_rfc3339(),
+            updated_at: crate::note::now_rfc3339(),
+            attempt_count: 0,
+            next_attempt_at_epoch,
+            last_error: None,
+        };
+
+        let records = vec![
+            mk("/tmp/b-repo", "origin", now - 10),
+            mk("/tmp/a-repo", "origin", now - 10),
+            mk("/tmp/c-repo", "origin", now + 600),
+        ];
+        for (idx, rec) in records.into_iter().enumerate() {
+            let path = pending.join(format!("job-{idx}.json"));
+            tokio::fs::write(path, serde_json::to_vec_pretty(&rec).unwrap())
+                .await
+                .unwrap();
+        }
+
+        let jobs = collect_runnable_jobs(&SyncRunOptions {
+            repo: None,
+            remote: None,
+            all_pending: true,
+            background: false,
+            max_items: 1,
+            time_budget_ms: 1000,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(
+            jobs[0].repo_root,
+            PathBuf::from("/tmp/a-repo").to_string_lossy()
+        );
+
+        backup.restore();
     }
 }
