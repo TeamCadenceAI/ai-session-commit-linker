@@ -5,6 +5,7 @@ use anyhow::Result;
 use std::collections::BTreeMap;
 use std::path::Path;
 use tokio::task::JoinSet;
+use tracing::{info, warn};
 
 const SESSION_REFS: [&str; 3] = [
     git::SESSION_DATA_REF,
@@ -70,7 +71,15 @@ pub async fn sync_session_refs_for_remote_at(repo: &Path, remote: &str) -> Resul
     let all_match = SESSION_REFS
         .iter()
         .all(|r| local_hashes.get(*r) == remote_hashes.get(*r));
+    info!(
+        remote = %remote,
+        repo = %repo.display(),
+        refs_total = SESSION_REFS.len(),
+        refs_equal = all_match,
+        "starting session ref sync"
+    );
     if all_match {
+        info!(remote = %remote, "no session ref changes detected; skipping sync");
         return Ok(());
     }
 
@@ -83,14 +92,32 @@ pub async fn sync_session_refs_for_remote_at(repo: &Path, remote: &str) -> Resul
         let pre_remote_hash = remote_hashes.get(ref_name.as_str()).cloned();
         let local_hash = local_hashes.get(ref_name.as_str()).cloned();
         set.spawn(async move {
+            info!(
+                remote = %remote,
+                ref_name = %ref_name,
+                remote_tip = %short_hash(pre_remote_hash.as_deref()),
+                local_tip = %short_hash(local_hash.as_deref()),
+                "queued per-ref sync task"
+            );
             sync_ref_for_remote_with_state(&repo, &remote, &ref_name, pre_remote_hash, local_hash)
                 .await
         });
     }
 
     while let Some(next) = set.join_next().await {
-        next??;
+        match next {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                warn!(remote = %remote, error = %e, "session ref sync task failed");
+                return Err(e);
+            }
+            Err(e) => {
+                warn!(remote = %remote, error = %e, "session ref sync task join error");
+                return Err(e.into());
+            }
+        }
     }
+    info!(remote = %remote, "session ref sync finished");
     Ok(())
 }
 
@@ -129,27 +156,64 @@ async fn sync_ref_for_remote_with_state(
     pre_remote_hash: Option<String>,
     local_hash: Option<String>,
 ) -> Result<()> {
+    let local_has_new_content = local_hash.is_some() && local_hash != pre_remote_hash;
+    info!(
+        remote = %remote,
+        ref_name = %ref_name,
+        remote_tip = %short_hash(pre_remote_hash.as_deref()),
+        local_tip = %short_hash(local_hash.as_deref()),
+        local_has_new_content,
+        "evaluating ref sync state"
+    );
+
     if local_hash == pre_remote_hash {
+        info!(remote = %remote, ref_name = %ref_name, "ref already in sync");
         return Ok(());
     }
 
     if pre_remote_hash.is_none() {
         if local_hash.is_none() {
+            info!(
+                remote = %remote,
+                ref_name = %ref_name,
+                "remote and local ref missing; nothing to sync"
+            );
             return Ok(());
         }
+        info!(
+            remote = %remote,
+            ref_name = %ref_name,
+            "remote ref missing; pushing local content to remote"
+        );
         let push_res =
             git::push_ref_with_lease_at(Some(repo), remote, ref_name, &pre_remote_hash).await;
         if let Err(e) = push_res {
             let msg = e.to_string();
             if is_ref_push_race(&msg, ref_name) {
+                warn!(
+                    remote = %remote,
+                    ref_name = %ref_name,
+                    "push raced; retrying with refresh flow"
+                );
                 return sync_ref_for_remote_inner(repo, remote, ref_name, false).await;
             }
             return Err(e);
         }
+        info!(
+            remote = %remote,
+            ref_name = %ref_name,
+            pushed_local_new_content = true,
+            "pushed local ref successfully"
+        );
         return Ok(());
     }
 
     if local_hash.is_none() {
+        info!(
+            remote = %remote,
+            ref_name = %ref_name,
+            "local ref missing; attempting to fetch remote content"
+        );
         let temp_ref = temp_ref_name(ref_name, remote);
         let _ = git::run_git_output_at(Some(repo), &["update-ref", "-d", &temp_ref], &[]).await;
         let fetch_result =
@@ -157,6 +221,20 @@ async fn sync_ref_for_remote_with_state(
         if fetch_result.fetched {
             let remote_tip = git::rev_parse_at(Some(repo), &temp_ref).await?;
             git::update_ref_at(Some(repo), ref_name, &remote_tip).await?;
+            info!(
+                remote = %remote,
+                ref_name = %ref_name,
+                remote_tip = %short_hash(Some(remote_tip.as_str())),
+                pulled_remote_new_content = true,
+                "updated local ref from remote"
+            );
+        } else {
+            info!(
+                remote = %remote,
+                ref_name = %ref_name,
+                pulled_remote_new_content = false,
+                "remote ref not fetched; nothing to apply locally"
+            );
         }
         let _ = git::run_git_output_at(Some(repo), &["update-ref", "-d", &temp_ref], &[]).await;
         return Ok(());
@@ -167,27 +245,60 @@ async fn sync_ref_for_remote_with_state(
     let fetch_result = git::fetch_ref_to_temp_at(Some(repo), remote, ref_name, &temp_ref).await?;
     if !fetch_result.fetched {
         let _ = git::run_git_output_at(Some(repo), &["update-ref", "-d", &temp_ref], &[]).await;
+        info!(
+            remote = %remote,
+            ref_name = %ref_name,
+            pulled_remote_new_content = false,
+            pushed_local_new_content = true,
+            "remote ref absent during fetch; pushing local content"
+        );
         let push_res =
             git::push_ref_with_lease_at(Some(repo), remote, ref_name, &pre_remote_hash).await;
         if let Err(e) = push_res {
             let msg = e.to_string();
             if is_ref_push_race(&msg, ref_name) {
+                warn!(
+                    remote = %remote,
+                    ref_name = %ref_name,
+                    "push raced after missing fetch; retrying with refresh flow"
+                );
                 return sync_ref_for_remote_inner(repo, remote, ref_name, false).await;
             }
             return Err(e);
         }
+        info!(remote = %remote, ref_name = %ref_name, "pushed local ref successfully");
         return Ok(());
     }
 
     let fetched_hash = git::rev_parse_at(Some(repo), &temp_ref).await.ok();
     if fetched_hash == local_hash {
+        info!(
+            remote = %remote,
+            ref_name = %ref_name,
+            pulled_remote_new_content = false,
+            pushed_local_new_content = false,
+            "remote content matches local; no merge or push needed"
+        );
         let _ = git::run_git_output_at(Some(repo), &["update-ref", "-d", &temp_ref], &[]).await;
         return Ok(());
     }
 
+    info!(
+        remote = %remote,
+        ref_name = %ref_name,
+        fetched_remote_tip = %short_hash(fetched_hash.as_deref()),
+        pulled_remote_new_content = true,
+        "remote contains new content; merging with local ref"
+    );
     let merged = merge_ref_maps(repo, ref_name, &temp_ref).await?;
     if let Some(new_tip) = merged {
         git::update_ref_at(Some(repo), ref_name, &new_tip).await?;
+        info!(
+            remote = %remote,
+            ref_name = %ref_name,
+            merged_tip = %short_hash(Some(new_tip.as_str())),
+            "updated local ref with merged content"
+        );
     }
     let push_res =
         git::push_ref_with_lease_at(Some(repo), remote, ref_name, &pre_remote_hash).await;
@@ -195,10 +306,22 @@ async fn sync_ref_for_remote_with_state(
     if let Err(e) = push_res {
         let msg = e.to_string();
         if is_ref_push_race(&msg, ref_name) {
+            warn!(
+                remote = %remote,
+                ref_name = %ref_name,
+                "push raced after merge; retrying with refresh flow"
+            );
             return sync_ref_for_remote_inner(repo, remote, ref_name, false).await;
         }
         return Err(e);
     }
+    info!(
+        remote = %remote,
+        ref_name = %ref_name,
+        pulled_remote_new_content = true,
+        pushed_local_new_content = true,
+        "pushed merged ref successfully"
+    );
     Ok(())
 }
 
@@ -218,6 +341,11 @@ async fn sync_ref_for_remote_inner(
             .unwrap_or(None);
 
         if local_hash == pre_remote_hash {
+            info!(
+                remote = %remote,
+                ref_name = %ref_name,
+                "fallback sync observed ref already in sync"
+            );
             return Ok(());
         }
 
@@ -231,6 +359,11 @@ async fn sync_ref_for_remote_inner(
                 let msg = e.to_string();
                 if may_retry && is_ref_push_race(&msg, ref_name) {
                     may_retry = false;
+                    warn!(
+                        remote = %remote,
+                        ref_name = %ref_name,
+                        "fallback push raced; retrying once"
+                    );
                     continue;
                 }
                 return Err(e);
@@ -264,6 +397,11 @@ async fn sync_ref_for_remote_inner(
                 let msg = e.to_string();
                 if may_retry && is_ref_push_race(&msg, ref_name) {
                     may_retry = false;
+                    warn!(
+                        remote = %remote,
+                        ref_name = %ref_name,
+                        "fallback push raced after missing remote fetch; retrying once"
+                    );
                     continue;
                 }
                 return Err(e);
@@ -289,12 +427,24 @@ async fn sync_ref_for_remote_inner(
             let msg = e.to_string();
             if may_retry && is_ref_push_race(&msg, ref_name) {
                 may_retry = false;
+                warn!(
+                    remote = %remote,
+                    ref_name = %ref_name,
+                    "fallback push raced after merge; retrying once"
+                );
                 continue;
             }
             return Err(e);
         }
 
         return Ok(());
+    }
+}
+
+fn short_hash(hash: Option<&str>) -> String {
+    match hash {
+        Some(h) => h.chars().take(12).collect(),
+        None => "none".to_string(),
     }
 }
 
