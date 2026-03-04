@@ -10,7 +10,6 @@
 //! into memory) and doing substring matching for the full hash and
 //! the short hash (first 7 characters).
 
-use std::fs::File;
 use std::io::{BufRead, BufReader, Cursor};
 use std::path::Path;
 use time::OffsetDateTime;
@@ -74,19 +73,18 @@ pub struct SessionMetadata {
 /// every JSON line will contain the fields we need. The function
 /// accumulates fields across all lines, with first-value-wins semantics
 /// (once a field is found, later occurrences are ignored).
-pub fn parse_session_metadata(file: &Path) -> SessionMetadata {
+pub async fn parse_session_metadata(file: &Path) -> SessionMetadata {
     let mut metadata = SessionMetadata::default();
-
-    let file_handle = match File::open(file) {
-        Ok(f) => f,
+    let content = match tokio::fs::read_to_string(file).await {
+        Ok(c) => c,
         Err(_) => return metadata,
     };
-
-    metadata = parse_session_metadata_reader(BufReader::new(file_handle), metadata);
+    let reader = BufReader::new(Cursor::new(content.as_bytes()));
+    metadata = parse_session_metadata_reader(reader, metadata);
 
     // Fallback: parse full JSON (chatSessions format).
     if (metadata.session_id.is_none() || metadata.cwd.is_none())
-        && let Some(value) = read_json_value(file)
+        && let Some(value) = read_json_value(file).await
     {
         apply_metadata_from_value(&mut metadata, &value);
     }
@@ -120,14 +118,13 @@ pub fn parse_session_metadata_str(content: &str) -> SessionMetadata {
 ///
 /// Parses RFC3339/ISO8601 timestamps and returns the min/max epoch seconds.
 /// Returns `None` if no parseable timestamps are found.
-pub fn session_time_range(file: &Path) -> Option<(i64, i64)> {
-    let file_handle = File::open(file).ok()?;
-    let reader = BufReader::new(file_handle);
-
+pub async fn session_time_range(file: &Path) -> Option<(i64, i64)> {
+    let content = tokio::fs::read_to_string(file).await.ok()?;
+    let reader = BufReader::new(Cursor::new(content.as_bytes()));
     let range = session_time_range_reader(reader);
 
     if range.is_none()
-        && let Some(value) = read_json_value(file)
+        && let Some(value) = read_json_value(file).await
     {
         return session_time_range_from_value(&value);
     }
@@ -158,12 +155,12 @@ pub fn session_time_range_str(content: &str) -> Option<(i64, i64)> {
 ///
 /// Returns a deduplicated `Vec<String>` of extracted hashes (lowercased).
 /// Returns an empty Vec on any I/O error.
-pub fn extract_commit_hashes(file: &Path) -> Vec<String> {
-    let file_handle = match File::open(file) {
-        Ok(f) => f,
+pub async fn extract_commit_hashes(file: &Path) -> Vec<String> {
+    let content = match tokio::fs::read_to_string(file).await {
+        Ok(c) => c,
         Err(_) => return Vec::new(),
     };
-    extract_commit_hashes_reader(BufReader::new(file_handle))
+    extract_commit_hashes_reader(BufReader::new(Cursor::new(content.as_bytes())))
 }
 
 /// Extract commit hashes from session log content.
@@ -293,8 +290,8 @@ fn parse_numeric_timestamp(value: &serde_json::Value) -> Option<i64> {
     }
 }
 
-fn read_json_value(file: &Path) -> Option<serde_json::Value> {
-    let content = std::fs::read_to_string(file).ok()?;
+async fn read_json_value(file: &Path) -> Option<serde_json::Value> {
+    let content = tokio::fs::read_to_string(file).await.ok()?;
     serde_json::from_str(&content).ok()
 }
 
@@ -535,7 +532,7 @@ fn collect_timestamp_candidates(value: &serde_json::Value, out: &mut Vec<serde_j
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+
     use tempfile::TempDir;
     use time::OffsetDateTime;
     use time::format_description::well_known::Rfc3339;
@@ -544,9 +541,11 @@ mod tests {
     // Helper: create a temp file with given content
     // -----------------------------------------------------------------------
 
-    fn write_temp_file(dir: &Path, name: &str, content: &str) -> std::path::PathBuf {
+    async fn write_temp_file(dir: &Path, name: &str, content: &str) -> std::path::PathBuf {
         let path = dir.join(name);
-        fs::write(&path, content).expect("failed to write temp file");
+        tokio::fs::write(&path, content)
+            .await
+            .expect("failed to write temp file");
         path
     }
 
@@ -554,44 +553,44 @@ mod tests {
     // infer_agent_type
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_infer_agent_type_claude() {
+    #[tokio::test]
+    async fn test_infer_agent_type_claude() {
         let path = Path::new("/Users/foo/.claude/projects/-Users-foo-bar/session.jsonl");
         assert_eq!(infer_agent_type(path), AgentType::Claude);
     }
 
-    #[test]
-    fn test_infer_agent_type_codex() {
+    #[tokio::test]
+    async fn test_infer_agent_type_codex() {
         let path = Path::new("/Users/foo/.codex/sessions/abc123/session.jsonl");
         assert_eq!(infer_agent_type(path), AgentType::Codex);
     }
 
-    #[test]
-    fn test_infer_agent_type_cursor() {
+    #[tokio::test]
+    async fn test_infer_agent_type_cursor() {
         let path = Path::new(
             "/Users/foo/Library/Application Support/Cursor/User/workspaceStorage/x/chatSessions/session.json",
         );
         assert_eq!(infer_agent_type(path), AgentType::Cursor);
     }
 
-    #[test]
-    fn test_infer_agent_type_copilot() {
+    #[tokio::test]
+    async fn test_infer_agent_type_copilot() {
         let path = Path::new(
             "/Users/foo/Library/Application Support/Code/User/workspaceStorage/x/chatSessions/session.json",
         );
         assert_eq!(infer_agent_type(path), AgentType::Copilot);
     }
 
-    #[test]
-    fn test_infer_agent_type_antigravity() {
+    #[tokio::test]
+    async fn test_infer_agent_type_antigravity() {
         let path = Path::new(
             "/Users/foo/Library/Application Support/Antigravity/User/workspaceStorage/x/chatSessions/session.json",
         );
         assert_eq!(infer_agent_type(path), AgentType::Antigravity);
     }
 
-    #[test]
-    fn test_infer_agent_type_antigravity_api_cache() {
+    #[tokio::test]
+    async fn test_infer_agent_type_antigravity_api_cache() {
         let path = Path::new("/Users/foo/.cadence/cli/antigravity-api/abc.json");
         assert_eq!(infer_agent_type(path), AgentType::Antigravity);
     }
@@ -604,8 +603,8 @@ mod tests {
         assert_eq!(infer_agent_type(path), AgentType::Warp);
     }
 
-    #[test]
-    fn test_infer_agent_type_unknown_defaults_to_claude() {
+    #[tokio::test]
+    async fn test_infer_agent_type_unknown_defaults_to_claude() {
         let path = Path::new("/tmp/some/random/session.jsonl");
         assert_eq!(infer_agent_type(path), AgentType::Claude);
     }
@@ -614,28 +613,28 @@ mod tests {
     // AgentType display
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_agent_type_display_claude() {
+    #[tokio::test]
+    async fn test_agent_type_display_claude() {
         assert_eq!(AgentType::Claude.to_string(), "claude-code");
     }
 
-    #[test]
-    fn test_agent_type_display_codex() {
+    #[tokio::test]
+    async fn test_agent_type_display_codex() {
         assert_eq!(AgentType::Codex.to_string(), "codex");
     }
 
-    #[test]
-    fn test_agent_type_display_cursor() {
+    #[tokio::test]
+    async fn test_agent_type_display_cursor() {
         assert_eq!(AgentType::Cursor.to_string(), "cursor");
     }
 
-    #[test]
-    fn test_agent_type_display_copilot() {
+    #[tokio::test]
+    async fn test_agent_type_display_copilot() {
         assert_eq!(AgentType::Copilot.to_string(), "copilot");
     }
 
-    #[test]
-    fn test_agent_type_display_antigravity() {
+    #[tokio::test]
+    async fn test_agent_type_display_antigravity() {
         assert_eq!(AgentType::Antigravity.to_string(), "antigravity");
     }
 
@@ -648,55 +647,55 @@ mod tests {
     // parse_session_metadata
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_parse_metadata_session_id_and_cwd() {
+    #[tokio::test]
+    async fn test_parse_metadata_session_id_and_cwd() {
         let dir = TempDir::new().unwrap();
         let content = r#"{"session_id":"abc-123","cwd":"/Users/foo/bar"}
 {"type":"message","content":"hello"}
 "#;
-        let file = write_temp_file(dir.path(), "session.jsonl", content);
+        let file = write_temp_file(dir.path(), "session.jsonl", content).await;
 
-        let metadata = parse_session_metadata(&file);
+        let metadata = parse_session_metadata(&file).await;
 
         assert_eq!(metadata.session_id, Some("abc-123".to_string()));
         assert_eq!(metadata.cwd, Some("/Users/foo/bar".to_string()));
     }
 
-    #[test]
-    fn test_parse_metadata_camel_case_session_id() {
+    #[tokio::test]
+    async fn test_parse_metadata_camel_case_session_id() {
         let dir = TempDir::new().unwrap();
         let content = r#"{"sessionId":"def-456","cwd":"/Users/baz"}"#;
-        let file = write_temp_file(dir.path(), "session.jsonl", content);
+        let file = write_temp_file(dir.path(), "session.jsonl", content).await;
 
-        let metadata = parse_session_metadata(&file);
+        let metadata = parse_session_metadata(&file).await;
 
         assert_eq!(metadata.session_id, Some("def-456".to_string()));
     }
 
-    #[test]
-    fn test_parse_metadata_workdir_field() {
+    #[tokio::test]
+    async fn test_parse_metadata_workdir_field() {
         let dir = TempDir::new().unwrap();
         let content = r#"{"workdir":"/home/user/project"}"#;
-        let file = write_temp_file(dir.path(), "session.jsonl", content);
+        let file = write_temp_file(dir.path(), "session.jsonl", content).await;
 
-        let metadata = parse_session_metadata(&file);
+        let metadata = parse_session_metadata(&file).await;
 
         assert_eq!(metadata.cwd, Some("/home/user/project".to_string()));
     }
 
-    #[test]
-    fn test_parse_metadata_working_directory_field() {
+    #[tokio::test]
+    async fn test_parse_metadata_working_directory_field() {
         let dir = TempDir::new().unwrap();
         let content = r#"{"working_directory":"/opt/app"}"#;
-        let file = write_temp_file(dir.path(), "session.jsonl", content);
+        let file = write_temp_file(dir.path(), "session.jsonl", content).await;
 
-        let metadata = parse_session_metadata(&file);
+        let metadata = parse_session_metadata(&file).await;
 
         assert_eq!(metadata.cwd, Some("/opt/app".to_string()));
     }
 
-    #[test]
-    fn test_parse_metadata_chat_session_json() {
+    #[tokio::test]
+    async fn test_parse_metadata_chat_session_json() {
         let dir = TempDir::new().unwrap();
         let content = r#"{
   "sessionId": "chat-123",
@@ -716,114 +715,114 @@ mod tests {
     }
   ]
 }"#;
-        let file = write_temp_file(dir.path(), "session.json", content);
+        let file = write_temp_file(dir.path(), "session.json", content).await;
 
-        let metadata = parse_session_metadata(&file);
+        let metadata = parse_session_metadata(&file).await;
 
         assert_eq!(metadata.session_id, Some("chat-123".to_string()));
         assert_eq!(metadata.cwd, Some("/Users/foo/dev/my-repo/src".to_string()));
     }
 
-    #[test]
-    fn test_parse_metadata_fields_across_multiple_lines() {
+    #[tokio::test]
+    async fn test_parse_metadata_fields_across_multiple_lines() {
         let dir = TempDir::new().unwrap();
         // session_id on one line, cwd on another
         let content = r#"{"session_id":"multi-line-id"}
 {"type":"other"}
 {"cwd":"/Users/foo/repo"}
 "#;
-        let file = write_temp_file(dir.path(), "session.jsonl", content);
+        let file = write_temp_file(dir.path(), "session.jsonl", content).await;
 
-        let metadata = parse_session_metadata(&file);
+        let metadata = parse_session_metadata(&file).await;
 
         assert_eq!(metadata.session_id, Some("multi-line-id".to_string()));
         assert_eq!(metadata.cwd, Some("/Users/foo/repo".to_string()));
     }
 
-    #[test]
-    fn test_parse_metadata_no_fields() {
+    #[tokio::test]
+    async fn test_parse_metadata_no_fields() {
         let dir = TempDir::new().unwrap();
         let content = r#"{"type":"message","content":"no metadata here"}
 {"type":"tool_result","content":"more stuff"}
 "#;
-        let file = write_temp_file(dir.path(), "session.jsonl", content);
+        let file = write_temp_file(dir.path(), "session.jsonl", content).await;
 
-        let metadata = parse_session_metadata(&file);
+        let metadata = parse_session_metadata(&file).await;
 
         assert_eq!(metadata.session_id, None);
         assert_eq!(metadata.cwd, None);
     }
 
-    #[test]
-    fn test_parse_metadata_invalid_json_lines_skipped() {
+    #[tokio::test]
+    async fn test_parse_metadata_invalid_json_lines_skipped() {
         let dir = TempDir::new().unwrap();
         let content = r#"this is not json
 {"session_id":"valid-id"}
 also not json {{{{
 {"cwd":"/valid/path"}
 "#;
-        let file = write_temp_file(dir.path(), "session.jsonl", content);
+        let file = write_temp_file(dir.path(), "session.jsonl", content).await;
 
-        let metadata = parse_session_metadata(&file);
+        let metadata = parse_session_metadata(&file).await;
 
         assert_eq!(metadata.session_id, Some("valid-id".to_string()));
         assert_eq!(metadata.cwd, Some("/valid/path".to_string()));
     }
 
-    #[test]
-    fn test_parse_metadata_empty_file() {
+    #[tokio::test]
+    async fn test_parse_metadata_empty_file() {
         let dir = TempDir::new().unwrap();
-        let file = write_temp_file(dir.path(), "empty.jsonl", "");
+        let file = write_temp_file(dir.path(), "empty.jsonl", "").await;
 
-        let metadata = parse_session_metadata(&file);
+        let metadata = parse_session_metadata(&file).await;
 
         assert_eq!(metadata.session_id, None);
         assert_eq!(metadata.cwd, None);
     }
 
-    #[test]
-    fn test_parse_metadata_nonexistent_file() {
+    #[tokio::test]
+    async fn test_parse_metadata_nonexistent_file() {
         let path = Path::new("/nonexistent/file.jsonl");
-        let metadata = parse_session_metadata(path);
+        let metadata = parse_session_metadata(path).await;
 
         assert_eq!(metadata.session_id, None);
         assert_eq!(metadata.cwd, None);
     }
 
-    #[test]
-    fn test_parse_metadata_agent_type_from_claude_path() {
+    #[tokio::test]
+    async fn test_parse_metadata_agent_type_from_claude_path() {
         let dir = TempDir::new().unwrap();
         let claude_dir = dir.path().join(".claude").join("projects");
-        fs::create_dir_all(&claude_dir).unwrap();
-        let file = write_temp_file(&claude_dir, "session.jsonl", "{}");
+        tokio::fs::create_dir_all(&claude_dir).await.unwrap();
+        let file = write_temp_file(&claude_dir, "session.jsonl", "{}").await;
 
-        let metadata = parse_session_metadata(&file);
+        let metadata = parse_session_metadata(&file).await;
 
         assert_eq!(metadata.agent_type, Some(AgentType::Claude));
     }
 
-    #[test]
-    fn test_parse_metadata_agent_type_from_codex_path() {
+    #[tokio::test]
+    async fn test_parse_metadata_agent_type_from_codex_path() {
         let dir = TempDir::new().unwrap();
         let codex_dir = dir.path().join(".codex").join("sessions");
-        fs::create_dir_all(&codex_dir).unwrap();
-        let file = write_temp_file(&codex_dir, "session.jsonl", "{}");
+        tokio::fs::create_dir_all(&codex_dir).await.unwrap();
+        let file = write_temp_file(&codex_dir, "session.jsonl", "{}").await;
 
-        let metadata = parse_session_metadata(&file);
+        let metadata = parse_session_metadata(&file).await;
 
         assert_eq!(metadata.agent_type, Some(AgentType::Codex));
     }
 
-    #[test]
-    fn test_parse_metadata_first_value_wins() {
+    #[tokio::test]
+    async fn test_parse_metadata_first_value_wins() {
         let dir = TempDir::new().unwrap();
         // Two lines with session_id -- first should win
         let content = r#"{"session_id":"first-id"}
 {"session_id":"second-id"}
 "#;
-        let file = write_temp_file(dir.path(), "session.jsonl", content);
+        let file = write_temp_file(dir.path(), "session.jsonl", content).await;
 
-        let metadata = parse_session_metadata(&file);
+        let metadata = parse_session_metadata(&file).await;
 
         assert_eq!(metadata.session_id, Some("first-id".to_string()));
     }
@@ -852,14 +851,14 @@ also not json {{{{
     // parse_session_metadata — Codex format (nested under payload)
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_parse_metadata_codex_session_meta() {
+    #[tokio::test]
+    async fn test_parse_metadata_codex_session_meta() {
         let dir = TempDir::new().unwrap();
         // Real Codex session_meta format: id and cwd nested under payload
         let content = r#"{"timestamp":"2026-02-10T01:52:21.832Z","type":"session_meta","payload":{"id":"019c453f-e731-7bd1-9d05-c571ec59ca6b","cwd":"/Users/foo/dev/my-project","originator":"codex_cli_rs","cli_version":"0.98.0"}}"#;
-        let file = write_temp_file(dir.path(), "session.jsonl", content);
+        let file = write_temp_file(dir.path(), "session.jsonl", content).await;
 
-        let metadata = parse_session_metadata(&file);
+        let metadata = parse_session_metadata(&file).await;
 
         assert_eq!(
             metadata.session_id,
@@ -868,42 +867,42 @@ also not json {{{{
         assert_eq!(metadata.cwd, Some("/Users/foo/dev/my-project".to_string()));
     }
 
-    #[test]
-    fn test_parse_metadata_codex_payload_id_only() {
+    #[tokio::test]
+    async fn test_parse_metadata_codex_payload_id_only() {
         let dir = TempDir::new().unwrap();
         // Only payload.id present, no cwd
         let content = r#"{"type":"session_meta","payload":{"id":"abc-123"}}"#;
-        let file = write_temp_file(dir.path(), "session.jsonl", content);
+        let file = write_temp_file(dir.path(), "session.jsonl", content).await;
 
-        let metadata = parse_session_metadata(&file);
+        let metadata = parse_session_metadata(&file).await;
 
         assert_eq!(metadata.session_id, Some("abc-123".to_string()));
         assert_eq!(metadata.cwd, None);
     }
 
-    #[test]
-    fn test_parse_metadata_codex_payload_cwd_only() {
+    #[tokio::test]
+    async fn test_parse_metadata_codex_payload_cwd_only() {
         let dir = TempDir::new().unwrap();
         // Only payload.cwd present, no id
         let content = r#"{"type":"session_meta","payload":{"cwd":"/Users/foo/bar"}}"#;
-        let file = write_temp_file(dir.path(), "session.jsonl", content);
+        let file = write_temp_file(dir.path(), "session.jsonl", content).await;
 
-        let metadata = parse_session_metadata(&file);
+        let metadata = parse_session_metadata(&file).await;
 
         assert_eq!(metadata.session_id, None);
         assert_eq!(metadata.cwd, Some("/Users/foo/bar".to_string()));
     }
 
-    #[test]
-    fn test_parse_metadata_top_level_takes_priority_over_payload() {
+    #[tokio::test]
+    async fn test_parse_metadata_top_level_takes_priority_over_payload() {
         let dir = TempDir::new().unwrap();
         // Both top-level and payload fields present -- top-level wins (first-value-wins)
         let content = r#"{"session_id":"top-level-id","cwd":"/top/level"}
 {"type":"session_meta","payload":{"id":"payload-id","cwd":"/payload/path"}}
 "#;
-        let file = write_temp_file(dir.path(), "session.jsonl", content);
+        let file = write_temp_file(dir.path(), "session.jsonl", content).await;
 
-        let metadata = parse_session_metadata(&file);
+        let metadata = parse_session_metadata(&file).await;
 
         assert_eq!(metadata.session_id, Some("top-level-id".to_string()));
         assert_eq!(metadata.cwd, Some("/top/level".to_string()));
@@ -913,8 +912,8 @@ also not json {{{{
     // session_time_range
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_session_time_range_parses_rfc3339() {
+    #[tokio::test]
+    async fn test_session_time_range_parses_rfc3339() {
         let dir = TempDir::new().unwrap();
         let t1 = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
         let t2 = OffsetDateTime::from_unix_timestamp(1_700_000_120).unwrap();
@@ -925,23 +924,23 @@ also not json {{{{
             r#"{{"timestamp":"{s1}"}}
 {{"payload":{{"createdAt":"{s2}"}}}}"#,
         );
-        let file = write_temp_file(dir.path(), "session.jsonl", &content);
+        let file = write_temp_file(dir.path(), "session.jsonl", &content).await;
 
-        let range = session_time_range(&file).unwrap();
+        let range = session_time_range(&file).await.unwrap();
         assert_eq!(range.0, t1.unix_timestamp());
         assert_eq!(range.1, t2.unix_timestamp());
     }
 
-    #[test]
-    fn test_session_time_range_numeric_ms() {
+    #[tokio::test]
+    async fn test_session_time_range_numeric_ms() {
         let dir = TempDir::new().unwrap();
         let content = r#"{
   "creationDate": 1749509938455,
   "lastMessageDate": 1749509971642
 }"#;
-        let file = write_temp_file(dir.path(), "session.json", content);
+        let file = write_temp_file(dir.path(), "session.json", content).await;
 
-        let range = session_time_range(&file).unwrap();
+        let range = session_time_range(&file).await.unwrap();
         assert_eq!(range.0, 1_749_509_938);
         assert_eq!(range.1, 1_749_509_971);
     }
@@ -953,24 +952,24 @@ also not json {{{{
         assert_eq!(range.0, range.1);
     }
 
-    #[test]
-    fn test_session_time_range_none_when_missing() {
+    #[tokio::test]
+    async fn test_session_time_range_none_when_missing() {
         let dir = TempDir::new().unwrap();
         let content = r#"{"type":"message","content":"no timestamps"}"#;
-        let file = write_temp_file(dir.path(), "session.jsonl", content);
+        let file = write_temp_file(dir.path(), "session.jsonl", content).await;
 
-        let range = session_time_range(&file);
+        let range = session_time_range(&file).await;
         assert!(range.is_none());
     }
 
-    #[test]
-    fn test_extract_commit_hashes_from_codex_function_call_output() {
+    #[tokio::test]
+    async fn test_extract_commit_hashes_from_codex_function_call_output() {
         let dir = TempDir::new().unwrap();
         // Real Codex function_call_output format with git commit output
         let content = r#"{"timestamp":"2026-02-10T02:13:37.205Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_fEoWO6fq3tRI8VsBgjkdxRfp","output":"Chunk ID: f0cd33\nWall time: 0.0525 seconds\nProcess exited with code 0\nOriginal token count: 40\nOutput:\n[main df69283] Create detailed TODO plan\n 1 file changed, 229 insertions(+)\n create mode 100644 TODO.md\n"}}"#;
-        let file = write_temp_file(dir.path(), "session.jsonl", content);
+        let file = write_temp_file(dir.path(), "session.jsonl", content).await;
 
-        let hashes = extract_commit_hashes(&file);
+        let hashes = extract_commit_hashes(&file).await;
         assert_eq!(hashes.len(), 1);
         assert_eq!(hashes[0], "df69283");
     }
@@ -979,148 +978,148 @@ also not json {{{{
     // extract_commit_hashes
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_extract_commit_hashes_finds_short_hash() {
+    #[tokio::test]
+    async fn test_extract_commit_hashes_finds_short_hash() {
         let dir = TempDir::new().unwrap();
         let content = r#"{"content":"[main abcdef0] fix bug"}"#;
-        let file = write_temp_file(dir.path(), "session.jsonl", content);
+        let file = write_temp_file(dir.path(), "session.jsonl", content).await;
 
-        let hashes = extract_commit_hashes(&file);
+        let hashes = extract_commit_hashes(&file).await;
         assert_eq!(hashes.len(), 1);
         assert_eq!(hashes[0], "abcdef0");
     }
 
-    #[test]
-    fn test_extract_commit_hashes_finds_full_hash() {
+    #[tokio::test]
+    async fn test_extract_commit_hashes_finds_full_hash() {
         let dir = TempDir::new().unwrap();
         let hash = "abcdef0123456789abcdef0123456789abcdef01";
         let content = format!(r#"{{"content":"[main {hash}] fix bug"}}"#);
-        let file = write_temp_file(dir.path(), "session.jsonl", &content);
+        let file = write_temp_file(dir.path(), "session.jsonl", &content).await;
 
-        let hashes = extract_commit_hashes(&file);
+        let hashes = extract_commit_hashes(&file).await;
         assert_eq!(hashes.len(), 1);
         assert_eq!(hashes[0], hash);
     }
 
-    #[test]
-    fn test_extract_commit_hashes_finds_multiple() {
+    #[tokio::test]
+    async fn test_extract_commit_hashes_finds_multiple() {
         let dir = TempDir::new().unwrap();
         let content = r#"{"content":"[main abcdef0] first commit"}
 {"content":"[main 1234567] second commit"}
 "#;
-        let file = write_temp_file(dir.path(), "session.jsonl", content);
+        let file = write_temp_file(dir.path(), "session.jsonl", content).await;
 
-        let hashes = extract_commit_hashes(&file);
+        let hashes = extract_commit_hashes(&file).await;
         assert_eq!(hashes.len(), 2);
         assert!(hashes.contains(&"abcdef0".to_string()));
         assert!(hashes.contains(&"1234567".to_string()));
     }
 
-    #[test]
-    fn test_extract_commit_hashes_deduplicates() {
+    #[tokio::test]
+    async fn test_extract_commit_hashes_deduplicates() {
         let dir = TempDir::new().unwrap();
         let content = r#"{"content":"[main abcdef0] fix bug"}
 {"content":"[main abcdef0] fix bug"}
 "#;
-        let file = write_temp_file(dir.path(), "session.jsonl", content);
+        let file = write_temp_file(dir.path(), "session.jsonl", content).await;
 
-        let hashes = extract_commit_hashes(&file);
+        let hashes = extract_commit_hashes(&file).await;
         assert_eq!(hashes.len(), 1);
     }
 
-    #[test]
-    fn test_extract_commit_hashes_no_hashes() {
+    #[tokio::test]
+    async fn test_extract_commit_hashes_no_hashes() {
         let dir = TempDir::new().unwrap();
         let content = r#"{"type":"message","content":"hello world"}"#;
-        let file = write_temp_file(dir.path(), "session.jsonl", content);
+        let file = write_temp_file(dir.path(), "session.jsonl", content).await;
 
-        let hashes = extract_commit_hashes(&file);
+        let hashes = extract_commit_hashes(&file).await;
         assert!(hashes.is_empty());
     }
 
-    #[test]
-    fn test_extract_commit_hashes_ignores_bare_hex() {
+    #[tokio::test]
+    async fn test_extract_commit_hashes_ignores_bare_hex() {
         let dir = TempDir::new().unwrap();
         // Bare hex strings (e.g., from git log) should NOT be extracted
         let content = r#"{"content":"abcdef0 Fix something"}"#;
-        let file = write_temp_file(dir.path(), "session.jsonl", content);
+        let file = write_temp_file(dir.path(), "session.jsonl", content).await;
 
-        let hashes = extract_commit_hashes(&file);
+        let hashes = extract_commit_hashes(&file).await;
         assert!(hashes.is_empty());
     }
 
-    #[test]
-    fn test_extract_commit_hashes_ignores_diff_blob_hashes() {
+    #[tokio::test]
+    async fn test_extract_commit_hashes_ignores_diff_blob_hashes() {
         let dir = TempDir::new().unwrap();
         // Diff index lines should NOT match
         let content = r#"{"content":"index c84f8ba..b145f18 100644"}"#;
-        let file = write_temp_file(dir.path(), "session.jsonl", content);
+        let file = write_temp_file(dir.path(), "session.jsonl", content).await;
 
-        let hashes = extract_commit_hashes(&file);
+        let hashes = extract_commit_hashes(&file).await;
         assert!(hashes.is_empty());
     }
 
-    #[test]
-    fn test_extract_commit_hashes_ignores_too_short_hex() {
+    #[tokio::test]
+    async fn test_extract_commit_hashes_ignores_too_short_hex() {
         let dir = TempDir::new().unwrap();
         // 6-char hash in bracket pattern -- below minimum
         let content = r#"{"content":"[main abcdef] fix bug"}"#;
-        let file = write_temp_file(dir.path(), "session.jsonl", content);
+        let file = write_temp_file(dir.path(), "session.jsonl", content).await;
 
-        let hashes = extract_commit_hashes(&file);
+        let hashes = extract_commit_hashes(&file).await;
         assert!(hashes.is_empty());
     }
 
-    #[test]
-    fn test_extract_commit_hashes_uppercase_lowered() {
+    #[tokio::test]
+    async fn test_extract_commit_hashes_uppercase_lowered() {
         let dir = TempDir::new().unwrap();
         let content = r#"{"content":"[main ABCDEF0] fix bug"}"#;
-        let file = write_temp_file(dir.path(), "session.jsonl", content);
+        let file = write_temp_file(dir.path(), "session.jsonl", content).await;
 
-        let hashes = extract_commit_hashes(&file);
+        let hashes = extract_commit_hashes(&file).await;
         assert_eq!(hashes.len(), 1);
         assert_eq!(hashes[0], "abcdef0");
     }
 
-    #[test]
-    fn test_extract_commit_hashes_feature_branch() {
+    #[tokio::test]
+    async fn test_extract_commit_hashes_feature_branch() {
         let dir = TempDir::new().unwrap();
         // Branch names with slashes and dashes
         let content = r#"{"content":"[feature/foo-bar abcdef0] fix bug"}"#;
-        let file = write_temp_file(dir.path(), "session.jsonl", content);
+        let file = write_temp_file(dir.path(), "session.jsonl", content).await;
 
-        let hashes = extract_commit_hashes(&file);
+        let hashes = extract_commit_hashes(&file).await;
         assert_eq!(hashes.len(), 1);
         assert_eq!(hashes[0], "abcdef0");
     }
 
-    #[test]
-    fn test_extract_commit_hashes_nonexistent_file() {
+    #[tokio::test]
+    async fn test_extract_commit_hashes_nonexistent_file() {
         let path = Path::new("/nonexistent/file.jsonl");
-        let hashes = extract_commit_hashes(path);
+        let hashes = extract_commit_hashes(path).await;
         assert!(hashes.is_empty());
     }
 
-    #[test]
-    fn test_extract_commit_hashes_empty_file() {
+    #[tokio::test]
+    async fn test_extract_commit_hashes_empty_file() {
         let dir = TempDir::new().unwrap();
-        let file = write_temp_file(dir.path(), "empty.jsonl", "");
+        let file = write_temp_file(dir.path(), "empty.jsonl", "").await;
 
-        let hashes = extract_commit_hashes(&file);
+        let hashes = extract_commit_hashes(&file).await;
         assert!(hashes.is_empty());
     }
 
-    #[test]
-    fn test_extract_commit_hashes_realistic_session_log() {
+    #[tokio::test]
+    async fn test_extract_commit_hashes_realistic_session_log() {
         let dir = TempDir::new().unwrap();
         let content = r#"{"type":"assistant","message":"I'll commit now"}
 {"type":"tool_use","name":"Bash","input":{"command":"git commit -m fix"}}
 {"type":"tool_result","content":"[main 655dd38] fix\n 1 file changed"}
 {"type":"assistant","message":"Done! Commit 655dd38"}
 "#;
-        let file = write_temp_file(dir.path(), "session.jsonl", content);
+        let file = write_temp_file(dir.path(), "session.jsonl", content).await;
 
-        let hashes = extract_commit_hashes(&file);
+        let hashes = extract_commit_hashes(&file).await;
         // Should find 655dd38 from the [main 655dd38] pattern
         // but NOT from the bare "Commit 655dd38" mention
         assert_eq!(hashes.len(), 1);

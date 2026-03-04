@@ -5,7 +5,6 @@
 //! For example, a repo at `/Users/foo/bar` produces a directory named
 //! `-Users-foo-bar` under `~/.claude/projects/`.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::{AgentExplorer, SessionLog, SessionSource, home_dir, recent_files_with_exts};
@@ -21,12 +20,12 @@ use async_trait::async_trait;
 /// Returns an empty `Vec` if:
 /// - The home directory cannot be resolved
 /// - `~/.claude/projects/` does not exist
-pub fn all_log_dirs() -> Vec<PathBuf> {
+pub async fn all_log_dirs() -> Vec<PathBuf> {
     let home = match home_dir() {
         Some(h) => h,
         None => return Vec::new(),
     };
-    all_log_dirs_in(&home)
+    all_log_dirs_in(&home).await
 }
 
 pub struct ClaudeExplorer;
@@ -34,8 +33,9 @@ pub struct ClaudeExplorer;
 #[async_trait]
 impl AgentExplorer for ClaudeExplorer {
     async fn discover_recent(&self, now: i64, since_secs: i64) -> Vec<SessionLog> {
-        let dirs = all_log_dirs();
+        let dirs = all_log_dirs().await;
         recent_files_with_exts(&dirs, now, since_secs, &["jsonl"])
+            .await
             .into_iter()
             .map(|file| SessionLog {
                 agent_type: AgentType::Claude,
@@ -50,20 +50,15 @@ impl AgentExplorer for ClaudeExplorer {
 /// Internal: find ALL Claude log directories under a given home directory.
 ///
 /// Separated from `all_log_dirs` for testability.
-fn all_log_dirs_in(home: &Path) -> Vec<PathBuf> {
+async fn all_log_dirs_in(home: &Path) -> Vec<PathBuf> {
     let projects_dir = home.join(".claude").join("projects");
-    let entries = match fs::read_dir(&projects_dir) {
+    let mut entries = match tokio::fs::read_dir(&projects_dir).await {
         Ok(entries) => entries,
         Err(_) => return Vec::new(),
     };
 
     let mut dirs = Vec::new();
-    for entry in entries {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-
+    while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
         if path.is_dir() {
             dirs.push(path);
@@ -80,47 +75,56 @@ fn all_log_dirs_in(home: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use tempfile::TempDir;
 
     // -----------------------------------------------------------------------
     // all_log_dirs_in
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_all_log_dirs_returns_all_directories() {
+    #[tokio::test]
+    async fn test_all_log_dirs_returns_all_directories() {
         let home = TempDir::new().unwrap();
         let projects_dir = home.path().join(".claude").join("projects");
-        fs::create_dir_all(&projects_dir).unwrap();
+        tokio::fs::create_dir_all(&projects_dir).await.unwrap();
 
         // Create multiple project directories
-        fs::create_dir(projects_dir.join("-Users-foo-bar")).unwrap();
-        fs::create_dir(projects_dir.join("-Users-baz-qux")).unwrap();
-        fs::create_dir(projects_dir.join("-home-user-project")).unwrap();
+        tokio::fs::create_dir(projects_dir.join("-Users-foo-bar"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir(projects_dir.join("-Users-baz-qux"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir(projects_dir.join("-home-user-project"))
+            .await
+            .unwrap();
 
-        let result = all_log_dirs_in(home.path());
+        let result = all_log_dirs_in(home.path()).await;
         assert_eq!(result.len(), 3);
     }
 
-    #[test]
-    fn test_all_log_dirs_returns_empty_when_no_projects_dir() {
+    #[tokio::test]
+    async fn test_all_log_dirs_returns_empty_when_no_projects_dir() {
         let home = TempDir::new().unwrap();
-        let result = all_log_dirs_in(home.path());
+        let result = all_log_dirs_in(home.path()).await;
         assert!(result.is_empty());
     }
 
-    #[test]
-    fn test_all_log_dirs_ignores_files() {
+    #[tokio::test]
+    async fn test_all_log_dirs_ignores_files() {
         let home = TempDir::new().unwrap();
         let projects_dir = home.path().join(".claude").join("projects");
-        fs::create_dir_all(&projects_dir).unwrap();
+        tokio::fs::create_dir_all(&projects_dir).await.unwrap();
 
         // Create a file (not a directory)
-        fs::write(projects_dir.join("some-file"), "not a dir").unwrap();
+        tokio::fs::write(projects_dir.join("some-file"), "not a dir")
+            .await
+            .unwrap();
         // Create a directory
-        fs::create_dir(projects_dir.join("-Users-foo-bar")).unwrap();
+        tokio::fs::create_dir(projects_dir.join("-Users-foo-bar"))
+            .await
+            .unwrap();
 
-        let result = all_log_dirs_in(home.path());
+        let result = all_log_dirs_in(home.path()).await;
         assert_eq!(result.len(), 1);
     }
 
@@ -128,11 +132,11 @@ mod tests {
     // Phase 12 hardening: missing ~/.claude/ directory
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_all_log_dirs_graceful_when_claude_dir_missing() {
+    #[tokio::test]
+    async fn test_all_log_dirs_graceful_when_claude_dir_missing() {
         // Same for all_log_dirs: missing ~/.claude/ should not error.
         let home = TempDir::new().unwrap();
-        let result = all_log_dirs_in(home.path());
+        let result = all_log_dirs_in(home.path()).await;
         assert!(result.is_empty());
     }
 }

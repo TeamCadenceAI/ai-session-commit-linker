@@ -12,30 +12,30 @@ const SESSION_REFS: [&str; 3] = [
 ];
 
 /// Determine whether session refs should be pushed for a specific remote.
-pub fn should_push_remote(remote: &str) -> bool {
+pub async fn should_push_remote(remote: &str) -> bool {
     if remote.is_empty() || remote == "." {
         return false;
     }
 
-    match git::remote_url(remote) {
+    match git::remote_url(remote).await {
         Ok(Some(_)) => {}
         _ => return false,
     }
 
-    check_org_filter_remote(remote)
+    check_org_filter_remote(remote).await
 }
 
 #[allow(dead_code)]
-pub fn attempt_push_remote_at(repo: &Path, remote: &str) {
-    attempt_push_remote_at_with_options(repo, remote, true);
+pub async fn attempt_push_remote_at(repo: &Path, remote: &str) {
+    attempt_push_remote_at_with_options(repo, remote, true).await;
 }
 
-pub fn attempt_push_remote_at_quiet(repo: &Path, remote: &str) {
-    attempt_push_remote_at_with_options(repo, remote, false);
+pub async fn attempt_push_remote_at_quiet(repo: &Path, remote: &str) {
+    attempt_push_remote_at_with_options(repo, remote, false).await;
 }
 
-fn attempt_push_remote_at_with_options(repo: &Path, remote: &str, show_progress: bool) {
-    let result = sync_session_refs_for_remote_at(repo, remote);
+async fn attempt_push_remote_at_with_options(repo: &Path, remote: &str, show_progress: bool) {
+    let result = sync_session_refs_for_remote_at(repo, remote).await;
 
     if let Err(e) = result {
         if show_progress {
@@ -55,11 +55,12 @@ fn attempt_push_remote_at_with_options(repo: &Path, remote: &str, show_progress:
 }
 
 /// Legacy name retained for call-site compatibility; now syncs canonical session refs.
-pub fn sync_notes_for_remote(remote: &str) {
-    let result = (|| -> Result<()> {
-        let repo_root = git::repo_root()?;
-        sync_session_refs_for_remote_at(&repo_root, remote)
-    })();
+pub async fn sync_notes_for_remote(remote: &str) {
+    let result = async {
+        let repo_root = git::repo_root().await?;
+        sync_session_refs_for_remote_at(&repo_root, remote).await
+    }
+    .await;
 
     if let Err(e) = result {
         output::note(&format!(
@@ -69,132 +70,152 @@ pub fn sync_notes_for_remote(remote: &str) {
     }
 }
 
-fn sync_session_refs_for_remote_at(repo: &Path, remote: &str) -> Result<()> {
+async fn sync_session_refs_for_remote_at(repo: &Path, remote: &str) -> Result<()> {
     if remote.is_empty() || remote == "." {
         anyhow::bail!("invalid remote name");
     }
 
     for ref_name in SESSION_REFS {
-        sync_ref_for_remote_at(repo, remote, ref_name)?;
+        sync_ref_for_remote_at(repo, remote, ref_name).await?;
     }
     Ok(())
 }
 
 /// Fetch and merge remote session refs into local refs without pushing.
-pub fn fetch_merge_notes_for_remote_at(repo: &Path, remote: &str) -> Result<()> {
+pub async fn fetch_merge_notes_for_remote_at(repo: &Path, remote: &str) -> Result<()> {
     if remote.is_empty() || remote == "." {
         anyhow::bail!("invalid remote name");
     }
     for ref_name in SESSION_REFS {
-        fetch_merge_ref_for_remote_at(repo, remote, ref_name)?;
+        fetch_merge_ref_for_remote_at(repo, remote, ref_name).await?;
     }
     Ok(())
 }
 
-fn fetch_merge_ref_for_remote_at(repo: &Path, remote: &str, ref_name: &str) -> Result<()> {
+async fn fetch_merge_ref_for_remote_at(repo: &Path, remote: &str, ref_name: &str) -> Result<()> {
     let temp_ref = temp_ref_name(ref_name, remote);
-    let _ = git::run_git_output_at(Some(repo), &["update-ref", "-d", &temp_ref], &[]);
-    let fetch_result = git::fetch_ref_to_temp_at(Some(repo), remote, ref_name, &temp_ref)?;
+    let _ = git::run_git_output_at(Some(repo), &["update-ref", "-d", &temp_ref], &[]).await;
+    let fetch_result = git::fetch_ref_to_temp_at(Some(repo), remote, ref_name, &temp_ref).await?;
     if !fetch_result.fetched {
-        let _ = git::run_git_output_at(Some(repo), &["update-ref", "-d", &temp_ref], &[]);
+        let _ = git::run_git_output_at(Some(repo), &["update-ref", "-d", &temp_ref], &[]).await;
         return Ok(());
     }
 
-    let merged = merge_ref_maps(repo, ref_name, &temp_ref)?;
+    let merged = merge_ref_maps(repo, ref_name, &temp_ref).await?;
     if let Some(new_tip) = merged {
-        git::update_ref_at(Some(repo), ref_name, &new_tip)?;
+        git::update_ref_at(Some(repo), ref_name, &new_tip).await?;
     }
-    let _ = git::run_git_output_at(Some(repo), &["update-ref", "-d", &temp_ref], &[]);
+    let _ = git::run_git_output_at(Some(repo), &["update-ref", "-d", &temp_ref], &[]).await;
     Ok(())
 }
 
-fn sync_ref_for_remote_at(repo: &Path, remote: &str, ref_name: &str) -> Result<()> {
-    sync_ref_for_remote_inner(repo, remote, ref_name, true)
+async fn sync_ref_for_remote_at(repo: &Path, remote: &str, ref_name: &str) -> Result<()> {
+    sync_ref_for_remote_inner(repo, remote, ref_name, true).await
 }
 
-fn sync_ref_for_remote_inner(
+async fn sync_ref_for_remote_inner(
     repo: &Path,
     remote: &str,
     ref_name: &str,
     allow_retry: bool,
 ) -> Result<()> {
-    let pre_remote_hash = git::remote_ref_hash_at(Some(repo), remote, ref_name).unwrap_or(None);
-    let local_hash = git::local_ref_hash_at(Some(repo), ref_name).unwrap_or(None);
+    let mut may_retry = allow_retry;
+    loop {
+        let pre_remote_hash = git::remote_ref_hash_at(Some(repo), remote, ref_name)
+            .await
+            .unwrap_or(None);
+        let local_hash = git::local_ref_hash_at(Some(repo), ref_name)
+            .await
+            .unwrap_or(None);
 
-    if local_hash == pre_remote_hash {
-        return Ok(());
-    }
-
-    if pre_remote_hash.is_none() {
-        if local_hash.is_none() {
+        if local_hash == pre_remote_hash {
             return Ok(());
         }
-        let push_res = git::push_ref_with_lease_at(Some(repo), remote, ref_name, &pre_remote_hash);
-        if let Err(e) = push_res {
-            let msg = e.to_string();
-            if allow_retry && is_ref_push_race(&msg, ref_name) {
-                return sync_ref_for_remote_inner(repo, remote, ref_name, false);
-            }
-            return Err(e);
-        }
-        return Ok(());
-    }
 
-    if local_hash.is_none() {
+        if pre_remote_hash.is_none() {
+            if local_hash.is_none() {
+                return Ok(());
+            }
+            let push_res =
+                git::push_ref_with_lease_at(Some(repo), remote, ref_name, &pre_remote_hash).await;
+            if let Err(e) = push_res {
+                let msg = e.to_string();
+                if may_retry && is_ref_push_race(&msg, ref_name) {
+                    may_retry = false;
+                    continue;
+                }
+                return Err(e);
+            }
+            return Ok(());
+        }
+
+        if local_hash.is_none() {
+            let temp_ref = temp_ref_name(ref_name, remote);
+            let _ = git::run_git_output_at(Some(repo), &["update-ref", "-d", &temp_ref], &[]).await;
+            let fetch_result =
+                git::fetch_ref_to_temp_at(Some(repo), remote, ref_name, &temp_ref).await?;
+            if fetch_result.fetched {
+                let remote_tip = git::rev_parse_at(Some(repo), &temp_ref).await?;
+                git::update_ref_at(Some(repo), ref_name, &remote_tip).await?;
+                let _ =
+                    git::run_git_output_at(Some(repo), &["update-ref", "-d", &temp_ref], &[]).await;
+            }
+            return Ok(());
+        }
+
         let temp_ref = temp_ref_name(ref_name, remote);
-        let _ = git::run_git_output_at(Some(repo), &["update-ref", "-d", &temp_ref], &[]);
-        let fetch_result = git::fetch_ref_to_temp_at(Some(repo), remote, ref_name, &temp_ref)?;
-        if fetch_result.fetched {
-            let remote_tip = git::rev_parse_at(Some(repo), &temp_ref)?;
-            git::update_ref_at(Some(repo), ref_name, &remote_tip)?;
-            let _ = git::run_git_output_at(Some(repo), &["update-ref", "-d", &temp_ref], &[]);
+        let _ = git::run_git_output_at(Some(repo), &["update-ref", "-d", &temp_ref], &[]).await;
+        let fetch_result =
+            git::fetch_ref_to_temp_at(Some(repo), remote, ref_name, &temp_ref).await?;
+        if !fetch_result.fetched {
+            let _ = git::run_git_output_at(Some(repo), &["update-ref", "-d", &temp_ref], &[]).await;
+            let push_res =
+                git::push_ref_with_lease_at(Some(repo), remote, ref_name, &pre_remote_hash).await;
+            if let Err(e) = push_res {
+                let msg = e.to_string();
+                if may_retry && is_ref_push_race(&msg, ref_name) {
+                    may_retry = false;
+                    continue;
+                }
+                return Err(e);
+            }
+            return Ok(());
         }
-        return Ok(());
-    }
 
-    let temp_ref = temp_ref_name(ref_name, remote);
-    let _ = git::run_git_output_at(Some(repo), &["update-ref", "-d", &temp_ref], &[]);
-    let fetch_result = git::fetch_ref_to_temp_at(Some(repo), remote, ref_name, &temp_ref)?;
-    if !fetch_result.fetched {
-        let _ = git::run_git_output_at(Some(repo), &["update-ref", "-d", &temp_ref], &[]);
-        let push_res = git::push_ref_with_lease_at(Some(repo), remote, ref_name, &pre_remote_hash);
+        let fetched_hash = git::rev_parse_at(Some(repo), &temp_ref).await.ok();
+        if fetched_hash == local_hash {
+            let _ = git::run_git_output_at(Some(repo), &["update-ref", "-d", &temp_ref], &[]).await;
+            return Ok(());
+        }
+
+        let merged = merge_ref_maps(repo, ref_name, &temp_ref).await?;
+        if let Some(new_tip) = merged {
+            git::update_ref_at(Some(repo), ref_name, &new_tip).await?;
+        }
+
+        let push_res =
+            git::push_ref_with_lease_at(Some(repo), remote, ref_name, &pre_remote_hash).await;
+        let _ = git::run_git_output_at(Some(repo), &["update-ref", "-d", &temp_ref], &[]).await;
         if let Err(e) = push_res {
             let msg = e.to_string();
-            if allow_retry && is_ref_push_race(&msg, ref_name) {
-                return sync_ref_for_remote_inner(repo, remote, ref_name, false);
+            if may_retry && is_ref_push_race(&msg, ref_name) {
+                may_retry = false;
+                continue;
             }
             return Err(e);
         }
+
         return Ok(());
     }
-
-    let fetched_hash = git::rev_parse_at(Some(repo), &temp_ref).ok();
-    if fetched_hash == local_hash {
-        let _ = git::run_git_output_at(Some(repo), &["update-ref", "-d", &temp_ref], &[]);
-        return Ok(());
-    }
-
-    let merged = merge_ref_maps(repo, ref_name, &temp_ref)?;
-    if let Some(new_tip) = merged {
-        git::update_ref_at(Some(repo), ref_name, &new_tip)?;
-    }
-
-    let push_res = git::push_ref_with_lease_at(Some(repo), remote, ref_name, &pre_remote_hash);
-    let _ = git::run_git_output_at(Some(repo), &["update-ref", "-d", &temp_ref], &[]);
-    if let Err(e) = push_res {
-        let msg = e.to_string();
-        if allow_retry && is_ref_push_race(&msg, ref_name) {
-            return sync_ref_for_remote_inner(repo, remote, ref_name, false);
-        }
-        return Err(e);
-    }
-
-    Ok(())
 }
 
-fn merge_ref_maps(repo: &Path, local_ref: &str, remote_temp_ref: &str) -> Result<Option<String>> {
-    let mut merged = ref_map_from_ref(repo, local_ref)?;
-    let remote_map = ref_map_from_ref(repo, remote_temp_ref)?;
+async fn merge_ref_maps(
+    repo: &Path,
+    local_ref: &str,
+    remote_temp_ref: &str,
+) -> Result<Option<String>> {
+    let mut merged = ref_map_from_ref(repo, local_ref).await?;
+    let remote_map = ref_map_from_ref(repo, remote_temp_ref).await?;
     let merge_index_shards =
         local_ref == git::SESSION_INDEX_BRANCH_REF || local_ref == git::SESSION_INDEX_COMMITTER_REF;
     for (path, remote_sha) in remote_map {
@@ -207,7 +228,7 @@ fn merge_ref_maps(repo: &Path, local_ref: &str, remote_temp_ref: &str) -> Result
                     continue;
                 }
                 if merge_index_shards {
-                    let merged_sha = merge_index_shard_blobs(repo, &local_sha, &remote_sha)?;
+                    let merged_sha = merge_index_shard_blobs(repo, &local_sha, &remote_sha).await?;
                     merged.insert(path, merged_sha);
                 }
             }
@@ -218,11 +239,15 @@ fn merge_ref_maps(repo: &Path, local_ref: &str, remote_temp_ref: &str) -> Result
         return Ok(None);
     }
 
-    let new_tree = build_tree_from_map(repo, &merged)?;
-    let current_tip = git::rev_parse_at(Some(repo), local_ref).ok();
-    let current_tree = current_tip
-        .as_deref()
-        .and_then(|_| git::rev_parse_at(Some(repo), &format!("{}^{{tree}}", local_ref)).ok());
+    let new_tree = build_tree_from_map(repo, &merged).await?;
+    let current_tip = git::rev_parse_at(Some(repo), local_ref).await.ok();
+    let current_tree = if current_tip.is_some() {
+        git::rev_parse_at(Some(repo), &format!("{}^{{tree}}", local_ref))
+            .await
+            .ok()
+    } else {
+        None
+    };
     if current_tree.as_deref() == Some(new_tree.as_str()) {
         return Ok(current_tip);
     }
@@ -232,13 +257,14 @@ fn merge_ref_maps(repo: &Path, local_ref: &str, remote_temp_ref: &str) -> Result
         &new_tree,
         "cadence sessions sync",
         current_tip.as_deref(),
-    )?;
+    )
+    .await?;
     Ok(Some(commit))
 }
 
-fn merge_index_shard_blobs(repo: &Path, local_sha: &str, remote_sha: &str) -> Result<String> {
-    let local_blob = git::read_blob_at(Some(repo), local_sha)?;
-    let remote_blob = git::read_blob_at(Some(repo), remote_sha)?;
+async fn merge_index_shard_blobs(repo: &Path, local_sha: &str, remote_sha: &str) -> Result<String> {
+    let local_blob = git::read_blob_at(Some(repo), local_sha).await?;
+    let remote_blob = git::read_blob_at(Some(repo), remote_sha).await?;
     let local_text = String::from_utf8(local_blob)?;
     let remote_text = String::from_utf8(remote_blob)?;
 
@@ -255,20 +281,20 @@ fn merge_index_shard_blobs(repo: &Path, local_sha: &str, remote_sha: &str) -> Re
     }
 
     if merged_lines.is_empty() {
-        return git::store_blob_at(Some(repo), b"");
+        return git::store_blob_at(Some(repo), b"").await;
     }
 
     let merged_text = format!("{}\n", merged_lines.join("\n"));
-    git::store_blob_at(Some(repo), merged_text.as_bytes())
+    git::store_blob_at(Some(repo), merged_text.as_bytes()).await
 }
 
-fn ref_map_from_ref(repo: &Path, ref_name: &str) -> Result<BTreeMap<String, String>> {
-    if !git::ref_exists_at(Some(repo), ref_name)? {
+async fn ref_map_from_ref(repo: &Path, ref_name: &str) -> Result<BTreeMap<String, String>> {
+    if !git::ref_exists_at(Some(repo), ref_name).await? {
         return Ok(BTreeMap::new());
     }
     let tree_rev = format!("{}^{{tree}}", ref_name);
     let mut out = BTreeMap::new();
-    for root in git::list_tree_entries_at(Some(repo), &tree_rev)? {
+    for root in git::list_tree_entries_at(Some(repo), &tree_rev).await? {
         let Some((_mode, kind, sha, name)) = parse_tree_line(&root) else {
             continue;
         };
@@ -279,7 +305,7 @@ fn ref_map_from_ref(repo: &Path, ref_name: &str) -> Result<BTreeMap<String, Stri
         if kind != "tree" {
             continue;
         }
-        for child in git::list_tree_entries_at(Some(repo), &sha)? {
+        for child in git::list_tree_entries_at(Some(repo), &sha).await? {
             if let Some((_cmode, ckind, csha, cname)) = parse_tree_line(&child)
                 && ckind == "blob"
             {
@@ -290,7 +316,7 @@ fn ref_map_from_ref(repo: &Path, ref_name: &str) -> Result<BTreeMap<String, Stri
     Ok(out)
 }
 
-fn build_tree_from_map(repo: &Path, map: &BTreeMap<String, String>) -> Result<String> {
+async fn build_tree_from_map(repo: &Path, map: &BTreeMap<String, String>) -> Result<String> {
     let mut fanout: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut root_files: Vec<String> = Vec::new();
 
@@ -308,11 +334,11 @@ fn build_tree_from_map(repo: &Path, map: &BTreeMap<String, String>) -> Result<St
     let mut root_entries = root_files;
     for (dir, mut entries) in fanout {
         entries.sort();
-        let subtree = git::mktree_at(Some(repo), &entries)?;
+        let subtree = git::mktree_at(Some(repo), &entries).await?;
         root_entries.push(format!("040000 tree {}\t{}", subtree, dir));
     }
     root_entries.sort();
-    git::mktree_at(Some(repo), &root_entries)
+    git::mktree_at(Some(repo), &root_entries).await
 }
 
 fn parse_tree_line(line: &str) -> Option<(String, String, String, String)> {
@@ -343,13 +369,13 @@ fn is_ref_push_race(stderr_trim: &str, ref_name: &str) -> bool {
 
 /// Check the org filter: if a global org is configured, verify that the
 /// selected remote belongs to that org.
-pub fn check_org_filter_remote(remote: &str) -> bool {
-    let configured_org = match git::config_get_global("ai.cadence.org") {
+pub async fn check_org_filter_remote(remote: &str) -> bool {
+    let configured_org = match git::config_get_global("ai.cadence.org").await {
         Ok(Some(org)) => org,
         _ => return true,
     };
 
-    let url = match git::remote_url(remote) {
+    let url = match git::remote_url(remote).await {
         Ok(Some(u)) => u,
         _ => return false,
     };
@@ -366,15 +392,11 @@ pub fn check_org_filter_remote(remote: &str) -> bool {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
-    use std::process::Command as ProcessCommand;
     use tempfile::TempDir;
 
-    fn run_git(repo: &Path, args: &[&str]) -> String {
-        let out = ProcessCommand::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .output()
+    async fn run_git(repo: &Path, args: &[&str]) -> String {
+        let out = crate::git::run_git_output_at(Some(repo), args, &[])
+            .await
             .expect("run git");
         assert!(
             out.status.success(),
@@ -387,53 +409,61 @@ mod tests {
             .to_string()
     }
 
-    fn init_repo() -> TempDir {
+    async fn init_repo() -> TempDir {
         let dir = TempDir::new().expect("tempdir");
-        run_git(dir.path(), &["init", "-q"]);
-        run_git(dir.path(), &["config", "user.name", "Test User"]);
-        run_git(dir.path(), &["config", "user.email", "test@example.com"]);
-        std::fs::write(dir.path().join("README.md"), "hello").expect("write");
-        run_git(dir.path(), &["add", "README.md"]);
-        run_git(dir.path(), &["commit", "-m", "init"]);
+        run_git(dir.path(), &["init", "-q"]).await;
+        run_git(dir.path(), &["config", "user.name", "Test User"]).await;
+        run_git(dir.path(), &["config", "user.email", "test@example.com"]).await;
+        tokio::fs::write(dir.path().join("README.md"), "hello")
+            .await
+            .expect("write");
+        run_git(dir.path(), &["add", "README.md"]).await;
+        run_git(dir.path(), &["commit", "-m", "init"]).await;
         dir
     }
 
-    fn write_ref_map(repo: &Path, ref_name: &str, map: &BTreeMap<String, String>) {
-        let tree = build_tree_from_map(repo, map).expect("build tree");
-        let parent = git::rev_parse_at(Some(repo), ref_name).ok();
+    async fn write_ref_map(repo: &Path, ref_name: &str, map: &BTreeMap<String, String>) {
+        let tree = build_tree_from_map(repo, map).await.expect("build tree");
+        let parent = git::rev_parse_at(Some(repo), ref_name).await.ok();
         let commit = git::commit_tree_at(Some(repo), &tree, "test ref map", parent.as_deref())
+            .await
             .expect("commit tree");
-        git::update_ref_at(Some(repo), ref_name, &commit).expect("update ref");
+        git::update_ref_at(Some(repo), ref_name, &commit)
+            .await
+            .expect("update ref");
     }
 
-    #[test]
-    fn merge_ref_maps_unions_conflicting_index_shards() {
-        let repo = init_repo();
+    #[tokio::test]
+    async fn merge_ref_maps_unions_conflicting_index_shards() {
+        let repo = init_repo().await;
         let path = "aa/bb--0001.ndjson".to_string();
         let local_blob = git::store_blob_at(
             Some(repo.path()),
             br#"{"session_uid":"local","session_blob_sha":"a","agent":"claude","ingested_at":"1"}
 "#,
         )
+        .await
         .expect("store local blob");
         let remote_blob = git::store_blob_at(
             Some(repo.path()),
             br#"{"session_uid":"remote","session_blob_sha":"b","agent":"codex","ingested_at":"2"}
 "#,
         )
+        .await
         .expect("store remote blob");
 
         let mut local_map = BTreeMap::new();
         local_map.insert(path.clone(), local_blob);
-        write_ref_map(repo.path(), git::SESSION_INDEX_BRANCH_REF, &local_map);
+        write_ref_map(repo.path(), git::SESSION_INDEX_BRANCH_REF, &local_map).await;
 
         let remote_temp_ref = "refs/cadence/tmp/test/index-branch";
         let mut remote_map = BTreeMap::new();
         remote_map.insert(path.clone(), remote_blob);
-        write_ref_map(repo.path(), remote_temp_ref, &remote_map);
+        write_ref_map(repo.path(), remote_temp_ref, &remote_map).await;
 
         let merged_tip =
             merge_ref_maps(repo.path(), git::SESSION_INDEX_BRANCH_REF, remote_temp_ref)
+                .await
                 .expect("merge ref maps")
                 .expect("merged tip");
         git::update_ref_at(
@@ -441,12 +471,16 @@ mod tests {
             git::SESSION_INDEX_BRANCH_REF,
             &merged_tip,
         )
+        .await
         .expect("update merged tip");
 
-        let merged_map =
-            ref_map_from_ref(repo.path(), git::SESSION_INDEX_BRANCH_REF).expect("read merged map");
+        let merged_map = ref_map_from_ref(repo.path(), git::SESSION_INDEX_BRANCH_REF)
+            .await
+            .expect("read merged map");
         let merged_sha = merged_map.get(&path).expect("merged shard exists");
-        let merged_blob = git::read_blob_at(Some(repo.path()), merged_sha).expect("read blob");
+        let merged_blob = git::read_blob_at(Some(repo.path()), merged_sha)
+            .await
+            .expect("read blob");
         let merged_text = String::from_utf8(merged_blob).expect("utf8");
         assert!(merged_text.contains("\"session_uid\":\"local\""));
         assert!(merged_text.contains("\"session_uid\":\"remote\""));
