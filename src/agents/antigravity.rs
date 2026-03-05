@@ -10,6 +10,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use super::{
     AgentExplorer, SessionLog, SessionSource, app_config_dir_in, find_chat_session_dirs, home_dir,
@@ -98,6 +99,12 @@ async fn api_log_dir(home: &Path) -> Option<PathBuf> {
     }
     let debug = std::env::var("CADENCE_ANTIGRAVITY_DEBUG").is_ok();
     let now = now_epoch();
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(Duration::from_secs(2))
+        .connect_timeout(Duration::from_millis(500))
+        .build()
+        .ok()?;
 
     let cache_dir = api_cache_dir(home);
     if ensure_dir(&cache_dir).await.is_err() {
@@ -120,18 +127,18 @@ async fn api_log_dir(home: &Path) -> Option<PathBuf> {
                 return Some(candidate);
             }
         }
-        return None;
+        return fallback_cached_dir(&cache_dir).await;
     }
 
     probe_cache.last_checked_epoch = now;
     let _ = save_probe_cache(&cache_path, &probe_cache).await;
-    let _ = clear_json_files(&cache_dir).await;
 
     let process = match discover_lsp_process().await {
         Some(v) => v,
         None => {
-            probe_cache.cached_log_dir = None;
-            let _ = save_probe_cache(&cache_path, &probe_cache).await;
+            if let Some(dir) = fallback_cached_dir(&cache_dir).await {
+                return Some(dir);
+            }
             return None;
         }
     };
@@ -143,7 +150,7 @@ async fn api_log_dir(home: &Path) -> Option<PathBuf> {
     }
     let ports = discover_listening_ports(process.pid).await;
     let preferred_connect = override_connect_port();
-    let probed_connect = probe_connect_port(&ports, &process.csrf_token).await;
+    let probed_connect = probe_connect_port(&client, &ports, &process.csrf_token).await;
     let (scheme, port) = match preferred_connect.or(probed_connect) {
         Some(p) => p,
         None => {
@@ -173,15 +180,13 @@ async fn api_log_dir(home: &Path) -> Option<PathBuf> {
         );
     }
 
-    let cascade_ids = match fetch_cascade_ids(scheme, port, &process.csrf_token).await {
+    let cascade_ids = match fetch_cascade_ids(&client, scheme, port, &process.csrf_token).await {
         Ok(ids) => ids,
         Err(e) => {
             if debug {
                 eprintln!("[cadence] antigravity: list failed: {e}");
             }
-            probe_cache.cached_log_dir = None;
-            let _ = save_probe_cache(&cache_path, &probe_cache).await;
-            return None;
+            return fallback_cached_dir(&cache_dir).await;
         }
     };
 
@@ -189,14 +194,12 @@ async fn api_log_dir(home: &Path) -> Option<PathBuf> {
         if debug {
             eprintln!("[cadence] antigravity: no cascade ids found");
         }
-        probe_cache.cached_log_dir = None;
-        let _ = save_probe_cache(&cache_path, &probe_cache).await;
-        return None;
+        return fallback_cached_dir(&cache_dir).await;
     }
 
-    let mut wrote_any = false;
+    let mut payloads: Vec<(String, String)> = Vec::new();
     for (idx, cascade_id) in cascade_ids.iter().enumerate() {
-        match fetch_cascade_steps(scheme, port, &process.csrf_token, cascade_id).await {
+        match fetch_cascade_steps(&client, scheme, port, &process.csrf_token, cascade_id).await {
             Ok(steps) => {
                 let workspace_uri = extract_workspace_uri(&steps);
                 let payload = serde_json::json!({
@@ -208,12 +211,7 @@ async fn api_log_dir(home: &Path) -> Option<PathBuf> {
                     "steps": steps,
                 });
                 let filename = format!("{}.json", sanitize_filename(cascade_id, idx));
-                let path = cache_dir.join(filename);
-                if tokio::fs::write(&path, payload.to_string()).await.is_ok() {
-                    wrote_any = true;
-                } else if debug {
-                    eprintln!("[cadence] antigravity: failed to write {}", path.display());
-                }
+                payloads.push((filename, payload.to_string()));
             }
             Err(e) => {
                 if debug {
@@ -227,15 +225,28 @@ async fn api_log_dir(home: &Path) -> Option<PathBuf> {
         }
     }
 
+    if payloads.is_empty() {
+        return fallback_cached_dir(&cache_dir).await;
+    }
+
+    let _ = clear_json_files(&cache_dir).await;
+    let mut wrote_any = false;
+    for (filename, payload) in payloads {
+        let path = cache_dir.join(filename);
+        if tokio::fs::write(&path, payload).await.is_ok() {
+            wrote_any = true;
+        } else if debug {
+            eprintln!("[cadence] antigravity: failed to write {}", path.display());
+        }
+    }
+
     if wrote_any {
         probe_cache.last_success_epoch = Some(now);
         probe_cache.cached_log_dir = Some(cache_dir.to_string_lossy().to_string());
         let _ = save_probe_cache(&cache_path, &probe_cache).await;
         Some(cache_dir)
     } else {
-        probe_cache.cached_log_dir = None;
-        let _ = save_probe_cache(&cache_path, &probe_cache).await;
-        None
+        fallback_cached_dir(&cache_dir).await
     }
 }
 
@@ -326,6 +337,29 @@ async fn clear_json_files(dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn fallback_cached_dir(cache_dir: &Path) -> Option<PathBuf> {
+    if has_json_files(cache_dir).await {
+        Some(cache_dir.to_path_buf())
+    } else {
+        None
+    }
+}
+
+async fn has_json_files(dir: &Path) -> bool {
+    let mut entries = match tokio::fs::read_dir(dir).await {
+        Ok(entries) => entries,
+        Err(_) => return false,
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("json") {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(unix)]
 async fn discover_lsp_process() -> Option<LspProcess> {
     let output = tokio::process::Command::new("ps")
         .args(["-ax", "-o", "pid=,command="])
@@ -343,7 +377,7 @@ async fn discover_lsp_process() -> Option<LspProcess> {
         let pid: u32 = pid_str.parse().ok()?;
         let cmd = line[pid_str.len()..].trim();
         let cmd_lower = cmd.to_lowercase();
-        if !cmd_lower.contains("language_server_macos") {
+        if !cmd_lower.contains("language_server_") {
             continue;
         }
         if !(cmd_lower.contains("--app_data_dir antigravity")
@@ -365,6 +399,13 @@ async fn discover_lsp_process() -> Option<LspProcess> {
     None
 }
 
+#[cfg(not(unix))]
+async fn discover_lsp_process() -> Option<LspProcess> {
+    // Local LSP probing currently shells out to Unix tooling (`ps`/`lsof`).
+    // Keep this a no-op on non-Unix targets rather than failing discovery.
+    None
+}
+
 fn extract_flag_value(command: &str, flag: &str) -> Option<String> {
     let mut iter = command.split_whitespace();
     while let Some(part) = iter.next() {
@@ -375,6 +416,7 @@ fn extract_flag_value(command: &str, flag: &str) -> Option<String> {
     None
 }
 
+#[cfg(unix)]
 async fn discover_listening_ports(pid: u32) -> Vec<u16> {
     let output = tokio::process::Command::new("lsof")
         .args(["-nP", "-iTCP", "-sTCP:LISTEN", "-p"])
@@ -392,16 +434,26 @@ async fn discover_listening_ports(pid: u32) -> Vec<u16> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut ports = BTreeSet::new();
     for line in stdout.lines() {
-        let last = match line.split_whitespace().last() {
-            Some(v) => v,
-            None => continue,
-        };
-        if let Some(port) = parse_port_from_lsof_field(last) {
+        if let Some(port) = parse_port_from_lsof_line(line) {
             ports.insert(port);
         }
     }
 
     ports.into_iter().collect()
+}
+
+#[cfg(not(unix))]
+async fn discover_listening_ports(_pid: u32) -> Vec<u16> {
+    Vec::new()
+}
+
+fn parse_port_from_lsof_line(line: &str) -> Option<u16> {
+    for token in line.split_whitespace().rev() {
+        if let Some(port) = parse_port_from_lsof_field(token) {
+            return Some(port);
+        }
+    }
+    None
 }
 
 fn parse_port_from_lsof_field(field: &str) -> Option<u16> {
@@ -413,9 +465,14 @@ fn parse_port_from_lsof_field(field: &str) -> Option<u16> {
     port_str.parse::<u16>().ok()
 }
 
-async fn probe_connect_port(ports: &[u16], csrf: &str) -> Option<(&'static str, u16)> {
+async fn probe_connect_port(
+    client: &reqwest::Client,
+    ports: &[u16],
+    csrf: &str,
+) -> Option<(&'static str, u16)> {
     for port in ports {
         if post_json(
+            client,
             "https",
             *port,
             "GetUnleashData",
@@ -430,6 +487,7 @@ async fn probe_connect_port(ports: &[u16], csrf: &str) -> Option<(&'static str, 
     }
     for port in ports {
         if post_json(
+            client,
             "http",
             *port,
             "GetUnleashData",
@@ -460,14 +518,20 @@ fn override_connect_port() -> Option<(&'static str, u16)> {
     Some((scheme, port))
 }
 
-async fn fetch_cascade_ids(scheme: &str, port: u16, csrf: &str) -> anyhow::Result<Vec<String>> {
+async fn fetch_cascade_ids(
+    client: &reqwest::Client,
+    scheme: &str,
+    port: u16,
+    csrf: &str,
+) -> anyhow::Result<Vec<String>> {
     let method = std::env::var("ANTIGRAVITY_LSP_LIST_METHOD")
         .unwrap_or_else(|_| "GetAllCascadeTrajectories".to_string());
-    let response = post_json(scheme, port, &method, csrf, &serde_json::json!({})).await?;
+    let response = post_json(client, scheme, port, &method, csrf, &serde_json::json!({})).await?;
     Ok(extract_cascade_ids_from_value(&response))
 }
 
 async fn fetch_cascade_steps(
+    client: &reqwest::Client,
     scheme: &str,
     port: u16,
     csrf: &str,
@@ -485,10 +549,11 @@ async fn fetch_cascade_steps(
         "startIndex": 0,
         "endIndex": end_index
     });
-    post_json(scheme, port, &method, csrf, &body).await
+    post_json(client, scheme, port, &method, csrf, &body).await
 }
 
 async fn post_json(
+    client: &reqwest::Client,
     scheme: &str,
     port: u16,
     method: &str,
@@ -499,9 +564,6 @@ async fn post_json(
         "{}://127.0.0.1:{}/exa.language_server_pb.LanguageServerService/{}",
         scheme, port, method
     );
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()?;
     let response = client
         .post(url)
         .header("Content-Type", "application/json")
@@ -655,6 +717,12 @@ mod tests {
         let ids = extract_cascade_ids_from_value(&value);
         assert!(ids.contains(&"foo".to_string()));
         assert!(ids.contains(&"bar".to_string()));
+    }
+
+    #[test]
+    fn test_parse_port_from_lsof_line_handles_listen_suffix() {
+        let line = "language_ 20815 zack 6u IPv4 0x0 0t0 TCP 127.0.0.1:60482 (LISTEN)";
+        assert_eq!(parse_port_from_lsof_line(line), Some(60482));
     }
 
     #[tokio::test]
