@@ -1,13 +1,18 @@
 //! Agent log discovery module.
 //!
-//! Discovers AI coding agent session logs (Claude Code, Codex) on disk
+//! Discovers AI coding agent session logs on disk
 //! and filters candidate files by modification time relative to a commit.
 
+pub mod amp_code;
 pub mod antigravity;
 pub mod claude;
+pub mod cline;
 pub mod codex;
 pub mod copilot;
 pub mod cursor;
+pub mod kiro;
+pub mod opencode;
+pub mod roo_code;
 pub mod warp;
 pub mod windsurf;
 
@@ -185,6 +190,11 @@ pub async fn discover_recent_sessions(now: i64, since_secs: i64) -> Vec<SessionL
         codex_logs,
         cursor_logs,
         copilot_logs,
+        cline_logs,
+        roo_logs,
+        opencode_logs,
+        kiro_logs,
+        amp_logs,
         antigravity_logs,
         windsurf_logs,
         warp_logs,
@@ -193,6 +203,11 @@ pub async fn discover_recent_sessions(now: i64, since_secs: i64) -> Vec<SessionL
         codex::CodexExplorer.discover_recent(now, since_secs),
         cursor::CursorExplorer.discover_recent(now, since_secs),
         copilot::CopilotExplorer.discover_recent(now, since_secs),
+        cline::ClineExplorer.discover_recent(now, since_secs),
+        roo_code::RooCodeExplorer.discover_recent(now, since_secs),
+        opencode::OpenCodeExplorer.discover_recent(now, since_secs),
+        kiro::KiroExplorer.discover_recent(now, since_secs),
+        amp_code::AmpCodeExplorer.discover_recent(now, since_secs),
         antigravity::AntigravityExplorer.discover_recent(now, since_secs),
         windsurf::WindsurfExplorer.discover_recent(now, since_secs),
         warp::WarpExplorer.discover_recent(now, since_secs),
@@ -203,6 +218,11 @@ pub async fn discover_recent_sessions(now: i64, since_secs: i64) -> Vec<SessionL
     results.extend(codex_logs);
     results.extend(cursor_logs);
     results.extend(copilot_logs);
+    results.extend(cline_logs);
+    results.extend(roo_logs);
+    results.extend(opencode_logs);
+    results.extend(kiro_logs);
+    results.extend(amp_logs);
     results.extend(antigravity_logs);
     results.extend(windsurf_logs);
     results.extend(warp_logs);
