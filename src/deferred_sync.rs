@@ -23,7 +23,7 @@ use crate::{agents, git, push};
 
 const DEFAULT_LOCK_MAX_AGE_SECS: i64 = 300;
 const DEFAULT_LOG_RETENTION_DAYS: i64 = 7;
-const DEFAULT_SYNC_TIMEOUT_MS: u64 = 300_000;
+const DEFAULT_SYNC_TIMEOUT_MS: u64 = 120_000;
 const DEFAULT_TIME_BUDGET_MS: u64 = 8_000;
 const REF_SYNC_JOB_CONCURRENCY: usize = 4;
 static SYNC_TRACING_INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
