@@ -6,7 +6,8 @@
 use std::path::{Path, PathBuf};
 
 use super::{
-    AgentExplorer, SessionLog, SessionSource, app_config_dir_in, home_dir, recent_files_with_exts,
+    AgentExplorer, SessionLog, SessionSource, app_config_dir_in, collect_dirs_with_exts, home_dir,
+    recent_files_with_exts,
 };
 use crate::scanner::AgentType;
 use async_trait::async_trait;
@@ -70,39 +71,6 @@ async fn log_dirs_in(home: &Path) -> Vec<PathBuf> {
     dirs.dedup();
     dirs
 }
-
-async fn collect_dirs_with_exts(root: &Path, results: &mut Vec<PathBuf>, exts: &[&str]) {
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let mut entries = match tokio::fs::read_dir(&dir).await {
-            Ok(entries) => entries,
-            Err(_) => continue,
-        };
-
-        let mut has_match = false;
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let path = entry.path();
-            let file_type = match entry.file_type().await {
-                Ok(file_type) => file_type,
-                Err(_) => continue,
-            };
-            if file_type.is_dir() {
-                stack.push(path);
-            } else if file_type.is_file()
-                && !has_match
-                && let Some(ext) = path.extension().and_then(|e| e.to_str())
-                && exts.iter().any(|allowed| allowed.eq_ignore_ascii_case(ext))
-            {
-                has_match = true;
-            }
-        }
-
-        if has_match {
-            results.push(dir);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

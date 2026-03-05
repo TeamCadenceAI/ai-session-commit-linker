@@ -256,11 +256,21 @@ fn extract_hashes_from_line(
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Infer the agent type from a file path.
+/// Infer the agent type from a file path using ordered substring matches.
 ///
-/// - If path contains `.claude` -> Claude
-/// - If path contains `.codex` -> Codex
-/// - Otherwise -> Claude (conservative default)
+/// Match precedence is significant for overlapping paths:
+/// 1. Codex (`.codex`)
+/// 2. OpenCode data roots
+/// 3. Cline extension/storage paths
+/// 4. Roo Code extension/storage paths
+/// 5. Kiro storage paths
+/// 6. Amp Code paths
+/// 7. Cursor paths
+/// 8. Antigravity paths
+/// 9. Windsurf paths
+/// 10. Warp paths
+/// 11. VS Code / Copilot workspace storage
+/// 12. Fallback to Claude
 fn infer_agent_type(path: &Path) -> AgentType {
     let path_str = path.to_string_lossy().replace('\\', "/");
     let path_lower = path_str.to_ascii_lowercase();
@@ -550,7 +560,7 @@ fn extract_cwd_from_value(value: &serde_json::Value) -> Option<String> {
 }
 
 fn normalize_cwd_path(path: &str) -> String {
-    let trimmed = path.strip_prefix("file://").unwrap_or(path);
+    let trimmed = strip_file_uri_prefix(path);
     let candidate = Path::new(trimmed);
     if looks_like_file(candidate) {
         candidate
@@ -561,6 +571,32 @@ fn normalize_cwd_path(path: &str) -> String {
     } else {
         candidate.to_string_lossy().to_string()
     }
+}
+
+fn strip_file_uri_prefix(path: &str) -> &str {
+    let Some(mut trimmed) = path.strip_prefix("file://") else {
+        return path;
+    };
+
+    if let Some(local_path) = trimmed.strip_prefix("localhost/") {
+        trimmed = local_path;
+    }
+
+    if let Some(without_leading_slash) = trimmed.strip_prefix('/')
+        && is_windows_drive_path(without_leading_slash)
+    {
+        return without_leading_slash;
+    }
+
+    trimmed
+}
+
+fn is_windows_drive_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'/' || bytes[2] == b'\\')
 }
 
 fn looks_like_file(path: &Path) -> bool {
@@ -677,6 +713,14 @@ mod tests {
             "/Users/foo/Library/Application Support/Cursor/User/workspaceStorage/x/chatSessions/session.json",
         );
         assert_eq!(infer_agent_type(path), AgentType::Cursor);
+    }
+
+    #[tokio::test]
+    async fn test_infer_agent_type_cline_wins_over_cursor_for_ambiguous_path() {
+        let path = Path::new(
+            "/Users/foo/Library/Application Support/Cursor/User/globalStorage/saoudrizwan.claude-dev/tasks/x/task.json",
+        );
+        assert_eq!(infer_agent_type(path), AgentType::Cline);
     }
 
     #[tokio::test]
@@ -895,6 +939,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_parse_metadata_amp_fields_windows_file_uri() {
+        let dir = TempDir::new().unwrap();
+        let content = r#"{"id":"T-456","messages":[],"env":{"initial":{"trees":[{"uri":"file:///C:/Users/foo/dev/cadence-cli"}]}}}"#;
+        let file = write_temp_file(dir.path(), "session.jsonl", content).await;
+
+        let metadata = parse_session_metadata(&file).await;
+
+        assert_eq!(metadata.session_id, Some("T-456".to_string()));
+        assert_eq!(
+            metadata.cwd,
+            Some("C:/Users/foo/dev/cadence-cli".to_string())
+        );
+    }
+
+    #[tokio::test]
     async fn test_parse_metadata_cline_task_id() {
         let dir = TempDir::new().unwrap();
         let content = r#"{"taskId":"task-123","workspacePath":"/Users/foo/dev/repo"}"#;
@@ -1069,6 +1128,12 @@ also not json {{{{
         let metadata = parse_session_metadata_str(content);
         assert_eq!(metadata.session_id, Some("chat-999".to_string()));
         assert_eq!(metadata.cwd, Some("/Users/foo/dev/repo".to_string()));
+    }
+
+    #[test]
+    fn test_normalize_cwd_path_handles_localhost_windows_file_uri() {
+        let normalized = normalize_cwd_path("file://localhost/C:/Users/foo/dev/repo");
+        assert_eq!(normalized, "C:/Users/foo/dev/repo".to_string());
     }
 
     // -----------------------------------------------------------------------

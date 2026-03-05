@@ -101,7 +101,8 @@ async fn discover_recent_in(roots: &[PathBuf], now: i64, since_secs: i64) -> Vec
         let message_dir = root.join("storage").join("message");
         let part_dir = root.join("storage").join("part");
 
-        for path in collect_json_files(&session_dir).await {
+        for candidate in collect_recent_json_files(&session_dir, cutoff).await {
+            let path = candidate.path;
             let Some(value) = read_json(&path).await else {
                 continue;
             };
@@ -134,7 +135,7 @@ async fn discover_recent_in(roots: &[PathBuf], now: i64, since_secs: i64) -> Vec
                 source_file: path.to_string_lossy().to_string(),
                 created_at,
                 updated_at,
-                file_mtime: file_mtime_epoch(&path).await,
+                file_mtime: candidate.mtime_epoch,
                 raw: value,
             };
 
@@ -143,16 +144,21 @@ async fn discover_recent_in(roots: &[PathBuf], now: i64, since_secs: i64) -> Vec
                     sessions.insert(session_id, record);
                 }
                 Some(existing) => {
-                    if record.updated_at.unwrap_or_default()
-                        > existing.updated_at.unwrap_or_default()
-                    {
+                    let record_recency =
+                        record.updated_at.or(record.file_mtime).unwrap_or_default();
+                    let existing_recency = existing
+                        .updated_at
+                        .or(existing.file_mtime)
+                        .unwrap_or_default();
+                    if record_recency > existing_recency {
                         sessions.insert(session_id, record);
                     }
                 }
             }
         }
 
-        for path in collect_json_files(&message_dir).await {
+        for candidate in collect_recent_json_files(&message_dir, cutoff).await {
+            let path = candidate.path;
             let Some(value) = read_json(&path).await else {
                 continue;
             };
@@ -174,7 +180,7 @@ async fn discover_recent_in(roots: &[PathBuf], now: i64, since_secs: i64) -> Vec
                 created_at: value
                     .pointer("/time/created")
                     .and_then(parse_epoch_from_json_value),
-                file_mtime: file_mtime_epoch(&path).await,
+                file_mtime: candidate.mtime_epoch,
                 raw: value,
             };
 
@@ -185,7 +191,8 @@ async fn discover_recent_in(roots: &[PathBuf], now: i64, since_secs: i64) -> Vec
                 .push(record);
         }
 
-        for path in collect_json_files(&part_dir).await {
+        for candidate in collect_recent_json_files(&part_dir, cutoff).await {
+            let path = candidate.path;
             let Some(value) = read_json(&path).await else {
                 continue;
             };
@@ -221,7 +228,7 @@ async fn discover_recent_in(roots: &[PathBuf], now: i64, since_secs: i64) -> Vec
                 created_at: value
                     .pointer("/time/created")
                     .and_then(parse_epoch_from_json_value),
-                file_mtime: file_mtime_epoch(&path).await,
+                file_mtime: candidate.mtime_epoch,
                 raw: value,
             };
 
@@ -351,7 +358,13 @@ async fn discover_recent_in(roots: &[PathBuf], now: i64, since_secs: i64) -> Vec
     output
 }
 
-async fn collect_json_files(root: &Path) -> Vec<PathBuf> {
+#[derive(Debug)]
+struct JsonCandidate {
+    path: PathBuf,
+    mtime_epoch: Option<i64>,
+}
+
+async fn collect_recent_json_files(root: &Path, cutoff: i64) -> Vec<JsonCandidate> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
 
@@ -372,7 +385,11 @@ async fn collect_json_files(root: &Path) -> Vec<PathBuf> {
             } else if file_type.is_file()
                 && path.extension().and_then(|e| e.to_str()) == Some("json")
             {
-                out.push(path);
+                let mtime_epoch = file_mtime_epoch(&path).await;
+                if mtime_epoch.is_some_and(|mtime| mtime < cutoff) {
+                    continue;
+                }
+                out.push(JsonCandidate { path, mtime_epoch });
             }
         }
     }
@@ -541,5 +558,35 @@ mod tests {
         set_file_mtime(&session_file, 9_950);
         let logs = discover_recent_in(&[root.to_path_buf()], 10_000, 100).await;
         assert_eq!(logs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_opencode_prefers_newer_mtime_when_updated_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+
+        let older = root
+            .join("storage")
+            .join("session")
+            .join("global")
+            .join("ses_dupe_old.json");
+        write_json(&older, r#"{"id":"ses_dupe","directory":"/old"}"#).await;
+        set_file_mtime(&older, 1_000);
+
+        let newer = root
+            .join("storage")
+            .join("session")
+            .join("workspace")
+            .join("ses_dupe_new.json");
+        write_json(&newer, r#"{"id":"ses_dupe","directory":"/new"}"#).await;
+        set_file_mtime(&newer, 2_000);
+
+        let logs = discover_recent_in(&[root.to_path_buf()], 3_000, 5_000).await;
+        assert_eq!(logs.len(), 1);
+
+        match &logs[0].source {
+            SessionSource::Inline { content, .. } => assert!(content.contains("\"cwd\":\"/new\"")),
+            SessionSource::File(_) => panic!("expected inline session"),
+        }
     }
 }

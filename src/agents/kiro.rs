@@ -84,12 +84,12 @@ async fn discover_recent_in(roots: &[PathBuf], now: i64, since_secs: i64) -> Vec
                     continue;
                 }
 
-                let session_id = session_id_for_file(&path).await;
                 let canonical = path
                     .file_name()
                     .and_then(|n| n.to_str())
                     .map(|name| name.ends_with(".json") && name != "sessions.json")
                     .unwrap_or(false);
+                let session_id = session_id_for_file(&path, canonical).await;
                 candidates.push(Candidate {
                     path,
                     mtime_epoch,
@@ -156,7 +156,15 @@ fn is_kiro_session_file(path: &Path) -> bool {
     false
 }
 
-async fn session_id_for_file(path: &Path) -> String {
+async fn session_id_for_file(path: &Path, canonical: bool) -> String {
+    if canonical {
+        return path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown-session")
+            .to_string();
+    }
+
     if let Ok(content) = tokio::fs::read_to_string(path).await
         && let Ok(value) = serde_json::from_str::<Value>(&content)
     {
@@ -234,6 +242,30 @@ mod tests {
         assert_eq!(logs.len(), 1);
         match &logs[0].source {
             SessionSource::File(path) => assert_eq!(path, &chat),
+            SessionSource::Inline { .. } => panic!("expected file source"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_kiro_canonical_session_id_uses_filename_when_json_invalid() {
+        let home = TempDir::new().unwrap();
+        let root = kiro_storage_root_in(home.path());
+
+        let ws_dir = root
+            .join("workspace-sessions")
+            .join("workspace-1")
+            .join("session-b");
+        tokio::fs::create_dir_all(&ws_dir).await.unwrap();
+        let canonical = ws_dir.join("session-b.json");
+        tokio::fs::write(&canonical, "{not-json").await.unwrap();
+
+        let now = 1_700_000_000;
+        set_file_mtime(&canonical, now - 10);
+
+        let logs = discover_recent_in(&[root], now, 3600).await;
+        assert_eq!(logs.len(), 1);
+        match &logs[0].source {
+            SessionSource::File(path) => assert_eq!(path, &canonical),
             SessionSource::Inline { .. } => panic!("expected file source"),
         }
     }
