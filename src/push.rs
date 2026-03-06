@@ -35,6 +35,10 @@ pub async fn attempt_push_remote_at_quiet(repo: &Path, remote: &str) {
     attempt_push_remote_at_with_options(repo, remote, false).await;
 }
 
+pub async fn try_push_remote_at_quiet(repo: &Path, remote: &str) -> Result<()> {
+    sync_session_refs_for_remote_at(repo, remote).await
+}
+
 async fn attempt_push_remote_at_with_options(repo: &Path, remote: &str, show_progress: bool) {
     let result = sync_session_refs_for_remote_at(repo, remote).await;
 
