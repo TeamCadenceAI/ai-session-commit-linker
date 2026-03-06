@@ -196,6 +196,19 @@ pub async fn run_sync_command(opts: SyncRunOptions) -> Result<()> {
     execute_jobs_bounded(jobs, opts.time_budget_ms).await
 }
 
+/// List runnable pending jobs using the same filtering as the deferred worker.
+pub async fn list_runnable_pending_sync_jobs(max_items: usize) -> Result<Vec<PendingSyncRecord>> {
+    collect_runnable_jobs(&SyncRunOptions {
+        repo: None,
+        remote: None,
+        all_pending: true,
+        background: false,
+        max_items,
+        time_budget_ms: DEFAULT_TIME_BUDGET_MS,
+    })
+    .await
+}
+
 /// Run lock/log maintenance before processing jobs.
 async fn run_startup_maintenance() -> Result<()> {
     sweep_stale_locks().await?;
@@ -274,11 +287,6 @@ pub async fn has_pending_sync_jobs() -> bool {
         }
     }
     false
-}
-
-/// List pending sync records currently queued on disk.
-pub async fn list_pending_sync_jobs() -> Result<Vec<PendingSyncRecord>> {
-    load_pending_records().await
 }
 
 async fn run_one_pending_job(job: PendingSyncRecord) -> Result<()> {
@@ -993,6 +1001,13 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         assert_eq!(
             jobs[0].repo_root,
+            PathBuf::from("/tmp/a-repo").to_string_lossy()
+        );
+
+        let jobs_from_public = list_runnable_pending_sync_jobs(1).await.unwrap();
+        assert_eq!(jobs_from_public.len(), 1);
+        assert_eq!(
+            jobs_from_public[0].repo_root,
             PathBuf::from("/tmp/a-repo").to_string_lossy()
         );
 

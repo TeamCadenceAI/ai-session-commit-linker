@@ -4398,7 +4398,7 @@ async fn run_sync(
     max_items: usize,
     time_budget_ms: u64,
 ) -> Result<()> {
-    let repo_roots = repo_roots_for_sync_ingest(repo.as_deref(), all_pending).await?;
+    let repo_roots = repo_roots_for_sync_ingest(repo.as_deref(), all_pending, max_items).await?;
     let encryption_method = resolve_encryption_method()
         .await
         .unwrap_or_else(|e| EncryptionMethod::Unavailable(format!("{e}")));
@@ -4426,9 +4426,10 @@ async fn run_sync(
 async fn repo_roots_for_sync_ingest(
     repo: Option<&Path>,
     all_pending: bool,
+    max_items: usize,
 ) -> Result<Vec<PathBuf>> {
     if all_pending {
-        let jobs = deferred_sync::list_pending_sync_jobs().await?;
+        let jobs = deferred_sync::list_runnable_pending_sync_jobs(max_items).await?;
         return Ok(pending_repo_roots_sorted_deduped(jobs));
     }
 
