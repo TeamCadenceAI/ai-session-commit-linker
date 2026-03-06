@@ -276,6 +276,11 @@ pub async fn has_pending_sync_jobs() -> bool {
     false
 }
 
+/// List pending sync records currently queued on disk.
+pub async fn list_pending_sync_jobs() -> Result<Vec<PendingSyncRecord>> {
+    load_pending_records().await
+}
+
 async fn run_one_pending_job(job: PendingSyncRecord) -> Result<()> {
     let worker_id = Uuid::new_v4().to_string();
     info!(
