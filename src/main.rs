@@ -2133,15 +2133,29 @@ async fn process_repo_backfill(
             "remote": repo_remote.as_str(),
         }),
     );
-    push::attempt_push_remote_at_quiet(&repo_root, &repo_remote).await;
-    backfill_logger.event(
-        "repo_push_completed",
-        serde_json::json!({
-            "repo_display": repo_display.as_str(),
-            "repo_root": repo_root_str.as_str(),
-            "remote": repo_remote.as_str(),
-        }),
-    );
+    match push::try_push_remote_at_quiet(&repo_root, &repo_remote).await {
+        Ok(()) => {
+            backfill_logger.event(
+                "repo_push_completed",
+                serde_json::json!({
+                    "repo_display": repo_display.as_str(),
+                    "repo_root": repo_root_str.as_str(),
+                    "remote": repo_remote.as_str(),
+                }),
+            );
+        }
+        Err(e) => {
+            backfill_logger.event(
+                "repo_push_failed",
+                serde_json::json!({
+                    "repo_display": repo_display.as_str(),
+                    "repo_root": repo_root_str.as_str(),
+                    "remote": repo_remote.as_str(),
+                    "error": format!("{e:#}"),
+                }),
+            );
+        }
+    }
 
     if let Some(pb) = &repo_progress {
         pb.finish_with_message(format!(
