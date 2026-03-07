@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.2.0](https://github.com/TeamCadenceAI/cadence-cli/compare/v1.1.1...v1.2.0) (2026-03-07)
+
+
+### Features
+
+* add git identity fields to SessionRecord for server-side attribution ([0dce9b7](https://github.com/TeamCadenceAI/cadence-cli/commit/0dce9b775e69b524d9829c4e96b6843cff09ffff))
+* **note:** add git_user_email and git_user_name, remove touched_paths ([e759e08](https://github.com/TeamCadenceAI/cadence-cli/commit/e759e08110888b21db0feb20fe9534444e8d743f))
+
 ## [1.1.1](https://github.com/TeamCadenceAI/cadence-cli/compare/v1.1.0...v1.1.1) (2026-03-06)
 
 
