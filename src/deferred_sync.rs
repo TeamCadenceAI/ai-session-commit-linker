@@ -35,6 +35,8 @@ const SESSION_REFS_PUSHED: [&str; 3] = [
 ];
 const REF_SYNC_JOB_CONCURRENCY: usize = 4;
 static SYNC_TRACING_INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+static SYNC_NOTIFY_MISSING_AUTH_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+static SYNC_NOTIFY_AUTH_REJECTED_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub struct SyncRunOptions {
@@ -89,6 +91,18 @@ struct SyncLockGuard {
 struct SessionRefPushNotification<'a> {
     repo_full_name: &'a str,
     refs_pushed: &'a [&'a str],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotifySessionRefPushResult {
+    Sent,
+    SkippedUnauthenticated,
+}
+
+#[derive(Debug)]
+enum NotifySessionRefPushError {
+    Unauthorized,
+    Failed(anyhow::Error),
 }
 
 impl Drop for SyncLockGuard {
@@ -365,24 +379,51 @@ async fn run_one_pending_job(job: PendingSyncRecord) -> Result<()> {
 }
 
 async fn notify_session_ref_push_after_sync(repo_path: &Path, remote: &str) {
-    if let Err(err) = notify_session_ref_push(repo_path, remote).await {
-        warn!(
-            repo = %repo_path.display(),
-            remote = %remote,
-            error = %err,
-            "session ref push notification failed; relying on catchup scheduler"
-        );
+    match notify_session_ref_push(repo_path, remote).await {
+        Ok(NotifySessionRefPushResult::Sent) => {}
+        Ok(NotifySessionRefPushResult::SkippedUnauthenticated) => {
+            if SYNC_NOTIFY_MISSING_AUTH_WARNED.set(()).is_ok() {
+                warn!(
+                    repo = %repo_path.display(),
+                    remote = %remote,
+                    "session ref push notification skipped: missing auth token; run `cadence login` or set CADENCE_CLI_TOKEN"
+                );
+            }
+        }
+        Err(NotifySessionRefPushError::Unauthorized) => {
+            if SYNC_NOTIFY_AUTH_REJECTED_WARNED.set(()).is_ok() {
+                warn!(
+                    repo = %repo_path.display(),
+                    remote = %remote,
+                    "session ref push notification rejected with auth error; run `cadence login` to refresh credentials"
+                );
+            }
+        }
+        Err(NotifySessionRefPushError::Failed(err)) => {
+            warn!(
+                repo = %repo_path.display(),
+                remote = %remote,
+                error = %err,
+                "session ref push notification failed; relying on catchup scheduler"
+            );
+        }
     }
 }
 
-async fn notify_session_ref_push(repo_path: &Path, remote: &str) -> Result<()> {
+async fn notify_session_ref_push(
+    repo_path: &Path,
+    remote: &str,
+) -> std::result::Result<NotifySessionRefPushResult, NotifySessionRefPushError> {
     let remote_url = git::remote_url_at(repo_path, remote)
         .await
-        .with_context(|| format!("resolve remote URL for '{}'", remote))?
-        .ok_or_else(|| anyhow::anyhow!("remote '{}' has no URL", remote))?;
+        .with_context(|| format!("resolve remote URL for '{}'", remote))
+        .map_err(NotifySessionRefPushError::Failed)?
+        .ok_or_else(|| anyhow::anyhow!("remote '{}' has no URL", remote))
+        .map_err(NotifySessionRefPushError::Failed)?;
 
     let repo_full_name = parse_repo_full_name_from_remote_url(&remote_url)
-        .ok_or_else(|| anyhow::anyhow!("derive repo_full_name from remote URL '{}'", remote_url))?;
+        .ok_or_else(|| anyhow::anyhow!("derive repo_full_name from remote URL '{}'", remote_url))
+        .map_err(NotifySessionRefPushError::Failed)?;
 
     let cfg = match config::CliConfig::load().await {
         Ok(cfg) => cfg,
@@ -393,6 +434,9 @@ async fn notify_session_ref_push(repo_path: &Path, remote: &str) -> Result<()> {
             );
             config::CliConfig::default()
         }
+    };
+    let Some(token) = resolve_cli_notification_token(&cfg).await else {
+        return Ok(NotifySessionRefPushResult::SkippedUnauthenticated);
     };
     let api_url = cfg.resolve_api_url(None).url;
     let endpoint = format!(
@@ -406,33 +450,42 @@ async fn notify_session_ref_push(repo_path: &Path, remote: &str) -> Result<()> {
         refs_pushed: &SESSION_REFS_PUSHED,
     };
 
-    let mut req = reqwest::Client::new()
+    let req = reqwest::Client::new()
         .post(&endpoint)
         .timeout(Duration::from_secs(SESSION_REF_PUSH_NOTIFY_TIMEOUT_SECS))
-        .json(&payload);
-    if let Some(token) = resolve_cli_notification_token() {
-        req = req.bearer_auth(token);
-    }
+        .json(&payload)
+        .bearer_auth(token);
 
     let resp = req
         .send()
         .await
-        .with_context(|| format!("post session ref push notification to {}", endpoint))?;
+        .with_context(|| format!("post session ref push notification to {}", endpoint))
+        .map_err(NotifySessionRefPushError::Failed)?;
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!(
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(NotifySessionRefPushError::Unauthorized);
+        }
+        let err = anyhow::anyhow!(
             "session ref push notification endpoint returned {}: {}",
             status,
             body.trim()
         );
+        return Err(NotifySessionRefPushError::Failed(err));
     }
 
-    Ok(())
+    Ok(NotifySessionRefPushResult::Sent)
 }
 
-fn resolve_cli_notification_token() -> Option<String> {
+async fn resolve_cli_notification_token(cfg: &config::CliConfig) -> Option<String> {
+    let login_token = crate::resolve_cli_auth_token(cfg).await;
+    resolve_cli_notification_token_with_login_token(login_token)
+}
+
+fn resolve_cli_notification_token_with_login_token(login_token: Option<String>) -> Option<String> {
     non_empty_trimmed(std::env::var(CADENCE_CLI_TOKEN_ENV_VAR).ok())
+        .or_else(|| non_empty_trimmed(login_token))
 }
 
 fn parse_repo_full_name_from_remote_url(remote_url: &str) -> Option<String> {
@@ -1179,10 +1232,12 @@ mod tests {
             let captured = parse_http_request(&raw_request);
             let _ = tx.send(captured);
 
-            let status_text = if status_code == 200 {
-                "OK"
-            } else {
-                "Internal Server Error"
+            let status_text = match status_code {
+                200 => "OK",
+                401 => "Unauthorized",
+                403 => "Forbidden",
+                500 => "Internal Server Error",
+                _ => "Error",
             };
             let body = if status_code == 200 {
                 r#"{"status":"accepted"}"#
@@ -1270,6 +1325,50 @@ mod tests {
             authorization,
             body: body.to_string(),
         }
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_cli_notification_token_returns_none_without_env_or_login_token() {
+        let backup = EnvBackup::capture();
+        unsafe {
+            std::env::remove_var("CADENCE_CLI_TOKEN");
+        }
+
+        let token = resolve_cli_notification_token_with_login_token(None);
+        assert_eq!(token, None);
+
+        backup.restore();
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_cli_notification_token_env_overrides_login_token() {
+        let backup = EnvBackup::capture();
+        unsafe {
+            std::env::set_var("CADENCE_CLI_TOKEN", "env-token");
+        }
+
+        let token =
+            resolve_cli_notification_token_with_login_token(Some("login-token".to_string()));
+        assert_eq!(token.as_deref(), Some("env-token"));
+
+        backup.restore();
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_cli_notification_token_uses_login_token_when_env_absent() {
+        let backup = EnvBackup::capture();
+        unsafe {
+            std::env::remove_var("CADENCE_CLI_TOKEN");
+        }
+
+        let token =
+            resolve_cli_notification_token_with_login_token(Some("login-token".to_string()));
+        assert_eq!(token.as_deref(), Some("login-token"));
+
+        backup.restore();
     }
 
     #[tokio::test]
@@ -1438,7 +1537,7 @@ mod tests {
         unsafe {
             std::env::set_var("HOME", env_tmp.path());
             std::env::remove_var("AI_BAROMETER_API_URL");
-            std::env::remove_var("CADENCE_CLI_TOKEN");
+            std::env::set_var("CADENCE_CLI_TOKEN", "notify-token");
         }
 
         let (local, _remote_root, remote_bare) =
@@ -1454,6 +1553,44 @@ mod tests {
         run_one_pending_job(job)
             .await
             .expect("sync should succeed even if notification endpoint fails");
+
+        let _captured = tokio::time::timeout(Duration::from_secs(2), req_rx)
+            .await
+            .expect("notification request timeout")
+            .expect("notification request capture");
+
+        let remote_tip = git::rev_parse_at(Some(&remote_bare), git::SESSION_DATA_REF)
+            .await
+            .expect("remote ref should still be pushed");
+        assert!(!remote_tip.is_empty());
+
+        backup.restore();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_one_pending_job_notification_unauthorized_does_not_fail_sync() {
+        let env_tmp = TempDir::new().unwrap();
+        let backup = EnvBackup::capture();
+        unsafe {
+            std::env::set_var("HOME", env_tmp.path());
+            std::env::remove_var("AI_BAROMETER_API_URL");
+            std::env::set_var("CADENCE_CLI_TOKEN", "expired-token");
+        }
+
+        let (local, _remote_root, remote_bare) =
+            init_repo_with_file_remote("example-org", "notify-unauthorized").await;
+        write_session_data_ref(local.path()).await;
+
+        let (api_url, req_rx) = spawn_single_request_server(401).await;
+        unsafe {
+            std::env::set_var("CADENCE_API_URL", api_url);
+        }
+
+        let job = make_pending_job(local.path(), "origin");
+        run_one_pending_job(job)
+            .await
+            .expect("sync should succeed even if notification auth is rejected");
 
         let _captured = tokio::time::timeout(Duration::from_secs(2), req_rx)
             .await
