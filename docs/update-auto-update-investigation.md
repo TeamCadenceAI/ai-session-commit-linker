@@ -18,6 +18,40 @@ Codebase analyzed from `main` branch at investigation time: **2026-03-09**.
 - Manual update command: `cadence update` (install flow) and `cadence update --check` (check-only flow).
 - Passive check path: runs after successful non-`update` commands in `main` (`src/main.rs`), via `update::passive_version_check()`.
 - Install-time preference capture: `cadence install` may prompt for `auto_update` preference if TTY and not already configured.
+- External reinstall path: `install.sh` / `install.ps1` always fetch latest release and overwrite installed binary when those scripts are run.
+
+## 1.1) Update Path Diagram
+
+```mermaid
+flowchart TD
+    A["User runs any cadence command"] --> B{"Command is 'cadence update'?"}
+    B -- "Yes" --> C{"--check?"}
+    C -- "Yes" --> D["Check latest tag and print result only"]
+    C -- "No" --> E["Start install flow"]
+    E --> F{"Update available?"}
+    F -- "No" --> G["Print up-to-date and exit"]
+    F -- "Yes" --> H{"Confirm step"}
+    H --> H1["Accept if '--yes'"]
+    H --> H2["Else accept if 'auto_update=true'"]
+    H --> H3["Else prompt user '[y/N]'"]
+    H1 --> I["Download + checksum verify + extract + self-replace"]
+    H2 --> I
+    H3 --> I
+    I --> J["Cadence updated"]
+
+    B -- "No" --> K{"Command succeeded?"}
+    K -- "No" --> L["No passive check"]
+    K -- "Yes" --> M{"Passive check allowed? (TTY, interval, env)"}
+    M -- "No" --> N["No passive check"]
+    M -- "Yes" --> O["Check latest tag in background"]
+    O --> P{"Remote newer?"}
+    P -- "No" --> Q["No message"]
+    P -- "Yes" --> R["Print reminder: run 'cadence update'"]
+
+    S["User runs install script"] --> T["Download latest release artifact"]
+    T --> U["Copy binary into install dir"]
+    U --> V["Binary updated by reinstall path"]
+```
 
 ## 2) Release discovery
 
@@ -77,6 +111,12 @@ It does **not** currently mean:
 - background unattended update installation
 - hook-triggered self-update
 - periodic auto-install of new versions
+
+Re-check conclusion:
+
+- There is no code path where `auto_update=true` alone triggers background installation.
+- The only in-app install path is still `cadence update`.
+- The only non-`cadence update` update mechanism is re-running installer scripts (`install.sh`/`install.ps1`), which is external reinstall behavior.
 
 ## 6) Passive-check gating and throttling
 
