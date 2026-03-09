@@ -8,14 +8,16 @@
 //! local HTTP server URL via `check_latest_version_from_url()`.
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use sysinfo::{Pid, System};
 use tokio::io::AsyncReadExt;
+use tokio::process::Command;
 
 use crate::config::CliConfig;
 
@@ -35,6 +37,83 @@ const USER_AGENT: &str = "cadence-cli";
 
 /// HTTP request timeout for version checks.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Updater state file name under `~/.cadence/cli/`.
+const UPDATER_STATE_FILE: &str = "updater-state.json";
+
+/// Shared activity lock directory/file for hook + deferred sync + updater coordination.
+const ACTIVITY_LOCKS_DIR: &str = "locks";
+const ACTIVITY_LOCK_FILE: &str = "global-activity.lock";
+
+/// Scheduler cadence and jitter defaults.
+const AUTO_UPDATE_INTERVAL_SECS: u64 = 8 * 60 * 60;
+const AUTO_UPDATE_JITTER_SECS: u64 = 30 * 60;
+
+/// Retry backoff defaults.
+const UPDATE_RETRY_BASE_SECS: u64 = 60;
+const UPDATE_RETRY_MAX_SECS: u64 = 8 * 60 * 60;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ActivityLockRecord {
+    pid: u32,
+    created_at_epoch: i64,
+    hostname: String,
+    purpose: String,
+}
+
+#[derive(Debug)]
+pub struct ActivityLockGuard {
+    path: PathBuf,
+}
+
+impl Drop for ActivityLockGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UpdaterState {
+    pub last_check_at: Option<String>,
+    pub last_attempt_at: Option<String>,
+    pub last_success_at: Option<String>,
+    pub last_seen_version: Option<String>,
+    pub last_installed_version: Option<String>,
+    pub consecutive_failures: u32,
+    pub next_retry_after: Option<String>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdaterHealthState {
+    Disabled,
+    NeverRun,
+    Healthy,
+    Retrying,
+    Failing,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdaterHealth {
+    pub enabled: bool,
+    pub state: UpdaterHealthState,
+    pub last_result: String,
+    pub next_retry_after: Option<String>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum InstallMode {
+    Interactive,
+    SilentUnattended,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AttemptOutcome {
+    NoUpdate,
+    Installed,
+    SkippedUnstable,
+}
 
 // ---------------------------------------------------------------------------
 // Data model
@@ -66,6 +145,199 @@ pub struct ReleaseAsset {
 
 /// Filename of the checksums file published alongside release assets.
 const CHECKSUMS_FILENAME: &str = "checksums-sha256.txt";
+
+fn now_epoch() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn now_rfc3339() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+fn host_name() -> String {
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_else(|_| "unknown-host".to_string())
+}
+
+fn parse_rfc3339_to_epoch(value: &str) -> Option<i64> {
+    time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+        .ok()
+        .map(|dt| dt.unix_timestamp())
+}
+
+fn format_epoch_rfc3339(epoch: i64) -> Option<String> {
+    time::OffsetDateTime::from_unix_timestamp(epoch)
+        .ok()
+        .and_then(|dt| {
+            dt.format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        })
+}
+
+fn cadence_dir() -> Result<PathBuf> {
+    CliConfig::config_dir().ok_or_else(|| {
+        anyhow::anyhow!("cannot determine cadence config directory: $HOME is not set")
+    })
+}
+
+fn updater_state_path() -> Result<PathBuf> {
+    Ok(cadence_dir()?.join(UPDATER_STATE_FILE))
+}
+
+fn activity_lock_path() -> Result<PathBuf> {
+    Ok(cadence_dir()?
+        .join(ACTIVITY_LOCKS_DIR)
+        .join(ACTIVITY_LOCK_FILE))
+}
+
+async fn write_json_atomic<T: ?Sized + Serialize>(path: &Path, value: &T) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("path has no parent: {}", path.display()))?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .with_context(|| format!("failed to create directory {}", parent.display()))?;
+    let tmp = path.with_extension("tmp");
+    let payload = serde_json::to_vec_pretty(value).context("failed to serialize JSON")?;
+    tokio::fs::write(&tmp, payload)
+        .await
+        .with_context(|| format!("failed to write temporary file {}", tmp.display()))?;
+    tokio::fs::rename(&tmp, path)
+        .await
+        .with_context(|| format!("failed to atomically replace {}", path.display()))?;
+    Ok(())
+}
+
+async fn load_updater_state() -> Result<UpdaterState> {
+    let path = updater_state_path()?;
+    match tokio::fs::read_to_string(&path).await {
+        Ok(content) => serde_json::from_str::<UpdaterState>(&content)
+            .with_context(|| format!("failed to parse updater state at {}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(UpdaterState::default()),
+        Err(e) => {
+            Err(e).with_context(|| format!("failed to read updater state {}", path.display()))
+        }
+    }
+}
+
+async fn save_updater_state(state: &UpdaterState) -> Result<()> {
+    let path = updater_state_path()?;
+    write_json_atomic(&path, state).await
+}
+
+fn is_pid_alive(pid: u32) -> bool {
+    let mut system = System::new();
+    system.refresh_processes();
+    system.process(Pid::from_u32(pid)).is_some()
+}
+
+async fn try_create_activity_lock(path: &Path, record: &ActivityLockRecord) -> Result<bool> {
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    let file = opts.open(path).await;
+    let mut file = match file {
+        Ok(f) => f,
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(err) => return Err(err).with_context(|| format!("create lock {}", path.display())),
+    };
+    let payload = serde_json::to_vec_pretty(record).context("serialize lock record")?;
+    tokio::io::AsyncWriteExt::write_all(&mut file, &payload).await?;
+    Ok(true)
+}
+
+async fn clear_stale_activity_lock(path: &Path) -> Result<()> {
+    let content = match tokio::fs::read_to_string(path).await {
+        Ok(v) => v,
+        Err(_) => {
+            let _ = tokio::fs::remove_file(path).await;
+            return Ok(());
+        }
+    };
+    let parsed = match serde_json::from_str::<ActivityLockRecord>(&content) {
+        Ok(v) => v,
+        Err(_) => {
+            let _ = tokio::fs::remove_file(path).await;
+            return Ok(());
+        }
+    };
+    let age = now_epoch().saturating_sub(parsed.created_at_epoch);
+    // If owner process is gone or lock is stale, reclaim it.
+    if age > 15 * 60 || !is_pid_alive(parsed.pid) {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+    Ok(())
+}
+
+pub async fn acquire_activity_lock_blocking(purpose: &str) -> Result<ActivityLockGuard> {
+    let lock_path = activity_lock_path()?;
+    if let Some(parent) = lock_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let record = ActivityLockRecord {
+        pid: std::process::id(),
+        created_at_epoch: now_epoch(),
+        hostname: host_name(),
+        purpose: purpose.to_string(),
+    };
+    loop {
+        if try_create_activity_lock(&lock_path, &record).await? {
+            return Ok(ActivityLockGuard { path: lock_path });
+        }
+        clear_stale_activity_lock(&lock_path).await?;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+pub async fn try_acquire_activity_lock_nonblocking(
+    purpose: &str,
+) -> Result<Option<ActivityLockGuard>> {
+    let lock_path = activity_lock_path()?;
+    if let Some(parent) = lock_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    clear_stale_activity_lock(&lock_path).await?;
+    let record = ActivityLockRecord {
+        pid: std::process::id(),
+        created_at_epoch: now_epoch(),
+        hostname: host_name(),
+        purpose: purpose.to_string(),
+    };
+    if try_create_activity_lock(&lock_path, &record).await? {
+        return Ok(Some(ActivityLockGuard { path: lock_path }));
+    }
+    Ok(None)
+}
+
+fn retry_delay_secs(failures: u32) -> u64 {
+    let exp = failures.saturating_sub(1).min(10);
+    let base = UPDATE_RETRY_BASE_SECS.saturating_mul(1u64 << exp);
+    let capped = base.min(UPDATE_RETRY_MAX_SECS);
+    let jitter = rand08::Rng::gen_range(&mut rand08::thread_rng(), 0..=45);
+    capped.saturating_add(jitter)
+}
+
+fn is_stable_release_tag(tag: &str) -> bool {
+    let normalized = normalize_version_tag(tag);
+    semver::Version::parse(normalized)
+        .map(|v| v.pre.is_empty())
+        .unwrap_or(false)
+}
+
+fn update_due_for_retry(state: &UpdaterState, now_epoch_secs: i64) -> bool {
+    let Some(next_retry) = &state.next_retry_after else {
+        return true;
+    };
+    let Some(retry_epoch) = parse_rfc3339_to_epoch(next_retry) else {
+        return true;
+    };
+    now_epoch_secs >= retry_epoch
+}
 
 // ---------------------------------------------------------------------------
 // Version helpers
@@ -669,14 +941,23 @@ async fn run_update_install(yes: bool) -> Result<()> {
 
 /// Install path with injectable URL for testing.
 pub async fn run_update_install_from_url(release_url: &str, yes: bool) -> Result<()> {
+    let _ = run_update_install_from_url_mode(release_url, yes, InstallMode::Interactive).await?;
+    Ok(())
+}
+
+async fn run_update_install_from_url_mode(
+    release_url: &str,
+    yes: bool,
+    mode: InstallMode,
+) -> Result<AttemptOutcome> {
     let local = current_version();
 
-    // Load config for auto-update preference.
-    // Config load failure is a hard error for update to avoid silently ignoring
-    // user intent (e.g., a malformed config that was supposed to enable auto-update).
-    let config = CliConfig::load()
-        .await
-        .context("Failed to load config. Check ~/.cadence/cli/config.toml for syntax errors.")?;
+    if matches!(mode, InstallMode::Interactive) {
+        // Manual update keeps config load strict to preserve existing UX.
+        let _ = CliConfig::load().await.context(
+            "Failed to load config. Check ~/.cadence/cli/config.toml for syntax errors.",
+        )?;
+    }
 
     // Step 1: Fetch release metadata
     let release = check_latest_version_from_url(release_url)
@@ -691,8 +972,17 @@ pub async fn run_update_install_from_url(release_url: &str, yes: bool) -> Result
         compare_versions(local, remote).context("Failed to compare local and remote versions")?;
 
     if ordering != Ordering::Less {
-        println!("cadence v{local} is already up to date (latest: v{remote_display})");
-        return Ok(());
+        if matches!(mode, InstallMode::Interactive) {
+            println!("cadence v{local} is already up to date (latest: v{remote_display})");
+        }
+        return Ok(AttemptOutcome::NoUpdate);
+    }
+
+    if !is_stable_release_tag(remote) {
+        if matches!(mode, InstallMode::Interactive) {
+            println!("Latest release v{remote_display} is pre-release; skipping.");
+        }
+        return Ok(AttemptOutcome::SkippedUnstable);
     }
 
     // Step 3: Resolve target artifact and checksums from release assets
@@ -702,16 +992,19 @@ pub async fn run_update_install_from_url(release_url: &str, yes: bool) -> Result
 
     // Step 4: Prompt for confirmation
     // Precedence: --yes > config auto_update > interactive prompt
-    let auto_update_config = Some(config.auto_update_enabled());
-    if !confirm_update(local, remote_display, yes, auto_update_config)? {
+    if matches!(mode, InstallMode::Interactive)
+        && !confirm_update(local, remote_display, yes, None)?
+    {
         println!("Update cancelled.");
-        return Ok(());
+        return Ok(AttemptOutcome::NoUpdate);
     }
 
     // Step 5: Download to temp directory
     let tmp_dir = tempfile::tempdir().context("Failed to create temporary directory")?;
 
-    println!("Downloading cadence v{remote_display}...");
+    if matches!(mode, InstallMode::Interactive) {
+        println!("Downloading cadence v{remote_display}...");
+    }
 
     let checksums_path = download_to_file(
         &checksums_asset.browser_download_url,
@@ -754,11 +1047,332 @@ pub async fn run_update_install_from_url(release_url: &str, yes: bool) -> Result
     }
 
     // Step 9: Replace running binary
-    self_replace_binary(&new_binary)?;
+    if matches!(mode, InstallMode::SilentUnattended) {
+        let _activity_guard = try_acquire_activity_lock_nonblocking("auto-update")
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("global activity lock is busy"))?;
+        self_replace_binary(&new_binary)?;
+    } else {
+        self_replace_binary(&new_binary)?;
+    }
 
-    println!("Successfully updated cadence v{local} → v{remote_display}");
+    if matches!(mode, InstallMode::Interactive) {
+        println!("Successfully updated cadence v{local} → v{remote_display}");
+    }
+
+    Ok(AttemptOutcome::Installed)
+}
+
+async fn apply_auto_update_jitter() {
+    let jitter = rand08::Rng::gen_range(&mut rand08::thread_rng(), 0..=AUTO_UPDATE_JITTER_SECS);
+    if jitter > 0 {
+        tokio::time::sleep(Duration::from_secs(jitter)).await;
+    }
+}
+
+fn retry_delay_from_state(state: &UpdaterState) -> u64 {
+    retry_delay_secs(state.consecutive_failures.max(1))
+}
+
+pub async fn run_background_auto_update() -> Result<()> {
+    apply_auto_update_jitter().await;
+
+    let mut state = load_updater_state().await.unwrap_or_default();
+    let now = now_rfc3339();
+    state.last_attempt_at = Some(now.clone());
+
+    let config = CliConfig::load().await.unwrap_or_default();
+    if !config.auto_update_enabled() {
+        state.last_error = None;
+        state.consecutive_failures = 0;
+        state.next_retry_after = None;
+        save_updater_state(&state).await?;
+        return Ok(());
+    }
+
+    if !update_due_for_retry(&state, now_epoch()) {
+        return Ok(());
+    }
+
+    let release = match check_latest_version().await {
+        Ok(r) => r,
+        Err(e) => {
+            state.last_check_at = Some(now.clone());
+            state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+            state.last_error = Some(format!("{e:#}"));
+            let retry_at = now_epoch().saturating_add(retry_delay_from_state(&state) as i64);
+            state.next_retry_after = format_epoch_rfc3339(retry_at);
+            save_updater_state(&state).await?;
+            return Ok(());
+        }
+    };
+
+    state.last_check_at = Some(now.clone());
+    state.last_seen_version = Some(normalize_version_tag(&release.tag_name).to_string());
+
+    if !is_stable_release_tag(&release.tag_name) {
+        state.last_error =
+            Some("latest release is not stable; waiting for stable release".to_string());
+        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        let retry_at = now_epoch().saturating_add(retry_delay_from_state(&state) as i64);
+        state.next_retry_after = format_epoch_rfc3339(retry_at);
+        save_updater_state(&state).await?;
+        return Ok(());
+    }
+
+    match run_update_install_from_url_mode(
+        GITHUB_RELEASES_LATEST_URL,
+        true,
+        InstallMode::SilentUnattended,
+    )
+    .await
+    {
+        Ok(AttemptOutcome::Installed) => {
+            state.last_success_at = Some(now.clone());
+            state.last_installed_version = state.last_seen_version.clone();
+            state.consecutive_failures = 0;
+            state.last_error = None;
+            state.next_retry_after = None;
+            save_updater_state(&state).await?;
+        }
+        Ok(AttemptOutcome::NoUpdate | AttemptOutcome::SkippedUnstable) => {
+            state.last_success_at = Some(now.clone());
+            state.consecutive_failures = 0;
+            state.last_error = None;
+            state.next_retry_after = None;
+            save_updater_state(&state).await?;
+        }
+        Err(e) => {
+            let err = format!("{e:#}");
+            if err.contains("global activity lock is busy") {
+                // Lock contention is expected when hooks/sync are active; retry soon.
+                state.last_error = Some("activity lock busy; updater skipped".to_string());
+                let delay = rand08::Rng::gen_range(&mut rand08::thread_rng(), 60..=300);
+                state.next_retry_after =
+                    format_epoch_rfc3339(now_epoch().saturating_add(delay as i64));
+                save_updater_state(&state).await?;
+                return Ok(());
+            }
+            state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+            state.last_error = Some(err);
+            let retry_at = now_epoch().saturating_add(retry_delay_from_state(&state) as i64);
+            state.next_retry_after = format_epoch_rfc3339(retry_at);
+            save_updater_state(&state).await?;
+        }
+    }
 
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct SchedulerProvisionResult {
+    pub configured: bool,
+    pub description: String,
+}
+
+#[cfg(target_os = "windows")]
+fn scheduler_command_line(exe_path: &Path) -> String {
+    format!("\"{}\" hook auto-update", exe_path.display())
+}
+
+#[cfg(target_os = "macos")]
+fn launch_agent_plist(label: &str, exe_path: &Path) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{label}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{exe}</string>
+    <string>hook</string>
+    <string>auto-update</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>StartInterval</key><integer>{interval}</integer>
+  <key>RandomDelay</key><integer>{jitter}</integer>
+  <key>StandardOutPath</key><string>/tmp/cadence-autoupdate.log</string>
+  <key>StandardErrorPath</key><string>/tmp/cadence-autoupdate.log</string>
+</dict>
+</plist>
+"#,
+        exe = exe_path.display(),
+        interval = AUTO_UPDATE_INTERVAL_SECS,
+        jitter = AUTO_UPDATE_JITTER_SECS
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_service_contents(exe_path: &Path) -> String {
+    format!(
+        "[Unit]\nDescription=Cadence CLI unattended auto-update\n\n[Service]\nType=oneshot\nExecStart={} hook auto-update\n",
+        exe_path.display()
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_timer_contents() -> String {
+    format!(
+        "[Unit]\nDescription=Cadence CLI unattended auto-update timer\n\n[Timer]\nOnBootSec=5m\nOnUnitActiveSec={}s\nRandomizedDelaySec={}s\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n",
+        AUTO_UPDATE_INTERVAL_SECS, AUTO_UPDATE_JITTER_SECS
+    )
+}
+
+pub async fn provision_auto_update_scheduler() -> Result<SchedulerProvisionResult> {
+    let exe =
+        std::env::current_exe().context("failed to resolve current cadence executable path")?;
+    provision_auto_update_scheduler_for_exe(&exe).await
+}
+
+pub async fn provision_auto_update_scheduler_for_exe(
+    exe: &Path,
+) -> Result<SchedulerProvisionResult> {
+    #[cfg(target_os = "macos")]
+    {
+        let home =
+            std::env::var("HOME").context("HOME is required for LaunchAgent provisioning")?;
+        let agents_dir = PathBuf::from(home).join("Library").join("LaunchAgents");
+        tokio::fs::create_dir_all(&agents_dir).await?;
+        let label = "ai.teamcadence.cadence.autoupdate";
+        let plist_path = agents_dir.join(format!("{label}.plist"));
+        let plist = launch_agent_plist(label, exe);
+        tokio::fs::write(&plist_path, plist).await?;
+
+        let uid = std::env::var("UID").unwrap_or_default();
+        if !uid.is_empty() {
+            let domain = format!("gui/{uid}");
+            let service_target = format!("{domain}/{label}");
+            let _ = Command::new("launchctl")
+                .args(["bootout", &service_target])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await;
+            let _ = Command::new("launchctl")
+                .args(["bootstrap", &domain, &plist_path.to_string_lossy()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await;
+            let _ = Command::new("launchctl")
+                .args(["enable", &service_target])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await;
+        }
+
+        return Ok(SchedulerProvisionResult {
+            configured: true,
+            description: format!("LaunchAgent {}", plist_path.display()),
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let home =
+            std::env::var("HOME").context("HOME is required for systemd user provisioning")?;
+        let user_dir = PathBuf::from(home)
+            .join(".config")
+            .join("systemd")
+            .join("user");
+        tokio::fs::create_dir_all(&user_dir).await?;
+        let service_path = user_dir.join("cadence-autoupdate.service");
+        let timer_path = user_dir.join("cadence-autoupdate.timer");
+        tokio::fs::write(&service_path, systemd_service_contents(exe)).await?;
+        tokio::fs::write(&timer_path, systemd_timer_contents()).await?;
+
+        let daemon_reload = Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .status()
+            .await;
+        if daemon_reload.as_ref().is_ok_and(|s| s.success()) {
+            let _ = Command::new("systemctl")
+                .args(["--user", "enable", "--now", "cadence-autoupdate.timer"])
+                .status()
+                .await;
+        }
+
+        return Ok(SchedulerProvisionResult {
+            configured: true,
+            description: format!("systemd user timer {}", timer_path.display()),
+        });
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let task_name = "Cadence CLI Auto Update";
+        let command = scheduler_command_line(exe);
+        let _ = Command::new("schtasks")
+            .args([
+                "/Create", "/F", "/SC", "HOURLY", "/MO", "8", "/TN", task_name, "/TR", &command,
+            ])
+            .status()
+            .await;
+        return Ok(SchedulerProvisionResult {
+            configured: true,
+            description: task_name.to_string(),
+        });
+    }
+
+    #[allow(unreachable_code)]
+    Ok(SchedulerProvisionResult {
+        configured: false,
+        description: "scheduler unsupported on this platform".to_string(),
+    })
+}
+
+pub async fn updater_health() -> UpdaterHealth {
+    let cfg = CliConfig::load().await.unwrap_or_default();
+    let enabled = cfg.auto_update_enabled();
+    let state = load_updater_state().await.unwrap_or_default();
+    derive_updater_health(enabled, &state)
+}
+
+fn derive_updater_health(enabled: bool, state: &UpdaterState) -> UpdaterHealth {
+    if !enabled {
+        return UpdaterHealth {
+            enabled,
+            state: UpdaterHealthState::Disabled,
+            last_result: "disabled".to_string(),
+            next_retry_after: None,
+            last_error: None,
+        };
+    }
+
+    if state.last_attempt_at.is_none() {
+        return UpdaterHealth {
+            enabled,
+            state: UpdaterHealthState::NeverRun,
+            last_result: "never run".to_string(),
+            next_retry_after: None,
+            last_error: None,
+        };
+    }
+
+    if state.consecutive_failures > 0 {
+        let health_state = if state.consecutive_failures >= 5 {
+            UpdaterHealthState::Failing
+        } else {
+            UpdaterHealthState::Retrying
+        };
+        return UpdaterHealth {
+            enabled,
+            state: health_state,
+            last_result: "retry scheduled".to_string(),
+            next_retry_after: state.next_retry_after.clone(),
+            last_error: state.last_error.clone(),
+        };
+    }
+
+    UpdaterHealth {
+        enabled,
+        state: UpdaterHealthState::Healthy,
+        last_result: "healthy".to_string(),
+        next_retry_after: state.next_retry_after.clone(),
+        last_error: state.last_error.clone(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -977,7 +1591,35 @@ async fn check_latest_version_from_url_with_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::io::Write;
+
+    struct EnvGuard {
+        key: String,
+        original: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn new(key: &str) -> Self {
+            Self {
+                key: key.to_string(),
+                original: std::env::var(key).ok(),
+            }
+        }
+
+        fn set(&self, value: &str) {
+            unsafe { std::env::set_var(&self.key, value) };
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(v) => unsafe { std::env::set_var(&self.key, v) },
+                None => unsafe { std::env::remove_var(&self.key) },
+            }
+        }
+    }
 
     // -- normalize_version_tag -----------------------------------------------
 
@@ -1964,6 +2606,88 @@ mod tests {
         let msg = format_update_notification("1.0.0", "2.0.0-beta.1");
         assert!(msg.contains("v2.0.0-beta.1"));
         assert!(msg.contains("v1.0.0"));
+    }
+
+    // -- auto-update v1 helpers ----------------------------------------------
+
+    #[tokio::test]
+    async fn stable_release_filter_accepts_stable_and_rejects_prerelease() {
+        assert!(is_stable_release_tag("v1.3.0"));
+        assert!(!is_stable_release_tag("v1.4.0-rc.1"));
+    }
+
+    #[tokio::test]
+    async fn retry_due_respects_next_retry_after() {
+        let future = format_epoch_rfc3339(now_epoch() + 300).unwrap();
+        let state = UpdaterState {
+            next_retry_after: Some(future),
+            ..UpdaterState::default()
+        };
+        assert!(!update_due_for_retry(&state, now_epoch()));
+    }
+
+    #[tokio::test]
+    async fn updater_health_covers_never_run_retrying_and_disabled() {
+        let disabled = derive_updater_health(false, &UpdaterState::default());
+        assert_eq!(disabled.state, UpdaterHealthState::Disabled);
+
+        let never = derive_updater_health(true, &UpdaterState::default());
+        assert_eq!(never.state, UpdaterHealthState::NeverRun);
+
+        let retrying = derive_updater_health(
+            true,
+            &UpdaterState {
+                last_attempt_at: Some(now_rfc3339()),
+                consecutive_failures: 2,
+                next_retry_after: Some(now_rfc3339()),
+                last_error: Some("network".to_string()),
+                ..UpdaterState::default()
+            },
+        );
+        assert_eq!(retrying.state, UpdaterHealthState::Retrying);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn activity_lock_nonblocking_skips_when_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = EnvGuard::new("HOME");
+        home.set(tmp.path().to_str().unwrap());
+
+        let lock = acquire_activity_lock_blocking("test-holder")
+            .await
+            .expect("acquire lock");
+        let other = try_acquire_activity_lock_nonblocking("test-other")
+            .await
+            .expect("try lock");
+        assert!(other.is_none());
+        drop(lock);
+
+        let reacquired = try_acquire_activity_lock_nonblocking("test-after-drop")
+            .await
+            .expect("reacquire");
+        assert!(reacquired.is_some());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn launch_agent_plist_points_to_current_executable() {
+        let exe = PathBuf::from("/usr/local/bin/cadence");
+        let plist = launch_agent_plist("ai.teamcadence.cadence.autoupdate", &exe);
+        assert!(plist.contains("/usr/local/bin/cadence"));
+        assert!(plist.contains("<string>auto-update</string>"));
+        assert!(plist.contains("<key>StartInterval</key>"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn systemd_timer_and_service_include_expected_schedule_and_command() {
+        let exe = PathBuf::from("/usr/local/bin/cadence");
+        let service = systemd_service_contents(&exe);
+        let timer = systemd_timer_contents();
+        assert!(service.contains("ExecStart=/usr/local/bin/cadence hook auto-update"));
+        assert!(timer.contains("OnUnitActiveSec=28800s"));
+        assert!(timer.contains("RandomizedDelaySec=1800s"));
     }
 
     // -- check_latest_version_from_url_with_timeout ---------------------------

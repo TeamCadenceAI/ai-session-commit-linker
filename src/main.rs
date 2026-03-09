@@ -186,6 +186,9 @@ enum HookCommand {
         #[arg(long, default_value_t = 8000)]
         time_budget_ms: u64,
     },
+    /// Internal unattended background updater entrypoint (scheduler-only).
+    #[command(hide = true)]
+    AutoUpdate,
 }
 
 #[derive(Subcommand, Debug)]
@@ -715,6 +718,25 @@ async fn run_install_inner(
         }
     }
 
+    // Step 4c: Provision unattended auto-update scheduler (idempotent).
+    match update::provision_auto_update_scheduler().await {
+        Ok(result) if result.configured => {
+            output::success(
+                "Updated",
+                &format!("auto-update scheduler ({})", result.description),
+            );
+        }
+        Ok(result) => {
+            output::note(&format!(
+                "Auto-update scheduler not configured: {}",
+                result.description
+            ));
+        }
+        Err(e) => {
+            output::note(&format!("Could not provision auto-update scheduler ({e})"));
+        }
+    }
+
     // Step 5: Persist org filter if provided
     if let Some(ref org_value) = org {
         match git::config_set_global("ai.cadence.org", org_value).await {
@@ -968,6 +990,9 @@ async fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
     if !git::check_enabled().await {
         return Ok(());
     }
+    let _activity_lock = update::acquire_activity_lock_blocking("hook-post-commit")
+        .await
+        .map_err(HookError::Soft)?;
 
     // Step 1: Get repo root
     let repo_root = git::repo_root().await?;
@@ -1020,6 +1045,7 @@ async fn hook_pre_push_inner(remote: &str, _url: &str) -> Result<()> {
     if !git::check_enabled().await {
         return Ok(());
     }
+    let _activity_lock = update::acquire_activity_lock_blocking("hook-pre-push").await?;
 
     if push::should_push_remote(remote).await {
         let repo_root = git::repo_root().await?;
@@ -3213,6 +3239,31 @@ async fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
         output::detail_to_with_tty(w, "Repo enabled: (n/a - not in a repo)", false);
     }
 
+    let updater_health = update::updater_health().await;
+    let updater_state = match updater_health.state {
+        update::UpdaterHealthState::Disabled => "disabled",
+        update::UpdaterHealthState::NeverRun => "never-run",
+        update::UpdaterHealthState::Healthy => "healthy",
+        update::UpdaterHealthState::Retrying => "retrying",
+        update::UpdaterHealthState::Failing => "failing",
+    };
+    output::detail_to_with_tty(
+        w,
+        &format!(
+            "Auto-update: {} (enabled: {}, last result: {})",
+            updater_state,
+            if updater_health.enabled { "yes" } else { "no" },
+            updater_health.last_result
+        ),
+        false,
+    );
+    if let Some(next_retry) = updater_health.next_retry_after {
+        output::detail_to_with_tty(w, &format!("Auto-update next retry: {next_retry}"), false);
+    }
+    if let Some(last_error) = updater_health.last_error {
+        output::detail_to_with_tty(w, &format!("Auto-update last error: {last_error}"), false);
+    }
+
     Ok(())
 }
 
@@ -3380,6 +3431,33 @@ async fn run_doctor_inner(w: &mut dyn std::io::Write) -> Result<()> {
             ),
             false,
         );
+    }
+
+    let updater_health = update::updater_health().await;
+    match updater_health.state {
+        update::UpdaterHealthState::Disabled => {
+            output::detail_to_with_tty(w, "Auto-update: disabled", false);
+        }
+        update::UpdaterHealthState::NeverRun => {
+            output::detail_to_with_tty(w, "Auto-update: enabled, never run yet", false);
+        }
+        update::UpdaterHealthState::Healthy => {
+            output::detail_to_with_tty(w, "Auto-update: healthy", false);
+        }
+        update::UpdaterHealthState::Retrying => {
+            output::fail_to_with_tty(w, "Fail", "Auto-update is retrying after failures", false);
+            issues += 1;
+        }
+        update::UpdaterHealthState::Failing => {
+            output::fail_to_with_tty(w, "Fail", "Auto-update is failing repeatedly", false);
+            issues += 1;
+        }
+    }
+    if let Some(next_retry) = updater_health.next_retry_after {
+        output::detail_to_with_tty(w, &format!("Auto-update next retry: {next_retry}"), false);
+    }
+    if let Some(last_error) = updater_health.last_error {
+        output::detail_to_with_tty(w, &format!("Auto-update last error: {last_error}"), false);
     }
 
     if issues == 0 {
@@ -3716,7 +3794,7 @@ async fn run_install_auto_update_prompt_inner(
     output::action_to_with_tty(&mut stdout, "Auto-update", "setup", is_tty);
     output::detail_to_with_tty(
         &mut stdout,
-        "Cadence can automatically install updates when available.",
+        "Cadence can install stable updates in the background without prompts.",
         is_tty,
     );
 
@@ -3743,7 +3821,7 @@ async fn run_install_auto_update_prompt_inner(
                 output::success_to_with_tty(
                     &mut stdout,
                     "Auto-update",
-                    "enabled. Change anytime with `cadence config set auto_update false`.",
+                    "enabled for unattended background updates. Change anytime with `cadence config set auto_update false`.",
                     is_tty,
                 );
             } else {
@@ -4066,10 +4144,11 @@ async fn main() {
         let _ = API_URL_OVERRIDE.set(url);
     }
 
-    let is_update_command = matches!(cli.command, Command::Update { .. });
+    let is_update_command = matches!(&cli.command, Command::Update { .. });
+    let is_hook_command = matches!(&cli.command, Command::Hook { .. });
 
     // Opportunistic sweep of pending sync jobs for normal CLI flows.
-    if !matches!(cli.command, Command::Hook { .. }) && deferred_sync::has_pending_sync_jobs().await
+    if !matches!(&cli.command, Command::Hook { .. }) && deferred_sync::has_pending_sync_jobs().await
     {
         let _ = deferred_sync::run_sync_command(deferred_sync::SyncRunOptions {
             repo: None,
@@ -4115,6 +4194,7 @@ async fn main() {
                 )
                 .await
             }
+            HookCommand::AutoUpdate => update::run_background_auto_update().await,
         },
         Command::Backfill { since } => run_backfill(&since).await,
         Command::Login => run_login().await,
@@ -4139,7 +4219,7 @@ async fn main() {
 
     // Passive background version check: run after successful command execution
     // on all non-Update commands. Failures are silently ignored.
-    if result.is_ok() && !is_update_command {
+    if result.is_ok() && !is_update_command && !is_hook_command {
         update::passive_version_check().await;
     }
 
@@ -4157,6 +4237,7 @@ async fn run_sync(
     max_items: usize,
     time_budget_ms: u64,
 ) -> Result<()> {
+    let _activity_lock = update::acquire_activity_lock_blocking("deferred-sync").await?;
     let repo_roots = repo_roots_for_sync_ingest(repo.as_deref(), all_pending, max_items).await?;
     let encryption_method = resolve_encryption_method()
         .await
@@ -4442,6 +4523,17 @@ mod tests {
                 }
                 _ => panic!("expected DeferredSync hook command"),
             },
+            _ => panic!("expected Hook command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_hidden_hook_auto_update() {
+        let cli = Cli::parse_from(["cadence", "hook", "auto-update"]);
+        match cli.command {
+            Command::Hook { hook_command } => {
+                assert!(matches!(hook_command, HookCommand::AutoUpdate));
+            }
             _ => panic!("expected Hook command"),
         }
     }
