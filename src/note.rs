@@ -80,11 +80,7 @@ pub struct SessionRecord {
     pub git_user_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_start: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub session_end: Option<i64>,
     pub content_sha256: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub observed_commits: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub time_window: Option<TimeWindow>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -181,9 +177,7 @@ mod tests {
             git_user_email: Some("dev@example.com".to_string()),
             git_user_name: Some("Dev Name".to_string()),
             session_start: Some(1_700_000_000),
-            session_end: Some(1_700_000_100),
             content_sha256: "content-sha".to_string(),
-            observed_commits: Vec::new(),
             time_window: Some(TimeWindow {
                 start: 1_700_000_000,
                 end: 1_700_000_100,
@@ -241,6 +235,57 @@ mod tests {
         assert_eq!(envelope.record.session_id, record.session_id);
         assert_eq!(envelope.record.repo_root, record.repo_root);
         assert_eq!(envelope.record.content_sha256, record.content_sha256);
+        assert_eq!(envelope.session_content, "line1\nline2");
+    }
+
+    #[test]
+    fn serialize_session_object_omits_removed_legacy_keys() {
+        let bytes = serialize_session_object(sample_record(), "line1\nline2".to_string())
+            .expect("serialize session object");
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("parse serialized session object");
+        let record = value.get("record").expect("record object");
+
+        assert!(record.get("session_end").is_none());
+        assert!(record.get("observed_commits").is_none());
+    }
+
+    #[test]
+    fn deserialize_session_object_ignores_removed_legacy_keys() {
+        let bytes = br#"{
+            "record":{
+                "session_uid":"uid-1",
+                "agent":"codex",
+                "session_id":"session-abc",
+                "repo_root":"/tmp/repo",
+                "repo_remote_url":null,
+                "branch_key":"main",
+                "committer_key_hash":"committer-hash",
+                "git_user_email":"dev@example.com",
+                "git_user_name":"Dev Name",
+                "session_start":1700000000,
+                "session_end":1700000100,
+                "content_sha256":"content-sha",
+                "observed_commits":["abc123"],
+                "time_window":{"start":1700000000,"end":1700000100},
+                "cwd":"/tmp/repo",
+                "match_signals":{
+                    "confidence":"scored_match",
+                    "score":0.9,
+                    "reasons":["contains_commit_hash"]
+                },
+                "ingested_at":"2026-03-02T00:00:00Z",
+                "cli_version":"1.0.0"
+            },
+            "session_content":"line1\nline2"
+        }"#;
+
+        let envelope: SessionEnvelope =
+            serde_json::from_slice(bytes).expect("deserialize legacy session envelope");
+
+        assert_eq!(envelope.record.session_uid, "uid-1");
+        assert_eq!(envelope.record.session_id, "session-abc");
+        assert_eq!(envelope.record.session_start, Some(1_700_000_000));
         assert_eq!(envelope.session_content, "line1\nline2");
     }
 

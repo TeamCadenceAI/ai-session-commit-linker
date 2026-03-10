@@ -1271,9 +1271,7 @@ async fn ingest_session_from_log(
         git_user_email,
         git_user_name,
         session_start,
-        session_end: session_start,
         content_sha256,
-        observed_commits: Vec::new(),
         time_window: session_start.map(|start| note::TimeWindow { start, end: start }),
         cwd: Some(repo_str.to_string()),
         match_signals: Some(note::MatchSignals {
