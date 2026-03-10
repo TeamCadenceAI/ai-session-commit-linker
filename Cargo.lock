@@ -477,6 +477,7 @@ dependencies = [
  "flate2",
  "indicatif",
  "keyring",
+ "libc",
  "open",
  "pgp",
  "protobuf",
@@ -499,6 +500,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "windows-sys 0.59.0",
  "zip",
  "zstd",
 ]
