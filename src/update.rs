@@ -24,8 +24,8 @@ use crate::config::CliConfig;
 use sysinfo::{Pid, System};
 #[cfg(windows)]
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, WAIT_TIMEOUT},
-    System::Threading::{OpenProcess, SYNCHRONIZE, WaitForSingleObject},
+    Foundation::{CloseHandle, SYNCHRONIZE, WAIT_TIMEOUT},
+    System::Threading::{OpenProcess, WaitForSingleObject},
 };
 
 // ---------------------------------------------------------------------------
@@ -268,7 +268,7 @@ fn is_pid_alive(pid: u32) -> bool {
             return false;
         }
         let handle = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
-        if handle == 0 {
+        if handle.is_null() {
             return false;
         }
         let alive = unsafe { WaitForSingleObject(handle, 0) == WAIT_TIMEOUT };
