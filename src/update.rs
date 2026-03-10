@@ -15,11 +15,18 @@ use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use sysinfo::{Pid, System};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 use crate::config::CliConfig;
+
+#[cfg(not(any(unix, windows)))]
+use sysinfo::{Pid, System};
+#[cfg(windows)]
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, WAIT_TIMEOUT},
+    System::Threading::{OpenProcess, SYNCHRONIZE, WaitForSingleObject},
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -44,6 +51,9 @@ const UPDATER_STATE_FILE: &str = "updater-state.json";
 /// Shared activity lock directory/file for hook + deferred sync + updater coordination.
 const ACTIVITY_LOCKS_DIR: &str = "locks";
 const ACTIVITY_LOCK_FILE: &str = "global-activity.lock";
+const ACTIVITY_LOCK_STALE_SECS: i64 = 15 * 60;
+const ACTIVITY_LOCK_POLL_INTERVAL_MS: u64 = 20;
+const ACTIVITY_LOCK_BLOCKING_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Scheduler cadence and jitter defaults.
 const AUTO_UPDATE_INTERVAL_SECS: u64 = 8 * 60 * 60;
@@ -187,6 +197,13 @@ fn cadence_dir() -> Result<PathBuf> {
     })
 }
 
+fn update_confirmation_config(mode: InstallMode, config: Option<&CliConfig>) -> Option<bool> {
+    if matches!(mode, InstallMode::Interactive) {
+        return config.map(CliConfig::auto_update_enabled);
+    }
+    None
+}
+
 fn updater_state_path() -> Result<PathBuf> {
     Ok(cadence_dir()?.join(UPDATER_STATE_FILE))
 }
@@ -233,9 +250,40 @@ async fn save_updater_state(state: &UpdaterState) -> Result<()> {
 }
 
 fn is_pid_alive(pid: u32) -> bool {
-    let mut system = System::new();
-    system.refresh_processes();
-    system.process(Pid::from_u32(pid)).is_some()
+    #[cfg(unix)]
+    {
+        if pid == 0 {
+            return false;
+        }
+        let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        if result == 0 {
+            return true;
+        }
+        matches!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM))
+    }
+
+    #[cfg(windows)]
+    {
+        if pid == 0 {
+            return false;
+        }
+        let handle = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
+        if handle == 0 {
+            return false;
+        }
+        let alive = unsafe { WaitForSingleObject(handle, 0) == WAIT_TIMEOUT };
+        unsafe {
+            CloseHandle(handle);
+        }
+        return alive;
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let mut system = System::new();
+        system.refresh_processes();
+        return system.process(Pid::from_u32(pid)).is_some();
+    }
 }
 
 async fn try_create_activity_lock(path: &Path, record: &ActivityLockRecord) -> Result<bool> {
@@ -269,13 +317,20 @@ async fn clear_stale_activity_lock(path: &Path) -> Result<()> {
     };
     let age = now_epoch().saturating_sub(parsed.created_at_epoch);
     // If owner process is gone or lock is stale, reclaim it.
-    if age > 15 * 60 || !is_pid_alive(parsed.pid) {
+    if age > ACTIVITY_LOCK_STALE_SECS || !is_pid_alive(parsed.pid) {
         let _ = tokio::fs::remove_file(path).await;
     }
     Ok(())
 }
 
 pub async fn acquire_activity_lock_blocking(purpose: &str) -> Result<ActivityLockGuard> {
+    acquire_activity_lock_blocking_with_timeout(purpose, ACTIVITY_LOCK_BLOCKING_TIMEOUT).await
+}
+
+async fn acquire_activity_lock_blocking_with_timeout(
+    purpose: &str,
+    timeout: Duration,
+) -> Result<ActivityLockGuard> {
     let lock_path = activity_lock_path()?;
     if let Some(parent) = lock_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -286,12 +341,22 @@ pub async fn acquire_activity_lock_blocking(purpose: &str) -> Result<ActivityLoc
         hostname: host_name(),
         purpose: purpose.to_string(),
     };
+    let started_at = tokio::time::Instant::now();
     loop {
         if try_create_activity_lock(&lock_path, &record).await? {
             return Ok(ActivityLockGuard { path: lock_path });
         }
         clear_stale_activity_lock(&lock_path).await?;
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        let elapsed = started_at.elapsed();
+        if elapsed >= timeout {
+            bail!(
+                "timed out waiting for global activity lock after {:?} ({purpose})",
+                timeout
+            );
+        }
+        let remaining = timeout.saturating_sub(elapsed);
+        tokio::time::sleep(remaining.min(Duration::from_millis(ACTIVITY_LOCK_POLL_INTERVAL_MS)))
+            .await;
     }
 }
 
@@ -953,12 +1018,14 @@ async fn run_update_install_from_url_mode(
 ) -> Result<AttemptOutcome> {
     let local = current_version();
 
-    if matches!(mode, InstallMode::Interactive) {
+    let config = if matches!(mode, InstallMode::Interactive) {
         // Manual update keeps config load strict to preserve existing UX.
-        let _ = CliConfig::load().await.context(
+        Some(CliConfig::load().await.context(
             "Failed to load config. Check ~/.cadence/cli/config.toml for syntax errors.",
-        )?;
-    }
+        )?)
+    } else {
+        None
+    };
 
     // Step 1: Fetch release metadata
     let release = check_latest_version_from_url(release_url)
@@ -994,11 +1061,26 @@ async fn run_update_install_from_url_mode(
     // Step 4: Prompt for confirmation
     // Precedence: --yes > config auto_update > interactive prompt
     if matches!(mode, InstallMode::Interactive)
-        && !confirm_update(local, remote_display, yes, None)?
+        && !confirm_update(
+            local,
+            remote_display,
+            yes,
+            update_confirmation_config(mode, config.as_ref()),
+        )?
     {
         println!("Update cancelled.");
         return Ok(AttemptOutcome::NoUpdate);
     }
+
+    let _activity_guard = if matches!(mode, InstallMode::SilentUnattended) {
+        Some(
+            try_acquire_activity_lock_nonblocking("auto-update")
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("global activity lock is busy"))?,
+        )
+    } else {
+        None
+    };
 
     // Step 5: Download to temp directory
     let tmp_dir = tempfile::tempdir().context("Failed to create temporary directory")?;
@@ -1048,14 +1130,7 @@ async fn run_update_install_from_url_mode(
     }
 
     // Step 9: Replace running binary
-    if matches!(mode, InstallMode::SilentUnattended) {
-        let _activity_guard = try_acquire_activity_lock_nonblocking("auto-update")
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("global activity lock is busy"))?;
-        self_replace_binary(&new_binary)?;
-    } else {
-        self_replace_binary(&new_binary)?;
-    }
+    self_replace_binary(&new_binary)?;
 
     if matches!(mode, InstallMode::Interactive) {
         println!("Successfully updated cadence v{local} → v{remote_display}");
@@ -2612,6 +2687,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_confirmation_config_preserves_manual_auto_update_preference() {
+        let mut cfg = CliConfig::default();
+        cfg.auto_update = Some(true);
+        assert_eq!(
+            update_confirmation_config(InstallMode::Interactive, Some(&cfg)),
+            Some(true)
+        );
+        assert_eq!(
+            update_confirmation_config(InstallMode::SilentUnattended, Some(&cfg)),
+            None
+        );
+
+        cfg.auto_update = Some(false);
+        assert_eq!(
+            update_confirmation_config(InstallMode::Interactive, Some(&cfg)),
+            Some(false)
+        );
+    }
+
+    #[tokio::test]
     async fn confirm_update_auto_config_false_no_yes_would_prompt() {
         // auto_update=false, no --yes: would go to interactive prompt.
         // We can't test the actual prompt here without a TTY,
@@ -2948,6 +3043,27 @@ mod tests {
             .await
             .expect("reacquire");
         assert!(reacquired.is_some());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn activity_lock_blocking_times_out_when_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = EnvGuard::new("HOME");
+        home.set(tmp.path().to_str().unwrap());
+
+        let _lock = acquire_activity_lock_blocking("test-holder")
+            .await
+            .expect("acquire lock");
+        let err =
+            acquire_activity_lock_blocking_with_timeout("test-waiter", Duration::from_millis(75))
+                .await
+                .expect_err("timeout");
+        assert!(
+            err.to_string()
+                .contains("timed out waiting for global activity lock"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[tokio::test]
